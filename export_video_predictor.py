@@ -8,6 +8,7 @@ parser.add_argument('--framework', default="onnx", choices=["onnx", "tflite", "t
 parser.add_argument('--accuracy', default="float", choices=["float", "int8"])
 parser.add_argument('--mode', default="both", choices=["both", "import", "export"])
 parser.add_argument('--image_size', default=1024, type=int, choices=[512, 1024])
+parser.add_argument('--version', default="2.1", choices=["2", "2.1"])
 args = parser.parse_args()
 
 import os
@@ -30,21 +31,24 @@ import_from_tflite = args.framework=="tflite" and (args.mode=="import" or args.m
 
 # import
 if model_id == "hiera_l":
-    model_cfg = "sam2_hiera_l.yaml"
-    sam2_checkpoint = "./checkpoints/sam2_hiera_large.pt"
-elif model_id == "hiera_s":
-    model_cfg = "sam2_hiera_s.yaml"
-    sam2_checkpoint = "./checkpoints/sam2_hiera_small.pt"
+     sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_large.pt"
+     model_cfg = f"sam{args.version}_hiera_l.yaml"
 elif model_id == "hiera_b+":
-    model_cfg = "sam2_hiera_b+.yaml"
-    sam2_checkpoint = "./checkpoints/sam2_hiera_base_plus.pt"
+    sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_base_plus.pt"
+    model_cfg = f"sam{args.version}_hiera_b+.yaml"
+elif model_id == "hiera_s":
+    sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_small.pt"
+    model_cfg = f"sam{args.version}_hiera_s.yaml"
 elif model_id == "hiera_t":
-    model_cfg = "sam2_hiera_t.yaml"
-    sam2_checkpoint = "./checkpoints/sam2_hiera_tiny.pt"
+    sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_tiny.pt"
+    model_cfg = f"sam{args.version}_hiera_t.yaml"
 else:
     raise("unknown model type")
 
 # resolution settings
+if args.version == "2.1":
+    model_id = model_id + "_2.1"
+    model_cfg = f"configs/sam2.1/{model_cfg}"
 if args.image_size == 512:
     model_id = model_id + "_512"
 

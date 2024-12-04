@@ -1256,6 +1256,11 @@ class SAM2Base(torch.nn.Module):
         high_res_masks,
         object_score_logits,
         current_out,
+        export_to_onnx,
+        import_from_onnx,
+        export_to_tflite,
+        import_from_tflite,
+        model_id
     ):
         if run_mem_encoder and self.num_maskmem > 0:
             high_res_masks_for_mem_enc = high_res_masks
@@ -1265,6 +1270,11 @@ class SAM2Base(torch.nn.Module):
                 pred_masks_high_res=high_res_masks_for_mem_enc,
                 object_score_logits=object_score_logits,
                 is_mask_from_pts=(point_inputs is not None),
+                export_to_onnx=export_to_onnx,
+                import_from_onnx=import_from_onnx,
+                export_to_tflite=export_to_tflite,
+                import_from_tflite=import_from_tflite,
+                model_id=model_id
             )
             current_out["maskmem_features"] = maskmem_features
             current_out["maskmem_pos_enc"] = maskmem_pos_enc
@@ -1333,26 +1343,20 @@ class SAM2Base(torch.nn.Module):
 
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)
-        if run_mem_encoder and self.num_maskmem > 0:
-            maskmem_features, maskmem_pos_enc = self._encode_memory_in_output(
-                current_vision_feats,
-                feat_sizes,
-                point_inputs,
-                run_mem_encoder,
-                high_res_masks,
-                object_score_logits,
-                current_out,
-                export_to_onnx=export_to_onnx,
-                import_from_onnx=import_from_onnx,
-                export_to_tflite=export_to_tflite,
-                import_from_tflite=import_from_tflite,
-                model_id=model_id
-            )
-            current_out["maskmem_features"] = maskmem_features
-            current_out["maskmem_pos_enc"] = maskmem_pos_enc
-        else:
-            current_out["maskmem_features"] = None
-            current_out["maskmem_pos_enc"] = None
+        self._encode_memory_in_output(
+            current_vision_feats,
+            feat_sizes,
+            point_inputs,
+            run_mem_encoder,
+            high_res_masks,
+            object_score_logits,
+            current_out,
+            export_to_onnx=export_to_onnx,
+            import_from_onnx=import_from_onnx,
+            export_to_tflite=export_to_tflite,
+            import_from_tflite=import_from_tflite,
+            model_id=model_id
+        )
 
         return current_out
 
