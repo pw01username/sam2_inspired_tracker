@@ -1,4 +1,4 @@
-# SAM 2 Export to ONNX and TFLITE
+# SAM 2.1 Export to ONNX and TFLITE
 
 ## Download model
 

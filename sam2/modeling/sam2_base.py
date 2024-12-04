@@ -20,6 +20,8 @@ NO_OBJ_SCORE = -1024.0
 
 
 class SAM2Base(torch.nn.Module):
+    add_all_frames_to_correct_as_cond = False # For compatibility
+
     def __init__(
         self,
         image_encoder,
@@ -228,7 +230,7 @@ class SAM2Base(torch.nn.Module):
         assert(self.directly_add_no_mem_embed == True)
         #assert(self.training == False)
         assert(self.mem_dim == 64)
-        assert(self.add_tpos_enc_to_obj_ptrs == False)
+        #assert(self.add_tpos_enc_to_obj_ptrs == False) # SAM2ではFalse、SAM2.1ではTrue
         assert(self.use_obj_ptrs_in_encoder == True)
         assert(self.add_all_frames_to_correct_as_cond == False)
         assert(self.multimask_output_in_sam == True)
@@ -240,7 +242,6 @@ class SAM2Base(torch.nn.Module):
         assert(self.pred_obj_scores == True)
         assert(self.use_obj_ptrs_in_encoder == True)
         assert(self.use_mlp_for_obj_ptr_proj == True)
-        assert(self.proj_tpos_enc_in_obj_ptrs == False)
         assert(self.soft_no_obj_ptr == False)
         assert(self.fixed_no_obj_ptr == True)
         assert(self.non_overlap_masks_for_mem_enc == False)
