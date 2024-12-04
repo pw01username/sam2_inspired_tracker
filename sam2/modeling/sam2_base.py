@@ -1199,6 +1199,11 @@ class SAM2Base(torch.nn.Module):
         num_frames,
         track_in_reverse,
         prev_sam_mask_logits,
+        import_from_onnx=False,
+        export_to_onnx=False,
+        import_from_tflite=False,
+        export_to_tflite=False,
+        model_id=None
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -1228,6 +1233,11 @@ class SAM2Base(torch.nn.Module):
                 output_dict=output_dict,
                 num_frames=num_frames,
                 track_in_reverse=track_in_reverse,
+                export_to_onnx=export_to_onnx,
+                import_from_onnx=import_from_onnx,
+                export_to_tflite=export_to_tflite,
+                import_from_tflite=import_from_tflite,
+                model_id=model_id
             )
             # apply SAM-style segmentation head
             # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
@@ -1243,6 +1253,11 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
+                export_to_onnx=export_to_onnx,
+                import_from_onnx=import_from_onnx,
+                export_to_tflite=export_to_tflite,
+                import_from_tflite=import_from_tflite,
+                model_id=model_id
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
@@ -1321,6 +1336,11 @@ class SAM2Base(torch.nn.Module):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
+            export_to_onnx=export_to_onnx,
+            import_from_onnx=import_from_onnx,
+            export_to_tflite=export_to_tflite,
+            import_from_tflite=import_from_tflite,
+            model_id=model_id
         )
 
         (
