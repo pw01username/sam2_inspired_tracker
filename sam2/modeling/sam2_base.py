@@ -1164,10 +1164,13 @@ class SAM2Base(torch.nn.Module):
         if import_from_tflite:
             if self.debug:
                 print("begin memory encoder tflite")
-            import tensorflow as tf
             if self.memory_encoder_tflite == None:
-                memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT
-                self.memory_encoder_tflite = tf.lite.Interpreter(model_path="model/memory_encoder_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.memory_encoder_tflite = tf.lite.Interpreter(model_path="model/memory_encoder_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.memory_encoder_tflite = tf.lite.Interpreter(model_path="model/memory_encoder_"+model_id+".tflite")
                 self.memory_encoder_tflite.allocate_tensors()
 
             input_details = self.memory_encoder_tflite.get_input_details()

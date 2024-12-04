@@ -130,7 +130,12 @@ The memory attention in tflite does not support dynamic shapes, so num_maskmem a
 
 ### 2.1
 
-TBD
+- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/image_encoder_hiera_t_2.1.tflite
+- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/prompt_encoder_hiera_t_2.1.tflite
+- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/mask_decoder_hiera_t_2.1.tflite
+- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/mlp_hiera_t_2.1.tflite
+- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/memory_encoder_hiera_t_2.1.tflite
+- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/memory_attention_hiera_t_2.1.tflite (4dim matmul, batch = 1, num_maskmem = 1)
 
 ## Inference Example
 
