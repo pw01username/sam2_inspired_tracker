@@ -465,9 +465,13 @@ class SAM2Base(torch.nn.Module):
             if self.debug:
                 print("begin prompt encoder tflite")
 
-            import tensorflow as tf
             if self.prompt_encoder_tflite == None:
-                self.prompt_encoder_tflite = tf.lite.Interpreter(model_path="model/prompt_encoder_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.prompt_encoder_tflite = ailia_tflite.Interpreter(model_path="model/prompt_encoder_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.prompt_encoder_tflite = tf.lite.Interpreter(model_path="model/prompt_encoder_"+model_id+".tflite")
                 input_details = self.prompt_encoder_tflite.get_input_details()
                 self.prompt_encoder_tflite.resize_tensor_input(
                     input_details[2]["index"], 
@@ -489,7 +493,12 @@ class SAM2Base(torch.nn.Module):
             dense_pe = self.prompt_encoder_tflite.get_tensor(output_details[2]["index"])
 
             if self.mask_decoder_tflite == None:
-                self.mask_decoder_tflite = tf.lite.Interpreter(model_path="model/mask_decoder_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.mask_decoder_tflite = ailia_tflite.Interpreter(model_path="model/mask_decoder_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.mask_decoder_tflite = tf.lite.Interpreter(model_path="model/mask_decoder_"+model_id+".tflite")
 
                 input_details = self.mask_decoder_tflite.get_input_details()
                 self.mask_decoder_tflite.resize_tensor_input(
@@ -632,9 +641,13 @@ class SAM2Base(torch.nn.Module):
             edge_model.export("model/mlp_"+model_id+".tflite")
 
         if import_from_tflite:
-            import tensorflow as tf
             if self.mlp_tflite == None:
-                self.mlp_tflite = tf.lite.Interpreter(model_path="model/mlp_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.mlp_tflite = tf.lite.Interpreter(model_path="model/mlp_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.mlp_tflite = tf.lite.Interpreter(model_path="model/mlp_"+model_id+".tflite")
                 self.mlp_tflite.allocate_tensors()
 
             input_details = self.mlp_tflite.get_input_details()
@@ -1021,9 +1034,13 @@ class SAM2Base(torch.nn.Module):
         if import_from_tflite:
             if self.debug:
                 print("begin memory attention tflite")
-            import tensorflow as tf
             if self.memory_attention_tflite == None:
-                self.memory_attention_tflite = tf.lite.Interpreter(model_path="model/memory_attention_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.memory_attention_tflite = tf.lite.Interpreter(model_path="model/memory_attention_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.memory_attention_tflite = tf.lite.Interpreter(model_path="model/memory_attention_"+model_id+".tflite")
                 self.memory_attention_tflite.allocate_tensors()
                 input_details = self.memory_attention_tflite.get_input_details()
                 self.memory_attention_tflite.resize_tensor_input(
@@ -1149,6 +1166,7 @@ class SAM2Base(torch.nn.Module):
                 print("begin memory encoder tflite")
             import tensorflow as tf
             if self.memory_encoder_tflite == None:
+                memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT
                 self.memory_encoder_tflite = tf.lite.Interpreter(model_path="model/memory_encoder_"+model_id+".tflite")
                 self.memory_encoder_tflite.allocate_tensors()
 

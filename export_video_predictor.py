@@ -4,7 +4,7 @@
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_id', default="hiera_t", choices=["hiera_l", "hiera_b+", "hiera_s", "hiera_t"])
-parser.add_argument('--framework', default="onnx", choices=["onnx", "tflite", "torch"])
+parser.add_argument('--framework', default="onnx", choices=["onnx", "tflite", "torch", "ailia_tflite"])
 parser.add_argument('--accuracy', default="float", choices=["float", "int8"])
 parser.add_argument('--mode', default="both", choices=["both", "import", "export"])
 parser.add_argument('--image_size', default=1024, type=int, choices=[512, 1024])
@@ -27,7 +27,10 @@ model_id = args.model_id
 export_to_onnx = args.framework=="onnx" and (args.mode=="export" or args.mode=="both")
 import_from_onnx = args.framework=="onnx" and (args.mode=="import" or args.mode=="both")
 export_to_tflite = args.framework=="tflite" and (args.mode=="export" or args.mode=="both")
-import_from_tflite = args.framework=="tflite" and (args.mode=="import" or args.mode=="both")
+import_from_tflite = (args.framework=="tflite" or args.framework=="ailia_tflite") and (args.mode=="import" or args.mode=="both")
+
+if args.framework=="ailia_tflite" and import_from_tflite:
+    import_from_tflite = "ailia_tflite"
 
 # import
 if model_id == "hiera_l":
@@ -104,7 +107,7 @@ ann_obj_id = 1  # give a unique id to each object we interact with (it can be an
 # Let's add a 2nd positive click at (x, y) = (250, 220) to refine the mask
 # sending all clicks (and their labels) to `add_new_points_or_box`
 # for labels, `1` means positive click and `0` means negative click
-if args.framework == "tflite":
+if args.framework == "tflite" or args.framework == "ailia_tflite":
     points = np.array([[210, 350]], dtype=np.float32)
     labels = np.array([1], np.int32)
 else:

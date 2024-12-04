@@ -64,6 +64,14 @@ python3 export_image_predictor.py --framework tflite --mode import --image_size 
 python3 export_video_predictor.py --framework tflite --mode import --image_size 512
 ```
 
+ailia_tflite
+
+```
+download_tflite_models.sh
+python3 export_image_predictor.py --framework ailia_tflite --mode import
+python3 export_video_predictor.py --framework ailia_tflite --mode import
+```
+
 ## Test
 
 Replacing the complex tensor of RotaryEnc with matmul. To test this behavior, you can also run it with torch.

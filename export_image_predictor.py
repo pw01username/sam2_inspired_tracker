@@ -4,7 +4,7 @@
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_id', default="hiera_t", choices=["hiera_l", "hiera_b+", "hiera_s", "hiera_t"])
-parser.add_argument('--framework', default="onnx", choices=["onnx", "tflite", "torch"])
+parser.add_argument('--framework', default="onnx", choices=["onnx", "tflite", "torch", "ailia_tflite"])
 parser.add_argument('--accuracy', default="float", choices=["float", "int8"])
 parser.add_argument('--mode', default="both", choices=["both", "import", "export"])
 parser.add_argument('--image_size', default=1024, type=int, choices=[512, 1024])
@@ -31,7 +31,10 @@ import_from_onnx = args.framework == "onnx" and (args.mode=="import" or args.mod
 
 export_to_tflite_image_encoder = args.framework == "tflite" and (args.mode=="export" or args.mode=="both")
 export_to_tflite_mask_decoder = args.framework == "tflite" and (args.mode=="export" or args.mode=="both")
-import_from_tflite = args.framework == "tflite" and (args.mode=="import" or args.mode=="both")
+import_from_tflite = (args.framework == "tflite" or args.framework == "ailia_tflite") and (args.mode=="import" or args.mode=="both")
+
+if args.framework=="ailia_tflite" and import_from_tflite:
+    import_from_tflite = "ailia_tflite"
 
 tflite_int8 = args.accuracy == "int8"
 

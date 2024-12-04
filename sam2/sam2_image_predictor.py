@@ -195,9 +195,13 @@ class SAM2ImagePredictor:
                 edge_model = model
 
         if import_from_tflite:
-            import tensorflow as tf
             if self.image_encoder_tflite == None:
-                self.image_encoder_tflite = tf.lite.Interpreter(model_path="model/image_encoder_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.image_encoder_tflite = ailia_tflite.Interpreter(model_path="model/image_encoder_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.image_encoder_tflite = tf.lite.Interpreter(model_path="model/image_encoder_"+model_id+".tflite")
                 self.image_encoder_tflite.allocate_tensors()
 
             input_details = self.image_encoder_tflite.get_input_details()
@@ -591,9 +595,13 @@ class SAM2ImagePredictor:
                 edge_model = model
 
         if import_from_tflite:
-            import tensorflow as tf
             if self.prompt_encoder_tflite == None:
-                self.prompt_encoder_tflite = tf.lite.Interpreter(model_path="model/prompt_encoder_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.prompt_encoder_tflite = ailia_tflite.Interpreter(model_path="model/prompt_encoder_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.prompt_encoder_tflite = tf.lite.Interpreter(model_path="model/prompt_encoder_"+model_id+".tflite")
                 self.prompt_encoder_tflite.allocate_tensors()
                 input_details = self.prompt_encoder_tflite.get_input_details()
                 self.prompt_encoder_tflite.resize_tensor_input(
@@ -705,9 +713,13 @@ class SAM2ImagePredictor:
             if batched_mode:
                 batched_mode_np[0] = True
 
-            import tensorflow as tf
             if self.mask_decoder_tflite == None:
-                self.mask_decoder_tflite  = tf.lite.Interpreter(model_path="model/mask_decoder_"+model_id+".tflite")
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.mask_decoder_tflite  = ailia_tflite.Interpreter(model_path="model/mask_decoder_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.mask_decoder_tflite  = tf.lite.Interpreter(model_path="model/mask_decoder_"+model_id+".tflite")
                 self.mask_decoder_tflite.allocate_tensors()
                 input_details = self.mask_decoder_tflite.get_input_details()
                 self.mask_decoder_tflite.resize_tensor_input(
