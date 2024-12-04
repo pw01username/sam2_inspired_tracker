@@ -60,8 +60,6 @@ tflite
 download_tflite_models.sh
 python3 export_image_predictor.py --framework tflite --mode import
 python3 export_video_predictor.py --framework tflite --mode import
-python3 export_image_predictor.py --framework tflite --mode import --image_size 512
-python3 export_video_predictor.py --framework tflite --mode import --image_size 512
 ```
 
 ailia_tflite
@@ -71,6 +69,11 @@ download_tflite_models.sh
 python3 export_image_predictor.py --framework ailia_tflite --mode import
 python3 export_video_predictor.py --framework ailia_tflite --mode import
 ```
+
+## Options
+
+- `--image_size 512` : Use 512x512 resolution (default 1024x1024)
+- `--version 2` : Use SAM2 (default 2.1)
 
 ## Test
 
@@ -93,6 +96,8 @@ You can also download it from the following.
 
 ### ONNX
 
+### 2.0
+
 - https://storage.googleapis.com/ailia-models/segment-anything-2/image_encoder_hiera_t.onnx
 - https://storage.googleapis.com/ailia-models/segment-anything-2/prompt_encoder_hiera_t.onnx
 - https://storage.googleapis.com/ailia-models/segment-anything-2/mask_decoder_hiera_t.onnx
@@ -101,7 +106,13 @@ You can also download it from the following.
 - https://storage.googleapis.com/ailia-models/segment-anything-2/memory_attention_hiera_t.onnx (6dim matmul, batch = N)
 - https://storage.googleapis.com/ailia-models/segment-anything-2/memory_attention_hiera_t.opt.onnx (4dim matmul, batch = 1)
 
+### 2.1
+
+TBD
+
 ### TFLITE
+
+### 2.0
 
 - https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/image_encoder_hiera_t.tflite
 - https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/prompt_encoder_hiera_t.tflite
@@ -112,6 +123,10 @@ You can also download it from the following.
 
 The memory attention in tflite does not support dynamic shapes, so num_maskmem and max_obj_ptrs_in_encoder need to be fixed to 1.
 
+### 2.1
+
+TBD
+
 ## Inference Example
 
 - [ailia-models](https://github.com/axinc-ai/ailia-models/tree/master/image_segmentation/segment-anything-2)
@@ -120,13 +135,3 @@ The memory attention in tflite does not support dynamic shapes, so num_maskmem a
 ## Original document
 
 - [README_ORIGINAL.md](README_ORIGINAL.md)
-
-## Tags
-
-### 4dim matmul
-
-main
-
-### 6dim matmul
-
-https://github.com/axinc-ai/segment-anything-2/tree/f36169e87ec302c75279fadc60cda1c3763165eb
