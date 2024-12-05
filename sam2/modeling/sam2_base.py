@@ -958,7 +958,7 @@ class SAM2Base(torch.nn.Module):
         memory_pos_embed_2 = memory_pos_embed[-num_obj_ptr_tokens:,:,:]
 
         # Static Shapeに変換するために、定数フレームに変換する
-        convert_to_static_shape = True
+        convert_to_static_shape = export_to_tflite or import_from_tflite
         if convert_to_static_shape:
             max_num_frames = 16
             memory_1_pad = torch.zeros(max_num_frames * 4096, memory_1.shape[1], memory_1.shape[2])
@@ -1001,7 +1001,7 @@ class SAM2Base(torch.nn.Module):
             #print("memory_pos_embed", memory_pos_embed.shape, memory_pos_embed.dtype)
             #print("num_obj_ptr_tokens", num_obj_ptr_tokens)
             torch.onnx.export(
-                self.memory_attention, (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2, attention_mask_1, attention_mask_2), 'model/memory_attention_'+model_id+'.opt.onnx',
+                self.memory_attention, (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2, attention_mask_1, attention_mask_2), 'model/memory_attention_'+model_id+'.onnx',
                 input_names=["curr", "memory_1", "memory_2", "curr_pos", "memory_pos_1", "memory_pos_2", "attention_mask_1", "attention_mask_2"],
                 output_names=["pix_feat"],
                 dynamic_axes={
@@ -1025,7 +1025,7 @@ class SAM2Base(torch.nn.Module):
                 print("begin memory attention onnx")
             import onnxruntime
             if self.memory_attention_onnx == None:
-                self.memory_attention_onnx = onnxruntime.InferenceSession("model/memory_attention_"+model_id+".opt.onnx")
+                self.memory_attention_onnx = onnxruntime.InferenceSession("model/memory_attention_"+model_id+".onnx")
             import numpy as np
             #num_obj_ptr_tokens_numpy = np.array((num_obj_ptr_tokens)).astype(np.int64)
             #print("curr", np.sum(current_vision_feats[0].numpy()))
