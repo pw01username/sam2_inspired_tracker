@@ -1041,9 +1041,9 @@ class SAM2Base(torch.nn.Module):
             self.memory_attention_tflite_exported = True
             import ai_edge_torch
             import tensorflow as tf
-            sample_inputs = (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2)
+            sample_inputs = (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2, attention_mask_1, attention_mask_2)
             tfl_converter_flags = {'target_spec': {'supported_ops': [tf.lite.OpsSet.TFLITE_BUILTINS]}}
-            if self.num_maskmem == 1 and self.max_obj_ptrs_in_encoder == 1:
+            if True:#self.num_maskmem == 1 and self.max_obj_ptrs_in_encoder == 1:
                 edge_model = ai_edge_torch.convert(self.memory_attention, sample_inputs, _ai_edge_converter_flags=tfl_converter_flags)
             else:
                 n_1 = torch.export.Dim("n_1", min=1, max=256)
@@ -1075,35 +1075,35 @@ class SAM2Base(torch.nn.Module):
                     self.memory_attention_tflite = tf.lite.Interpreter(model_path="model/memory_attention_"+model_id+".tflite")
                 self.memory_attention_tflite.allocate_tensors()
                 input_details = self.memory_attention_tflite.get_input_details()
-                self.memory_attention_tflite.resize_tensor_input(
-                    input_details[5]["index"], 
-                    [memory_1.shape[0], 1, 64]
-                )
-                self.memory_attention_tflite.resize_tensor_input(
-                    input_details[1]["index"], 
-                    [memory_2.shape[0], 1, 64]
-                )
-                self.memory_attention_tflite.resize_tensor_input(
-                    input_details[4]["index"], 
-                    [memory_pos_embed_1.shape[0], 1, 64]
-                )
-                self.memory_attention_tflite.resize_tensor_input(
-                    input_details[0]["index"], 
-                    [memory_pos_embed_2.shape[0], 1, 64]
-                )
+                #self.memory_attention_tflite.resize_tensor_input(
+                #    input_details[5]["index"], 
+                #    [memory_1.shape[0], 1, 64]
+                #)
+                #self.memory_attention_tflite.resize_tensor_input(
+                #    input_details[1]["index"], 
+                #    [memory_2.shape[0], 1, 64]
+                #)
+                #self.memory_attention_tflite.resize_tensor_input(
+                #    input_details[4]["index"], 
+                #    [memory_pos_embed_1.shape[0], 1, 64]
+                #)
+                #self.memory_attention_tflite.resize_tensor_input(
+                #    input_details[0]["index"], 
+                #    [memory_pos_embed_2.shape[0], 1, 64]
+                #)
                 self.memory_attention_tflite.allocate_tensors()
 
             input_details = self.memory_attention_tflite.get_input_details()
             output_details = self.memory_attention_tflite.get_output_details()
 
             self.memory_attention_tflite.set_tensor(input_details[3]["index"], current_vision_feats[0].numpy())
-            self.memory_attention_tflite.set_tensor(input_details[5]["index"], memory_1.numpy())
+            self.memory_attention_tflite.set_tensor(input_details[6]["index"], memory_1.numpy())
             self.memory_attention_tflite.set_tensor(input_details[1]["index"], memory_2.numpy())
             self.memory_attention_tflite.set_tensor(input_details[2]["index"], current_vision_pos_embeds[0].numpy())
-            self.memory_attention_tflite.set_tensor(input_details[4]["index"], memory_pos_embed_1.numpy())
+            self.memory_attention_tflite.set_tensor(input_details[5]["index"], memory_pos_embed_1.numpy())
             self.memory_attention_tflite.set_tensor(input_details[0]["index"], memory_pos_embed_2.numpy())
-            #self.memory_attention_tflite.set_tensor(input_details[6]["index"], attention_mask_1.numpy())
-            #self.memory_attention_tflite.set_tensor(input_details[7]["index"], attention_mask_2.numpy())
+            self.memory_attention_tflite.set_tensor(input_details[4]["index"], attention_mask_1.numpy())
+            self.memory_attention_tflite.set_tensor(input_details[7]["index"], attention_mask_2.numpy())
 
             self.memory_attention_tflite.invoke()
 

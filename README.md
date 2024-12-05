@@ -23,8 +23,7 @@ tflite
 ```
 torch 2.4.0
 ai-edge-torch 0.2.0
-tf-nightly 2.18.0.dev20240811 for image mode, tf-nightly 2.18.0.dev20240905 for video mode (SAM2)
-tf-nightly 2.18.0.dev20240811 for image and video mode (SAM2.1)
+tf-nightly 2.18.0.dev20240811
 ```
 
 ## Export and Inference
@@ -96,18 +95,6 @@ You can also download it from the following.
 
 ### ONNX
 
-### 2.0
-
-- https://storage.googleapis.com/ailia-models/segment-anything-2/image_encoder_hiera_t.onnx
-- https://storage.googleapis.com/ailia-models/segment-anything-2/prompt_encoder_hiera_t.onnx
-- https://storage.googleapis.com/ailia-models/segment-anything-2/mask_decoder_hiera_t.onnx
-- https://storage.googleapis.com/ailia-models/segment-anything-2/memory_encoder_hiera_t.onnx
-- https://storage.googleapis.com/ailia-models/segment-anything-2/mlp_hiera_t.onnx
-- https://storage.googleapis.com/ailia-models/segment-anything-2/memory_attention_hiera_t.onnx (6dim matmul, batch = N)
-- https://storage.googleapis.com/ailia-models/segment-anything-2/memory_attention_hiera_t.opt.onnx (4dim matmul, batch = 1)
-
-### 2.1
-
 - https://storage.googleapis.com/ailia-models/segment-anything-2.1/image_encoder_hiera_t_2.1.onnx
 - https://storage.googleapis.com/ailia-models/segment-anything-2.1/prompt_encoder_hiera_t_2.1.onnx
 - https://storage.googleapis.com/ailia-models/segment-anything-2.1/mask_decoder_hiera_t_2.1.onnx
@@ -116,19 +103,6 @@ You can also download it from the following.
 - https://storage.googleapis.com/ailia-models/segment-anything-2.1/memory_attention_hiera_t_2.1.opt.onnx (4dim matmul, batch = 1)
 
 ### TFLITE
-
-### 2.0
-
-- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/image_encoder_hiera_t.tflite
-- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/prompt_encoder_hiera_t.tflite
-- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/mask_decoder_hiera_t.tflite
-- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/mlp_hiera_t.tflite
-- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/memory_encoder_hiera_t.tflite
-- https://storage.googleapis.com/ailia-models-tflite/segment-anything-2/memory_attention_hiera_t.tflite (4dim matmul, batch = 1, num_maskmem = 1)
-
-The memory attention in tflite does not support dynamic shapes, so num_maskmem and max_obj_ptrs_in_encoder need to be fixed to 1.
-
-### 2.1
 
 - https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/image_encoder_hiera_t_2.1.tflite
 - https://storage.googleapis.com/ailia-models-tflite/segment-anything-2.1/prompt_encoder_hiera_t_2.1.tflite
