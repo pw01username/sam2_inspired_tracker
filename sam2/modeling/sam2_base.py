@@ -810,7 +810,7 @@ class SAM2Base(torch.nn.Module):
             sample_inputs = (obj_pos,)
             tfl_converter_flags = {'target_spec': {'supported_ops': [tf.lite.OpsSet.TFLITE_BUILTINS]}}
             edge_model = ai_edge_torch.convert(self.obj_ptr_tpos_proj, sample_inputs, _ai_edge_converter_flags=tfl_converter_flags)
-            edge_model.export("model/mlp_"+model_id+".tflite")
+            edge_model.export("model/obj_ptr_tpos_proj_"+model_id+".tflite")
 
         if import_from_tflite:
             if self.obj_ptr_tpos_proj_tflite == None:
@@ -825,10 +825,12 @@ class SAM2Base(torch.nn.Module):
             input_details = self.obj_ptr_tpos_proj_tflite.get_input_details()
             output_details = self.obj_ptr_tpos_proj_tflite.get_output_details()
 
-            self.obj_ptr_tpos_proj_tflite.set_tensor(input_details[0]["index"], obj_pos.numpy())
-            self.obj_ptr_tpos_proj_tflite.invoke()
-
-            tpos = self.obj_ptr_tpos_proj_tflite.get_tensor(output_details[0]["index"])
+            import numpy as np
+            tpos = np.zeros((obj_pos.shape[0], 64))
+            for i in range(obj_pos.shape[0]):
+                self.obj_ptr_tpos_proj_tflite.set_tensor(input_details[0]["index"], obj_pos[i:i+1,:].numpy())
+                self.obj_ptr_tpos_proj_tflite.invoke()
+                tpos[i:i+1,:] = self.obj_ptr_tpos_proj_tflite.get_tensor(output_details[0]["index"])
             tpos = torch.Tensor(tpos)
 
         if not import_from_onnx and not import_from_tflite:
