@@ -404,7 +404,7 @@ class RoPEAttention(Attention):
         return out
 
     def cross_attn(
-        self, q: Tensor, k_1: Tensor, v_1: Tensor, k_2: Tensor = None, v_2: Tensor = None
+        self, q: Tensor, k_1: Tensor, v_1: Tensor, k_2: Tensor = None, v_2: Tensor = None, m_1: Tensor = None, m_2: Tensor = None
     ) -> Tensor:
         # Input projections
         q = self.q_proj(q)
@@ -466,6 +466,8 @@ class RoPEAttention(Attention):
         #else:
         v = torch.concat((v_1, v_2), dim = 2)
 
+        attn_mask = torch.concat((m_1, m_2), dim = 1)
+
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
         #try:
@@ -482,7 +484,7 @@ class RoPEAttention(Attention):
             #)
             global ALLOW_ALL_KERNELS
             ALLOW_ALL_KERNELS = True
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, attn_mask = attn_mask)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)

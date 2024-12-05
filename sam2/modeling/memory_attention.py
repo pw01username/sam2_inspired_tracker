@@ -63,7 +63,7 @@ class MemoryAttentionLayer(nn.Module):
         tgt = tgt + self.dropout1(tgt2)
         return tgt
 
-    def _forward_ca(self, tgt, memory_1, memory_2, query_pos, pos_1, pos_2):
+    def _forward_ca(self, tgt, memory_1, memory_2, query_pos, pos_1, pos_2, attention_mask_1, attention_mask_2):
         # Cross-Attention
         tgt2 = self.norm2(tgt)
         tgt2 = self.cross_attn_image.cross_attn(
@@ -71,7 +71,9 @@ class MemoryAttentionLayer(nn.Module):
             k_1=memory_1 + pos_1 if self.pos_enc_at_cross_attn_keys else memory_1,
             v_1=memory_1,
             k_2=memory_2 + pos_2 if self.pos_enc_at_cross_attn_keys else memory_2,
-            v_2=memory_2
+            v_2=memory_2,
+            m_1=attention_mask_1,
+            m_2=attention_mask_2,
         )
         tgt = tgt + self.dropout2(tgt2)
         return tgt
@@ -83,12 +85,14 @@ class MemoryAttentionLayer(nn.Module):
         memory_2,
         pos_1: Optional[Tensor] = None,
         pos_2: Optional[Tensor] = None,
+        attention_mask_1: Optional[Tensor] = None,
+        attention_mask_2: Optional[Tensor] = None,
         query_pos: Optional[Tensor] = None,
     ) -> torch.Tensor:
 
         # Self-Attn, Cross-Attn
         tgt = self._forward_sa(tgt, query_pos)
-        tgt = self._forward_ca(tgt, memory_1, memory_2, query_pos, pos_1, pos_2)
+        tgt = self._forward_ca(tgt, memory_1, memory_2, query_pos, pos_1, pos_2, attention_mask_1, attention_mask_2)
         # MLP
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
@@ -147,6 +151,8 @@ class MemoryAttention(nn.Module):
         curr_pos: Optional[Tensor] = None,  # pos_enc for self-attention inputs
         memory_pos_1: Optional[Tensor] = None,  # pos_enc for cross-attention inputs
         memory_pos_2: Optional[Tensor] = None,  # pos_enc for cross-attention inputs
+        attention_mask_1: torch.Tensor = None,
+        attention_mask_2: torch.Tensor = None,
     ):
         if isinstance(curr, list):
             assert isinstance(curr_pos, list)
@@ -172,6 +178,8 @@ class MemoryAttention(nn.Module):
             memory_2 = memory_2.transpose(0, 1)
             memory_pos_1 = memory_pos_1.transpose(0, 1)
             memory_pos_2 = memory_pos_2.transpose(0, 1)
+            attention_mask_1 = attention_mask_1.transpose(0, 1)
+            attention_mask_2 = attention_mask_2.transpose(0, 1)
 
         for layer in self.layers:
             output = layer(
@@ -180,6 +188,8 @@ class MemoryAttention(nn.Module):
                 memory_2=memory_2,
                 pos_1=memory_pos_1,
                 pos_2=memory_pos_2,
+                attention_mask_1=attention_mask_1,
+                attention_mask_2=attention_mask_2,
             )
         normed_output = self.norm(output)
 

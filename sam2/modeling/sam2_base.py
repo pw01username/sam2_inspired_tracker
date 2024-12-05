@@ -957,6 +957,34 @@ class SAM2Base(torch.nn.Module):
         memory_pos_embed_1 = memory_pos_embed[:-num_obj_ptr_tokens,:,:]
         memory_pos_embed_2 = memory_pos_embed[-num_obj_ptr_tokens:,:,:]
 
+        # Static Shapeに変換するために、定数フレームに変換する
+        convert_to_static_shape = True
+        if convert_to_static_shape:
+            max_num_frames = 16
+            memory_1_pad = torch.zeros(max_num_frames * 4096, memory_1.shape[1], memory_1.shape[2])
+            memory_1_pad[:memory_1.shape[0],:,:] = memory_1
+            memory_pos_embed_1_pad = torch.zeros(max_num_frames * 4096, memory_pos_embed_1.shape[1], memory_pos_embed_1.shape[2])
+            memory_pos_embed_1_pad[:memory_pos_embed_1.shape[0],:,:] = memory_pos_embed_1
+            memory_2_pad = torch.zeros(max_num_frames * 4, memory_2.shape[1], memory_2.shape[2])
+            memory_2_pad[:memory_2.shape[0],:,:] = memory_2
+            memory_pos_embed_2_pad = torch.zeros(max_num_frames * 4, memory_pos_embed_2.shape[1], memory_pos_embed_2.shape[2])
+            memory_pos_embed_2_pad[:memory_pos_embed_2.shape[0],:,:] = memory_pos_embed_2
+            memory_2_pad = torch.zeros(max_num_frames * 4, memory_2.shape[1], memory_2.shape[2])
+            memory_2_pad[:memory_2.shape[0],:,:] = memory_2
+            attention_mask_1 = torch.zeros(max_num_frames * 4096, memory_1.shape[1], dtype=torch.bool)
+            attention_mask_2 = torch.zeros(max_num_frames * 4, memory_2.shape[1], dtype=torch.bool)
+            attention_mask_1[:memory_1.shape[0],:] = True
+            attention_mask_2[:memory_2.shape[0],:] = True
+            memory_1 = memory_1_pad
+            memory_2 = memory_2_pad
+            memory_pos_embed_1 = memory_pos_embed_1_pad
+            memory_pos_embed_2 = memory_pos_embed_2_pad
+        else:
+            attention_mask_1 = torch.zeros(memory_1.shape[0], memory_1.shape[1], dtype=torch.bool)
+            attention_mask_2 = torch.zeros(memory_2.shape[0], memory_2.shape[1], dtype=torch.bool)
+            attention_mask_1[:memory_1.shape[0],:] = True
+            attention_mask_2[:memory_2.shape[0],:] = True
+
         if self.debug:
             print("memory attention shape")
             print("curr", current_vision_feats[0].shape)
@@ -973,14 +1001,16 @@ class SAM2Base(torch.nn.Module):
             #print("memory_pos_embed", memory_pos_embed.shape, memory_pos_embed.dtype)
             #print("num_obj_ptr_tokens", num_obj_ptr_tokens)
             torch.onnx.export(
-                self.memory_attention, (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2), 'model/memory_attention_'+model_id+'.opt.onnx',
-                input_names=["curr", "memory_1", "memory_2", "curr_pos", "memory_pos_1", "memory_pos_2"],
+                self.memory_attention, (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2, attention_mask_1, attention_mask_2), 'model/memory_attention_'+model_id+'.opt.onnx',
+                input_names=["curr", "memory_1", "memory_2", "curr_pos", "memory_pos_1", "memory_pos_2", "attention_mask_1", "attention_mask_2"],
                 output_names=["pix_feat"],
                 dynamic_axes={
                     'memory_1': {0: 'n_1'},
                     'memory_2': {0: 'n_2'},
                     'memory_pos_1': {0: 'n_1'},
-                    'memory_pos_2': {0: 'n_2'}
+                    'memory_pos_2': {0: 'n_2'},
+                    'attention_mask_1': {0: 'n_1'},
+                    'attention_mask_2': {0: 'n_2'}
                 },
                 verbose=False, opset_version=17
             )
@@ -1004,7 +1034,7 @@ class SAM2Base(torch.nn.Module):
             #print("memory_pos", np.sum(memory_pos_embed.numpy()))
             #print("num_obj_ptr_tokens", np.sum(num_obj_ptr_tokens_numpy))
 
-            pix_feat_with_mem = self.memory_attention_onnx.run(None, {"curr":current_vision_feats[0].numpy(), "memory_1":memory_1.numpy(), "memory_2":memory_2.numpy(), "curr_pos":current_vision_pos_embeds[0].numpy(), "memory_pos_1":memory_pos_embed_1.numpy(), "memory_pos_2":memory_pos_embed_2.numpy()})
+            pix_feat_with_mem = self.memory_attention_onnx.run(None, {"curr":current_vision_feats[0].numpy(), "memory_1":memory_1.numpy(), "memory_2":memory_2.numpy(), "curr_pos":current_vision_pos_embeds[0].numpy(), "memory_pos_1":memory_pos_embed_1.numpy(), "memory_pos_2":memory_pos_embed_2.numpy(), "attention_mask_1":attention_mask_1.numpy(), "attention_mask_2":attention_mask_2.numpy()})
             pix_feat_with_mem = torch.Tensor(pix_feat_with_mem[0])
         
         if export_to_tflite and not self.memory_attention_tflite_exported:
@@ -1026,7 +1056,9 @@ class SAM2Base(torch.nn.Module):
                     'memory_2': {0: n_4},
                     'curr_pos': None,
                     'memory_pos_1': {0: n_4096},
-                    'memory_pos_2': {0: n_4}
+                    'memory_pos_2': {0: n_4},
+                    'attention_mask_1': {0: n_4096},
+                    'attention_mask_2': {0: n_4}
                 }
                 edge_model = ai_edge_torch.convert(self.memory_attention, sample_inputs, _ai_edge_converter_flags=tfl_converter_flags, dynamic_shapes=dynamic_shapes)
             edge_model.export("model/memory_attention_"+model_id+".tflite")
@@ -1070,6 +1102,9 @@ class SAM2Base(torch.nn.Module):
             self.memory_attention_tflite.set_tensor(input_details[2]["index"], current_vision_pos_embeds[0].numpy())
             self.memory_attention_tflite.set_tensor(input_details[4]["index"], memory_pos_embed_1.numpy())
             self.memory_attention_tflite.set_tensor(input_details[0]["index"], memory_pos_embed_2.numpy())
+            #self.memory_attention_tflite.set_tensor(input_details[6]["index"], attention_mask_1.numpy())
+            #self.memory_attention_tflite.set_tensor(input_details[7]["index"], attention_mask_2.numpy())
+
             self.memory_attention_tflite.invoke()
 
             pix_feat_with_mem = self.memory_attention_tflite.get_tensor(output_details[0]["index"])
@@ -1088,6 +1123,8 @@ class SAM2Base(torch.nn.Module):
                 curr_pos=current_vision_pos_embeds,
                 memory_pos_1=memory_pos_embed_1,
                 memory_pos_2=memory_pos_embed_2,
+                attention_mask_1=attention_mask_1,
+                attention_mask_2=attention_mask_2,
             )
 
         # reshape the output (HW)BC => BCHW
