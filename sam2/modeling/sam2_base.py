@@ -190,6 +190,9 @@ class SAM2Base(torch.nn.Module):
         self.mlp_onnx_exported = False
         self.mlp_tflite_exported = False
 
+        self.obj_ptr_tpos_proj_onnx_exported = False
+        self.obj_ptr_tpos_proj_tflite_exported = False
+
         # Model compilation
         if compile_image_encoder:
             # Compile the forward function (not the full module) to allow loading checkpoints.
@@ -213,6 +216,7 @@ class SAM2Base(torch.nn.Module):
         self.mlp_onnx = None
         self.memory_attention_onnx = None
         self.memory_encoder_onnx = None
+        self.obj_ptr_tpos_proj_onnx = None
 
         # tflite
         self.image_encoder_tflite = None
@@ -221,6 +225,7 @@ class SAM2Base(torch.nn.Module):
         self.mlp_tflite = None
         self.memory_attention_tflite = None
         self.memory_encoder_tflite = None
+        self.obj_ptr_tpos_proj_tflite = None
 
         # Check decoder sample parameter
         assert(self.image_size == 512 or self.image_size == 1024)
@@ -770,6 +775,68 @@ class SAM2Base(torch.nn.Module):
 
         return backbone_out, vision_feats, vision_pos_embeds, feat_sizes
 
+    def call_obj_ptr_tpos_proj(self, obj_pos,
+        export_to_onnx=False,
+        import_from_onnx=False,
+        export_to_tflite=False,
+        import_from_tflite=False,
+        model_id=None):
+        if export_to_onnx and not self.obj_ptr_tpos_proj_onnx_exported:
+            print("x", obj_pos.shape)
+            self.obj_ptr_tpos_proj_onnx_exported = True
+            torch.onnx.export(
+                self.obj_ptr_tpos_proj, (obj_pos), 'model/obj_ptr_tpos_proj_'+model_id+'.onnx',
+                input_names=["x"],
+                output_names=["x_out"],
+                dynamic_axes={
+                    'x': {0: 'n'},
+                    'obj_ptr': {0: 'n'}
+                },
+                verbose=False, opset_version=17
+            )
+
+        if import_from_onnx:
+            import onnxruntime
+            if self.obj_ptr_tpos_proj_onnx == None:
+                self.obj_ptr_tpos_proj_onnx  = onnxruntime.InferenceSession("model/obj_ptr_tpos_proj_"+model_id+".onnx")
+            import numpy as np
+            tpos = self.obj_ptr_tpos_proj_onnx.run(None, {"x":obj_pos.numpy()})[0]
+            tpos = torch.Tensor(tpos)
+        
+        if export_to_tflite and not self.obj_ptr_tpos_proj_tflite_exported:
+            self.obj_ptr_tpos_proj_tflite_exported = True
+            import ai_edge_torch
+            import tensorflow as tf
+            sample_inputs = (obj_pos,)
+            tfl_converter_flags = {'target_spec': {'supported_ops': [tf.lite.OpsSet.TFLITE_BUILTINS]}}
+            edge_model = ai_edge_torch.convert(self.obj_ptr_tpos_proj, sample_inputs, _ai_edge_converter_flags=tfl_converter_flags)
+            edge_model.export("model/mlp_"+model_id+".tflite")
+
+        if import_from_tflite:
+            if self.obj_ptr_tpos_proj_tflite == None:
+                if import_from_tflite == "ailia_tflite":
+                    import ailia_tflite
+                    self.obj_ptr_tpos_proj_tflite = ailia_tflite.Interpreter(model_path="model/obj_ptr_tpos_proj_"+model_id+".tflite", memory_mode=ailia_tflite.AILIA_TFLITE_MEMORY_MODE_REDUCE_INTERSTAGE, flags=ailia_tflite.AILIA_TFLITE_FLAG_DYNAMIC_QUANT)
+                else:
+                    import tensorflow as tf
+                    self.obj_ptr_tpos_proj_tflite = tf.lite.Interpreter(model_path="model/obj_ptr_tpos_proj_"+model_id+".tflite")
+                self.obj_ptr_tpos_proj_tflite.allocate_tensors()
+
+            input_details = self.obj_ptr_tpos_proj_tflite.get_input_details()
+            output_details = self.obj_ptr_tpos_proj_tflite.get_output_details()
+
+            self.obj_ptr_tpos_proj_tflite.set_tensor(input_details[0]["index"], obj_pos.numpy())
+            self.obj_ptr_tpos_proj_tflite.invoke()
+
+            tpos = self.obj_ptr_tpos_proj_tflite.get_tensor(output_details[0]["index"])
+            tpos = torch.Tensor(tpos)
+
+        if not import_from_onnx and not import_from_tflite:
+            tpos = self.obj_ptr_tpos_proj(obj_pos)
+
+        return tpos
+
+
     def _prepare_memory_conditioned_features(
         self,
         frame_idx,
@@ -911,7 +978,8 @@ class SAM2Base(torch.nn.Module):
                         tpos_dim = C if self.proj_tpos_enc_in_obj_ptrs else self.mem_dim
                         obj_pos = torch.tensor(pos_list, device=device)
                         obj_pos = get_1d_sine_pe(obj_pos / t_diff_max, dim=tpos_dim)
-                        obj_pos = self.obj_ptr_tpos_proj(obj_pos)
+                        #obj_pos = self.obj_ptr_tpos_proj(obj_pos)
+                        obj_pos = self.call_obj_ptr_tpos_proj(obj_pos, export_to_onnx=export_to_onnx, import_from_onnx=import_from_onnx, export_to_tflite=export_to_tflite, import_from_tflite=import_from_tflite, model_id=model_id)
                         obj_pos = obj_pos.unsqueeze(1).expand(-1, B, self.mem_dim)
                     else:
                         obj_pos = obj_ptrs.new_zeros(len(pos_list), B, self.mem_dim)
