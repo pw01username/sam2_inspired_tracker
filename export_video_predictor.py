@@ -22,8 +22,6 @@ os.makedirs("output", exist_ok=True)
 os.makedirs("model", exist_ok=True)
 
 # export settings
-model_id = args.model_id
-
 export_to_onnx = args.framework=="onnx" and (args.mode=="export" or args.mode=="both")
 import_from_onnx = args.framework=="onnx" and (args.mode=="import" or args.mode=="both")
 export_to_tflite = args.framework=="tflite" and (args.mode=="export" or args.mode=="both")
@@ -33,20 +31,22 @@ if args.framework=="ailia_tflite" and import_from_tflite:
     import_from_tflite = "ailia_tflite"
 
 # import
+model_id = args.model_id
 if model_id == "hiera_l":
      sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_large.pt"
-     model_cfg = f"sam{args.version}_hiera_l.yaml"
+     model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_l.yaml"
 elif model_id == "hiera_b+":
     sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_base_plus.pt"
-    model_cfg = f"sam{args.version}_hiera_b+.yaml"
+    model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_b+.yaml"
 elif model_id == "hiera_s":
     sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_small.pt"
-    model_cfg = f"sam{args.version}_hiera_s.yaml"
+    model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_s.yaml"
 elif model_id == "hiera_t":
     sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_tiny.pt"
-    model_cfg = f"sam{args.version}_hiera_t.yaml"
+    model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_t.yaml"
 else:
-    raise("unknown model type")
+    print("unknown model id")
+    exit()
 
 # resolution settings
 if args.version == "2.1":

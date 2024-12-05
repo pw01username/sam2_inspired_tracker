@@ -44,16 +44,16 @@ tflite_int8 = args.accuracy == "int8"
 model_id = args.model_id
 if model_id == "hiera_l":
      sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_large.pt"
-     model_cfg = f"sam{args.version}_hiera_l.yaml"
+     model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_l.yaml"
 elif model_id == "hiera_b+":
     sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_base_plus.pt"
-    model_cfg = f"sam{args.version}_hiera_b+.yaml"
+    model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_b+.yaml"
 elif model_id == "hiera_s":
     sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_small.pt"
-    model_cfg = f"sam{args.version}_hiera_s.yaml"
+    model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_s.yaml"
 elif model_id == "hiera_t":
     sam2_checkpoint = f"./checkpoints/sam{args.version}_hiera_tiny.pt"
-    model_cfg = f"sam{args.version}_hiera_t.yaml"
+    model_cfg = f"configs/sam{args.version}/sam{args.version}_hiera_t.yaml"
 else:
     print("unknown model id")
     exit()
@@ -61,7 +61,6 @@ else:
 # resolution settings
 if args.version == "2.1":
     model_id = model_id + "_2.1"
-    model_cfg = f"configs/sam2.1/{model_cfg}"
 if args.image_size == 512:
     model_id = model_id + "_512"
 
