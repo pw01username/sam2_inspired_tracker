@@ -51,7 +51,6 @@ else:
 # resolution settings
 if args.version == "2.1":
     model_id = model_id + "_2.1"
-    model_cfg = f"configs/sam2.1/{model_cfg}"
 if args.image_size == 512:
     model_id = model_id + "_512"
 
