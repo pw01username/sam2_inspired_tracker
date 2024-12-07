@@ -1031,9 +1031,9 @@ class SAM2Base(torch.nn.Module):
         convert_to_static_shape = export_to_tflite or import_from_tflite
         if convert_to_static_shape:
             max_num_frames = 16
-            memory_1_pad = torch.zeros(max_num_frames * 4096, memory_1.shape[1], memory_1.shape[2])
+            memory_1_pad = torch.zeros(max_num_frames * self.sam_image_embedding_size * self.sam_image_embedding_size, memory_1.shape[1], memory_1.shape[2])
             memory_1_pad[:memory_1.shape[0],:,:] = memory_1
-            memory_pos_embed_1_pad = torch.zeros(max_num_frames * 4096, memory_pos_embed_1.shape[1], memory_pos_embed_1.shape[2])
+            memory_pos_embed_1_pad = torch.zeros(max_num_frames * self.sam_image_embedding_size * self.sam_image_embedding_size, memory_pos_embed_1.shape[1], memory_pos_embed_1.shape[2])
             memory_pos_embed_1_pad[:memory_pos_embed_1.shape[0],:,:] = memory_pos_embed_1
             memory_2_pad = torch.zeros(max_num_frames * 4, memory_2.shape[1], memory_2.shape[2])
             memory_2_pad[:memory_2.shape[0],:,:] = memory_2
@@ -1041,7 +1041,7 @@ class SAM2Base(torch.nn.Module):
             memory_pos_embed_2_pad[:memory_pos_embed_2.shape[0],:,:] = memory_pos_embed_2
             memory_2_pad = torch.zeros(max_num_frames * 4, memory_2.shape[1], memory_2.shape[2])
             memory_2_pad[:memory_2.shape[0],:,:] = memory_2
-            attention_mask_1 = torch.zeros(max_num_frames * 4096, memory_1.shape[1], dtype=torch.bool)
+            attention_mask_1 = torch.zeros(max_num_frames * self.sam_image_embedding_size * self.sam_image_embedding_size, memory_1.shape[1], dtype=torch.bool)
             attention_mask_2 = torch.zeros(max_num_frames * 4, memory_2.shape[1], dtype=torch.bool)
             attention_mask_1[:memory_1.shape[0],:] = True
             attention_mask_2[:memory_2.shape[0],:] = True
