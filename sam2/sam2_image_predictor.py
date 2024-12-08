@@ -744,7 +744,7 @@ class SAM2ImagePredictor:
 
         if not import_from_onnx and not import_from_tflite:
             self.model.sam_mask_decoder.forward = self.model.sam_mask_decoder.forward_normal
-            masks, iou_pred, sam_tokens_out, object_score_logits = self.model.sam_mask_decoder(
+            low_res_masks, iou_predictions, _, _  = self.model.sam_mask_decoder(
                 image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
                 image_pe=dense_pe,
                 sparse_prompt_embeddings=sparse_embeddings,
@@ -754,7 +754,6 @@ class SAM2ImagePredictor:
                 high_res_features1=high_res_features[0],
                 high_res_features2=high_res_features[1],
             )
-            low_res_masks, iou_predictions, _, _  = self.model.sam_mask_decoder.forward_postprocess(masks, iou_pred, sam_tokens_out, object_score_logits, multimask_output)
 
         # Upscale the masks to the original image resolution
         masks = self._transforms.postprocess_masks(
