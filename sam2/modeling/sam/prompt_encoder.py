@@ -113,9 +113,12 @@ class PromptEncoder(nn.Module):
         table[2] = self.point_embeddings[1].weight
         table[3] = self.point_embeddings[2].weight
         table[4] = self.point_embeddings[3].weight
-        for i in range(labels.shape[0]):
-            point_embedding[i] = point_embedding[i] + table[labels[i] + 1]
-
+        for b in range(labels.shape[0]):
+            for i in range(labels.shape[1]):
+                if labels[b][i] == -1:
+                    point_embedding[b][i] = table[labels[b][i] + 1]
+                else:
+                    point_embedding[b][i] = point_embedding[b][i] + table[labels[b][i] + 1]
         return point_embedding
 
     def _embed_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
