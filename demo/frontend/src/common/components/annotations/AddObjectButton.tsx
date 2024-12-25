@@ -15,18 +15,33 @@
  */
 import useMessagesSnackbar from '@/common/components/snackbar/useDemoMessagesSnackbar';
 import useVideo from '@/common/components/video/editor/useVideo';
-import {activeTrackletObjectIdAtom, labelTypeAtom} from '@/demo/atoms';
+import {
+  activeTrackletObjectIdAtom,
+  isStreamingAtom,
+  labelTypeAtom,
+} from '@/demo/atoms';
 import {Add} from '@carbon/icons-react';
-import {useSetAtom} from 'jotai';
+import {useAtomValue, useSetAtom} from 'jotai';
 
 export default function AddObjectButton() {
   const video = useVideo();
   const setActiveTrackletId = useSetAtom(activeTrackletObjectIdAtom);
+  const isStreaming = useAtomValue(isStreamingAtom);
   const setLabelType = useSetAtom(labelTypeAtom);
   const {enqueueMessage} = useMessagesSnackbar();
 
   async function addObject() {
     enqueueMessage('addObjectClick');
+
+    // Make sure video is paused to allow users adding clicks. Either abort
+    // streaming if propagation is running or simply pause the video.
+    if (isStreaming) {
+      void video?.abortStreamMasks();
+    } else {
+      video?.pause();
+    }
+
+    // Create tracklet for video.
     const tracklet = await video?.createTracklet();
     if (tracklet != null) {
       setActiveTrackletId(tracklet.id);
