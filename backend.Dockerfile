@@ -14,7 +14,7 @@ ENV PYTHONUNBUFFERED=1
 ENV SAM2_BUILD_CUDA=0
 ENV MODEL_SIZE=${MODEL_SIZE}
 
-# Install system requirements
+# Install system requirements including ffmpeg with necessary codecs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libavutil-dev \
@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libswscale-dev \
     pkg-config \
     build-essential \
-    libffi-dev
+    libffi-dev \
+    libx264-dev
 
 COPY setup.py .
 COPY README.md .
@@ -31,8 +32,10 @@ COPY README.md .
 RUN pip install --upgrade pip setuptools
 RUN pip install -e ".[interactive-demo]"
 
-# https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite/issues/69#issuecomment-1826764707
-RUN rm /opt/conda/bin/ffmpeg && ln -s /bin/ffmpeg /opt/conda/bin/ffmpeg
+# Remove conda's ffmpeg and link to system ffmpeg that has proper codec support
+# Additional Context: https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite/issues/69#issuecomment-1826764707
+RUN rm -f /opt/conda/bin/ffmpeg && \
+    ln -s /usr/bin/ffmpeg /opt/conda/bin/ffmpeg
 
 # Make app directory. This directory will host all files required for the
 # backend and SAM 2 inference files.
