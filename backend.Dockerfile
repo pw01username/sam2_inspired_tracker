@@ -30,6 +30,7 @@ COPY README.md .
 
 RUN pip install --upgrade pip setuptools
 RUN pip install -e ".[interactive-demo]"
+RUN pip uninstall -y av && pip install av==13.1.0
 
 # https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite/issues/69#issuecomment-1826764707
 RUN rm /opt/conda/bin/ffmpeg && ln -s /bin/ffmpeg /opt/conda/bin/ffmpeg
