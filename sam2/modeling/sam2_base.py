@@ -10,7 +10,9 @@ import torch.nn.functional as F
 
 from torch.nn.init import trunc_normal_
 
-from sam2.modeling.sam.mask_decoder import MaskDecoder
+#from sam2.modeling.sam.mask_decoder import MaskDecoder
+from sam2.modeling.sam.box_decoder import BoxDecoder  # new bounding-box decoder
+
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
@@ -220,8 +222,7 @@ class SAM2Base(torch.nn.Module):
             input_image_size=(self.image_size, self.image_size),
             mask_in_chans=16,
         )
-        self.sam_mask_decoder = MaskDecoder(
-            num_multimask_outputs=3,
+        self.sam_box_decoder = BoxDecoder(
             transformer=TwoWayTransformer(
                 depth=2,
                 embedding_dim=self.sam_prompt_embed_dim,
@@ -229,13 +230,8 @@ class SAM2Base(torch.nn.Module):
                 num_heads=8,
             ),
             transformer_dim=self.sam_prompt_embed_dim,
-            iou_head_depth=3,
-            iou_head_hidden_dim=256,
-            use_high_res_features=self.use_high_res_features_in_sam,
-            iou_prediction_use_sigmoid=self.iou_prediction_use_sigmoid,
             pred_obj_scores=self.pred_obj_scores,
             pred_obj_scores_mlp=self.pred_obj_scores_mlp,
-            use_multimask_token_for_obj_ptr=self.use_multimask_token_for_obj_ptr,
             **(self.sam_mask_decoder_extra_args or {}),
         )
         if self.use_obj_ptrs_in_encoder:
@@ -337,80 +333,32 @@ class SAM2Base(torch.nn.Module):
             # a learned `no_mask_embed` to indicate no mask input in this case).
             sam_mask_prompt = None
 
+        # Prompt encoder outputs
         sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
             points=(sam_point_coords, sam_point_labels),
             boxes=None,
             masks=sam_mask_prompt,
         )
-        (
-            low_res_multimasks,
-            ious,
-            sam_output_tokens,
-            object_score_logits,
-        ) = self.sam_mask_decoder(
+
+        # We feed features into BoxDecoder
+        box_coords, object_score_logits, box_tokens_out = self.sam_box_decoder(
             image_embeddings=backbone_features,
             image_pe=self.sam_prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-            repeat_image=False,  # the image is already batched
-            high_res_features=high_res_features,
+            repeat_image=False,
+            high_res_features=high_res_features
         )
+
+        # Return bounding boxes [B, num_box_outputs, 4], object scores, and object pointer
+        # "obj_ptr" is taken as the main token from the output, analog to old 'mask token'
+        obj_ptr = box_tokens_out[:, 0, :]  # shape [B, C]
         if self.pred_obj_scores:
+            # A simple gating on whether object is present
             is_obj_appearing = object_score_logits > 0
+            obj_ptr = torch.where(is_obj_appearing, obj_ptr, self.no_obj_ptr)
 
-            # Mask used for spatial memories is always a *hard* choice between obj and no obj,
-            # consistent with the actual mask prediction
-            low_res_multimasks = torch.where(
-                is_obj_appearing[:, None, None],
-                low_res_multimasks,
-                NO_OBJ_SCORE,
-            )
-
-        # convert masks from possibly bfloat16 (or float16) to float32
-        # (older PyTorch versions before 2.1 don't support `interpolate` on bf16)
-        low_res_multimasks = low_res_multimasks.float()
-        high_res_multimasks = F.interpolate(
-            low_res_multimasks,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        sam_output_token = sam_output_tokens[:, 0]
-        if multimask_output:
-            # take the best mask prediction (with the highest IoU estimation)
-            best_iou_inds = torch.argmax(ious, dim=-1)
-            batch_inds = torch.arange(B, device=device)
-            low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            if sam_output_tokens.size(1) > 1:
-                sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
-        else:
-            low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
-
-        # Extract object pointer from the SAM output token (with occlusion handling)
-        obj_ptr = self.obj_ptr_proj(sam_output_token)
-        if self.pred_obj_scores:
-            # Allow *soft* no obj ptr, unlike for masks
-            if self.soft_no_obj_ptr:
-                lambda_is_obj_appearing = object_score_logits.sigmoid()
-            else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
-
-            if self.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
-
-        return (
-            low_res_multimasks,
-            high_res_multimasks,
-            ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        )
+        return box_coords, object_score_logits, obj_ptr
 
     def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
         """
@@ -675,55 +623,89 @@ class SAM2Base(torch.nn.Module):
         pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
         return pix_feat_with_mem
 
-    def _encode_new_memory(
-        self,
-        current_vision_feats,
-        feat_sizes,
-        pred_masks_high_res,
-        object_score_logits,
-        is_mask_from_pts,
-    ):
-        """Encode the current image and its prediction into a memory feature."""
-        B = current_vision_feats[-1].size(1)  # batch size on this frame
-        C = self.hidden_dim
-        H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
-        # top-level feature, (HW)BC => BCHW
-        pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
-        if self.non_overlap_masks_for_mem_enc and not self.training:
-            # optionally, apply non-overlapping constraints to the masks (it's applied
-            # in the batch dimension and should only be used during eval, where all
-            # the objects come from the same video under batch size 1).
-            pred_masks_high_res = self._apply_non_overlapping_constraints(
-                pred_masks_high_res
-            )
-        # scale the raw mask logits with a temperature before applying sigmoid
-        binarize = self.binarize_mask_from_pts_for_mem_enc and is_mask_from_pts
-        if binarize and not self.training:
-            mask_for_mem = (pred_masks_high_res > 0).float()
-        else:
-            # apply sigmoid on the raw mask logits to turn them into range (0, 1)
-            mask_for_mem = torch.sigmoid(pred_masks_high_res)
-        # apply scale and bias terms to the sigmoid probabilities
-        if self.sigmoid_scale_for_mem_enc != 1.0:
-            mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
-        if self.sigmoid_bias_for_mem_enc != 0.0:
-            mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
-        maskmem_out = self.memory_encoder(
-            pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
-        )
-        maskmem_features = maskmem_out["vision_features"]
-        maskmem_pos_enc = maskmem_out["vision_pos_enc"]
-        # add a no-object embedding to the spatial memory to indicate that the frame
-        # is predicted to be occluded (i.e. no object is appearing in the frame)
-        if self.no_obj_embed_spatial is not None:
-            is_obj_appearing = (object_score_logits > 0).float()
-            maskmem_features += (
-                1 - is_obj_appearing[..., None, None]
-            ) * self.no_obj_embed_spatial[..., None, None].expand(
-                *maskmem_features.shape
-            )
+    # def _encode_new_memory(
+    #     self,
+    #     current_vision_feats,
+    #     feat_sizes,
+    #     pred_masks_high_res,
+    #     object_score_logits,
+    #     is_mask_from_pts,
+    # ):
+    #     """Encode the current image and its prediction into a memory feature."""
+    #     B = current_vision_feats[-1].size(1)  # batch size on this frame
+    #     C = self.hidden_dim
+    #     H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
+    #     # top-level feature, (HW)BC => BCHW
+    #     pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
+    #     if self.non_overlap_masks_for_mem_enc and not self.training:
+    #         # optionally, apply non-overlapping constraints to the masks (it's applied
+    #         # in the batch dimension and should only be used during eval, where all
+    #         # the objects come from the same video under batch size 1).
+    #         pred_masks_high_res = self._apply_non_overlapping_constraints(
+    #             pred_masks_high_res
+    #         )
+    #     # scale the raw mask logits with a temperature before applying sigmoid
+    #     binarize = self.binarize_mask_from_pts_for_mem_enc and is_mask_from_pts
+    #     if binarize and not self.training:
+    #         mask_for_mem = (pred_masks_high_res > 0).float()
+    #     else:
+    #         # apply sigmoid on the raw mask logits to turn them into range (0, 1)
+    #         mask_for_mem = torch.sigmoid(pred_masks_high_res)
+    #     # apply scale and bias terms to the sigmoid probabilities
+    #     if self.sigmoid_scale_for_mem_enc != 1.0:
+    #         mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
+    #     if self.sigmoid_bias_for_mem_enc != 0.0:
+    #         mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
+    #     maskmem_out = self.memory_encoder(
+    #         pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
+    #     )
+    #     maskmem_features = maskmem_out["vision_features"]
+    #     maskmem_pos_enc = maskmem_out["vision_pos_enc"]
+    #     # add a no-object embedding to the spatial memory to indicate that the frame
+    #     # is predicted to be occluded (i.e. no object is appearing in the frame)
+    #     if self.no_obj_embed_spatial is not None:
+    #         is_obj_appearing = (object_score_logits > 0).float()
+    #         maskmem_features += (
+    #             1 - is_obj_appearing[..., None, None]
+    #         ) * self.no_obj_embed_spatial[..., None, None].expand(
+    #             *maskmem_features.shape
+    #         )
 
-        return maskmem_features, maskmem_pos_enc
+    #     return maskmem_features, maskmem_pos_enc
+
+    def _encode_new_box_memory(
+        self,
+        fused_pix_feat,
+        feat_size,
+        box_coords,
+        object_score_logits,
+    ):
+        """
+        Example function to turn bounding boxes into a spatial memory representation.
+        This is analogous to the old `_encode_new_memory` but for bounding boxes.
+        """
+        B, _, H, W = fused_pix_feat.shape
+        device = fused_pix_feat.device
+
+        # Optionally, create a "box heatmap" or "box mask" to feed into MemoryEncoder
+        # For brevity, we just show a stub. In practice, you'd rasterize the boxes:
+        box_mask = torch.zeros(B, 1, H * 16, W * 16, device=device)
+        for b in range(B):
+            for box in box_coords[b]:
+                x1, y1, x2, y2 = box.round().int()
+                # clamp into image size
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(x2, W * 16 - 1), min(y2, H * 16 - 1)
+                box_mask[b, 0, y1:y2, x1:x2] = 1.0
+
+        memory_out = self.memory_encoder(
+            pix_feat=fused_pix_feat,
+            masks=box_mask,
+            skip_mask_sigmoid=True  # we already have 0/1 box region
+        )
+        boxmem_features = memory_out["vision_features"]
+        boxmem_pos_enc = memory_out["vision_pos_enc"]
+        return boxmem_features, boxmem_pos_enc
 
     def _track_step(
         self,
@@ -822,59 +804,70 @@ class SAM2Base(torch.nn.Module):
         mask_inputs,
         output_dict,
         num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
-        # Whether to run the memory encoder on the predicted masks. Sometimes we might want
-        # to skip the memory encoder with `run_mem_encoder=False`. For example,
-        # in demo we might call `track_step` multiple times for each user click,
-        # and only encode the memory when the user finalizes their clicks. And in ablation
-        # settings like SAM training on static images, we don't need the memory encoder.
+        track_in_reverse=False,
         run_mem_encoder=True,
-        # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
-        prev_sam_mask_logits=None,
+        prev_sam_mask_logits=None,  # unused now, but kept for API compatibility
     ):
-        current_out, sam_outputs, _, _ = self._track_step(
-            frame_idx,
-            is_init_cond_frame,
-            current_vision_feats,
-            current_vision_pos_embeds,
-            feat_sizes,
-            point_inputs,
-            mask_inputs,
-            output_dict,
-            num_frames,
-            track_in_reverse,
-            prev_sam_mask_logits,
+        """
+        Updated to predict bounding boxes instead of masks,
+        and store them in memory if needed.
+        """
+        current_out = {
+            "point_inputs": point_inputs,
+            "mask_inputs": mask_inputs,
+        }
+
+        # Possibly fuse current frame with memory
+        fused_pix_feat = self._prepare_memory_conditioned_features(
+            frame_idx=frame_idx,
+            is_init_cond_frame=is_init_cond_frame,
+            current_vision_feats=current_vision_feats[-1:],
+            current_vision_pos_embeds=current_vision_pos_embeds[-1:],
+            feat_sizes=feat_sizes[-1:],
+            output_dict=output_dict,
+            num_frames=num_frames,
+            track_in_reverse=track_in_reverse,
         )
 
-        (
-            _,
-            _,
-            _,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        ) = sam_outputs
+        # For multi-scale features if needed
+        if len(current_vision_feats) > 1:
+            high_res_features = [
+                x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
+                for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
+            ]
+        else:
+            high_res_features = None
 
-        current_out["pred_masks"] = low_res_masks
-        current_out["pred_masks_high_res"] = high_res_masks
+        # Forward the bounding box decoder
+        box_coords, object_score_logits, obj_ptr = self._forward_sam_heads(
+            backbone_features=fused_pix_feat,
+            point_inputs=point_inputs,
+            mask_inputs=mask_inputs,
+            high_res_features=high_res_features,
+        )
+
+        # Store predictions
+        current_out["pred_boxes"] = box_coords  # shape [B, num_box_outputs, 4]
+        current_out["object_score_logits"] = object_score_logits
         current_out["obj_ptr"] = obj_ptr
-        if not self.training:
-            # Only add this in inference (to avoid unused param in activation checkpointing;
-            # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
-            current_out["object_score_logits"] = object_score_logits
 
-        # Finally run the memory encoder on the predicted mask to encode
-        # it into a new memory feature (that can be used in future frames)
-        self._encode_memory_in_output(
-            current_vision_feats,
-            feat_sizes,
-            point_inputs,
-            run_mem_encoder,
-            high_res_masks,
-            object_score_logits,
-            current_out,
-        )
+        # Encode bounding box memory if needed
+        if run_mem_encoder and self.num_maskmem > 0:
+            # Here you'd do something akin to the old `_encode_new_memory`,
+            # but for bounding boxes. Possibly store bounding box embeddings
+            # or a "box heatmap" that your memory encoder can handle.
+            # Example:
+            boxmem_features, boxmem_pos_enc = self._encode_new_box_memory(
+                fused_pix_feat,
+                feat_sizes[-1],
+                box_coords,
+                object_score_logits
+            )
+            current_out["maskmem_features"] = boxmem_features
+            current_out["maskmem_pos_enc"] = boxmem_pos_enc
+        else:
+            current_out["maskmem_features"] = None
+            current_out["maskmem_pos_enc"] = None
 
         return current_out
 
