@@ -143,6 +143,7 @@ class MemoryEncoder(nn.Module):
         fuser,
         position_encoding,
         in_dim=256,  # in_dim of pix_feats
+        embedding_dim=8,  # in_dim of instance embeddings
     ):
         super().__init__()
 
@@ -154,12 +155,21 @@ class MemoryEncoder(nn.Module):
         self.out_proj = nn.Identity()
         if out_dim != in_dim:
             self.out_proj = nn.Conv2d(in_dim, out_dim, kernel_size=1)
+            
+        # New: Projection for instance embeddings
+        # self.instance_embedding_proj = nn.Sequential(
+        #     nn.Conv2d(embedding_dim, in_dim // 2, kernel_size=1),
+        #     nn.GroupNorm(8, in_dim // 2),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(in_dim // 2, in_dim, kernel_size=1)
+        # )
 
     def forward(
         self,
         pix_feat: torch.Tensor,
         masks: torch.Tensor,
         skip_mask_sigmoid: bool = False,
+        instance_ids: torch.Tensor = None,  # new
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         ## Process masks
         # sigmoid, so that less domain shift from gt masks which are bool
@@ -173,6 +183,26 @@ class MemoryEncoder(nn.Module):
 
         x = self.pix_feat_proj(pix_feat)
         x = x + masks
+
+        # *** New: Multiply by a factor encoding instance IDs ***
+        # We assume instance_ids are in the range [1,125]. We normalize by dividing by 125
+        if instance_ids is not None and 1 == 0: # TODO NOTE: Disabled for now to see if results are better
+            # Compute a scaling factor (e.g. 1 + id/125) to avoid zeros.
+            instance_scale = 1.0 + (instance_ids.float() / 125.0)
+            
+            sqrt_size = int(math.sqrt(instance_scale.shape[-1]))
+            instance_scale = instance_scale.view(instance_scale.shape[0], instance_scale.shape[1], sqrt_size, sqrt_size)
+            # Now interpolate to target size
+            instance_scale = F.interpolate(
+                instance_scale, 
+                size=(x.shape[2], x.shape[3]),
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            # Multiply each channel by the scaling factor (broadcast along channel dimension)
+            x = x * instance_scale
+
         x = self.fuser(x)
         x = self.out_proj(x)
 

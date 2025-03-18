@@ -1,21 +1,23 @@
 # @package _global_
 
 scratch:
-  resolution: 1024
+  resolution: 256 #1024
   train_batch_size: 1
-  num_train_workers: 10
+  num_train_workers: 1 #10
   num_frames: 8
   max_num_objects: 3
-  base_lr: 5.0e-6
+  base_lr: 5.0e-1 # original 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
   num_epochs: 40
 
 dataset:
   # PATHS to Dataset
-  img_folder: null # PATH to MOSE JPEGImages folder
-  gt_folder: null  # PATH to MOSE Annotations folder
-  file_list_txt: training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  #img_folder: C:\Users\patrick.wulff\Downloads\DAVIS-2017-trainval-480p\DAVIS\JPEGImages # PATH to MOSE JPEGImages folder
+  #gt_folder: C:\Users\patrick.wulff\Downloads\DAVIS-2017-trainval-480p\DAVIS\Annotations  # PATH to MOSE Annotations folder
+  img_folder: /davis/DAVIS/JPEGImages
+  gt_folder: /davis/DAVIS/Annotations
+  file_list_txt: null #training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 2
 
 # Video transforms
@@ -178,19 +180,19 @@ trainer:
 
     ####### Training specific params #######
     # box/point input and corrections
-    prob_to_use_pt_input_for_train: 0.5
+    prob_to_use_pt_input_for_train: 0.0
     prob_to_use_pt_input_for_eval: 0.0
-    prob_to_use_box_input_for_train: 0.5  # 0.5*0.5 = 0.25 prob to use box instead of points
+    prob_to_use_box_input_for_train: 0  # 0.5*0.5 = 0.25 prob to use box instead of points
     prob_to_use_box_input_for_eval: 0.0
-    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
-    num_frames_to_correct_for_train: 2  # iteratively sample on random 1~2 frames (always include the first frame)
-    num_frames_to_correct_for_eval: 1  # only iteratively sample on first frame
+    prob_to_sample_from_gt_for_train: 0  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    num_frames_to_correct_for_train: 0  # iteratively sample on random 1~2 frames (always include the first frame)
+    num_frames_to_correct_for_eval: 0  # only iteratively sample on first frame
     rand_frames_to_correct_for_train: True  # random #init-cond-frame ~ 2
     add_all_frames_to_correct_as_cond: True  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
     # maximum 2 initial conditioning frames
-    num_init_cond_frames_for_train: 2
-    rand_init_cond_frames_for_train: True  # random 1~2
-    num_correction_pt_per_frame: 7
+    num_init_cond_frames_for_train: 1 # original was 2
+    rand_init_cond_frames_for_train: False  # random 1~2
+    num_correction_pt_per_frame: 0 # original 7
     use_act_ckpt_iterative_pt_sampling: false
     
 
@@ -205,7 +207,7 @@ trainer:
       phases_per_epoch: ${scratch.phases_per_epoch}
       batch_sizes:
         - ${scratch.train_batch_size}
-
+      
       datasets:
         - _target_: training.dataset.utils.RepeatFactorWrapper
           dataset:
@@ -282,10 +284,11 @@ trainer:
     all:
       _target_: training.loss_fns.MultiStepMultiMasksAndIous
       weight_dict:
-        loss_mask: 20
+        loss_mask: 3
         loss_dice: 1
         loss_iou: 1
         loss_class: 1
+        loss_instance: 50
       supervise_all_iou: true
       iou_use_l1_loss: true
       pred_obj_scores: true
@@ -293,14 +296,14 @@ trainer:
       focal_alpha_obj_score: -1.0
 
   distributed:
-    backend: nccl
+    backend: gloo
     find_unused_parameters: True
 
   logging:
     tensorboard_writer:
       _target_: training.utils.logger.make_tensorboard_logger
       log_dir:  ${launcher.experiment_log_dir}/tensorboard
-      flush_secs: 120
+      flush_secs: 10
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
@@ -308,11 +311,11 @@ trainer:
   # initialize from a SAM 2 checkpoint
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 0 # 0 only last checkpoint is saved.
+    save_freq: 1 # 0 only last checkpoint is saved.
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
-      strict: True
+      strict: False
       ignore_unexpected_keys: null
       ignore_missing_keys: null
 
@@ -323,7 +326,7 @@ trainer:
 
 launcher:
   num_nodes: 1
-  gpus_per_node: 8
+  gpus_per_node: 1
   experiment_log_dir: null # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster

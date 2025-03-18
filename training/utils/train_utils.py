@@ -4,6 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import subprocess
+
+
 import logging
 import math
 import os
@@ -200,7 +203,34 @@ class MemMeter:
         self._allow_updates = True
 
     def update(self, n=1, reset_peak_usage=True):
-        self.val = torch.cuda.max_memory_allocated() // 1e9
+        #self.val = torch.cuda.max_memory_allocated() // 1e9 gives wrong value for ROCM
+
+        # Run the rocm-smi command to get memory info
+        result = subprocess.run(['rocm-smi', '--showmeminfo', 'vram'], stdout=subprocess.PIPE)
+        memory_info = result.stdout.decode('utf-8')
+
+        # Regex patterns to capture total and used memory from the relevant lines
+        total_memory_pattern = re.compile(r'VRAM Total Memory \(B\):\s*(\d+)')
+        used_memory_pattern = re.compile(r'VRAM Total Used Memory \(B\):\s*(\d+)')
+
+        total_memory = 0
+        used_memory = 0
+
+        # Search for total and used memory lines
+        for line in memory_info.splitlines():
+            total_match = total_memory_pattern.search(line)
+            used_match = used_memory_pattern.search(line)
+            if total_match:
+                total_memory = int(total_match.group(1)) / 1e9  # Convert bytes to GB
+            if used_match:
+                used_memory = int(used_match.group(1)) / 1e9   # Convert bytes to GB
+
+        if total_memory and used_memory:
+            self.val = used_memory
+        else:
+            print(f"Error parsing memory info: {memory_info}")
+            self.val = -1
+
         self.sum += self.val * n
         self.count += n
         self.avg = self.sum / self.count

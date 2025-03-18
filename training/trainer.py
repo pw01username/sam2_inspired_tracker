@@ -222,6 +222,7 @@ class Trainer:
                 # if there is not a checkpoint to resume from already there
                 makedir(self.checkpoint_conf.save_dir)
                 g_pathmgr.copy(self.checkpoint_conf.resume_from, dst)
+                print("using checkpoint from", self.checkpoint_conf.resume_from, self.checkpoint_conf.save_dir)
             barrier()
 
         self.load_checkpoint()
@@ -349,6 +350,7 @@ class Trainer:
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
             "best_meter_values": self.best_meter_values,
+            "save_best_meters": ["Losses/train_all_core_loss"],
         }
         if self.optim_conf.amp.enabled:
             checkpoint["scaler"] = self.scaler.state_dict()
@@ -431,7 +433,7 @@ class Trainer:
         )
 
         self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.loss.load_state_dict(checkpoint["loss"], strict=True)
+        self.loss.load_state_dict(checkpoint["loss"], strict=False)
         self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"]
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed")
@@ -453,13 +455,14 @@ class Trainer:
         model: nn.Module,
         phase: str,
     ):
-
         outputs = model(batch)
-        targets = batch.masks
+        targets = batch.combined_masks #batch.masks
+        
+        instance_ids = batch.instance_maps  # Get instance IDs from batch
         batch_size = len(batch.img_batch)
 
         key = batch.dict_key  # key for dataset
-        loss = self.loss[key](outputs, targets)
+        loss = self.loss[key](outputs, targets, instance_ids) # pass instance ids to loss function
         loss_str = f"Losses/{phase}_{key}_loss"
 
         loss_log_str = os.path.join("Step_Losses", loss_str)
@@ -620,7 +623,6 @@ class Trainer:
             data_time.update(time.time() - end)
 
             batch = batch.to(self.device, non_blocking=True)
-
             # compute output
             with torch.no_grad():
                 with torch.cuda.amp.autocast(
@@ -744,9 +746,12 @@ class Trainer:
             batch = batch.to(
                 self.device, non_blocking=True
             )  # move tensors in a tensorclass
-
+            
             try:
                 self._run_step(batch, phase, loss_mts, extra_loss_mts)
+
+                if hasattr(self.model, 'current_step'):
+                    self.model.current_step = self.steps[phase]
 
                 # compute gradient and do optim step
                 exact_epoch = self.epoch + float(data_iter) / iters_per_epoch
@@ -858,9 +863,10 @@ class Trainer:
         # grads will also update a model even if the step doesn't produce
         # gradients
         self.optim.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(
+        with torch.amp.autocast(
             enabled=self.optim_conf.amp.enabled,
             dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
+            device_type='cuda'
         ):
             loss_dict, batch_size, extra_losses = self._step(
                 batch,
@@ -993,7 +999,14 @@ class Trainer:
         self.logger = Logger(self.logging_conf)
 
         self.model = instantiate(self.model_conf, _convert_="all")
-        print_model_summary(self.model)
+        # Make the logger accessible to the model for visualization
+        if hasattr(self.model, 'set_logger'):
+            self.model.set_logger(self.logger)
+        else:
+            # If the method doesn't exist, attach directly
+            self.model.logger = self.logger
+        
+        #print_model_summary(self.model)
 
         self.loss = None
         if self.loss_conf:

@@ -175,7 +175,7 @@ def load_video_frames(
     offload_video_to_cpu,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
-    async_loading_frames=False,
+    async_loading_frames=True,
     compute_device=torch.device("cuda"),
 ):
     """
@@ -216,7 +216,7 @@ def load_video_frames_from_jpg_images(
     offload_video_to_cpu,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
-    async_loading_frames=False,
+    async_loading_frames=True,
     compute_device=torch.device("cuda"),
 ):
     """

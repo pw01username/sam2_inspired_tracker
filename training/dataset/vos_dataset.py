@@ -88,10 +88,15 @@ class VOSDataset(VisionDataset):
         # Iterate over the sampled frames and store their rgb data and object data (bbox, segment)
         for frame_idx, frame in enumerate(sampled_frames):
             w, h = rgb_images[frame_idx].size
+            
+            # New: Initialize an instance ID map with zeros (background)
+            instance_id_map = torch.zeros((h, w), dtype=torch.float32)
+            
             images.append(
                 Frame(
                     data=rgb_images[frame_idx],
                     objects=[],
+                    instance_id_map=instance_id_map,  # Add instance ID map to Frame
                 )
             )
             # We load the gt segments associated with the current frame
@@ -109,6 +114,9 @@ class VOSDataset(VisionDataset):
                     ), "None targets are not supported"
                     # segment is uint8 and remains uint8 throughout the transforms
                     segment = segments[obj_id].to(torch.uint8)
+                    
+                    # New: Update instance ID map - set pixels with this object to the object ID
+                    instance_id_map[segment > 0] = obj_id
                 else:
                     # There is no target, we either use a zero mask target or drop this object
                     if not self.always_target:
@@ -126,6 +134,8 @@ class VOSDataset(VisionDataset):
             frames=images,
             video_id=video.video_id,
             size=(h, w),
+            # Store the instance ID map at the video level as well if needed
+            instance_id_maps=[frame.instance_id_map for frame in images],
         )
 
     def __getitem__(self, idx):

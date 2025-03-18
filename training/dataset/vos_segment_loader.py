@@ -20,6 +20,26 @@ except:
     pass
 
 
+def create_instance_id_map(binary_segments):
+    """
+    Convert a dictionary of binary masks into a single instance ID map.
+    
+    Args:
+        binary_segments: Dictionary mapping object IDs to binary masks
+        
+    Returns:
+        instance_id_map: A tensor where each pixel value equals the object ID
+    """
+    # Initialize with zeros (background)
+    instance_id_map = torch.zeros_like(list(binary_segments.values())[0], dtype=torch.float)
+    
+    # Assign each object ID to its corresponding pixels
+    for obj_id, mask in binary_segments.items():
+        # Only update pixels where this object's mask is True
+        instance_id_map[mask > 0] = obj_id
+        
+    return instance_id_map
+
 class JSONSegmentLoader:
     def __init__(self, video_json_path, ann_every=1, frames_fps=24, valid_obj_ids=None):
         # Annotations in the json are provided every ann_every th frame

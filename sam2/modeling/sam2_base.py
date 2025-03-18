@@ -26,7 +26,7 @@ class SAM2Base(torch.nn.Module):
         memory_attention,
         memory_encoder,
         num_maskmem=7,  # default 1 input frame + 6 previous frames
-        image_size=512,
+        image_size=256,
         backbone_stride=16,  # stride of the image backbone output
         sigmoid_scale_for_mem_enc=1.0,  # scale factor for mask sigmoid prob
         sigmoid_bias_for_mem_enc=0.0,  # bias factor for mask sigmoid prob
@@ -302,6 +302,7 @@ class SAM2Base(torch.nn.Module):
           based on the output token from the SAM mask decoder.
         """
         B = backbone_features.size(0)
+        
         device = backbone_features.device
         assert backbone_features.size(1) == self.sam_prompt_embed_dim
         assert backbone_features.size(2) == self.sam_image_embedding_size
@@ -321,7 +322,8 @@ class SAM2Base(torch.nn.Module):
         if mask_inputs is not None:
             # If mask_inputs is provided, downsize it into low-res mask input if needed
             # and feed it as a dense mask prompt into the SAM mask encoder
-            assert len(mask_inputs.shape) == 4 and mask_inputs.shape[:2] == (B, 1)
+            
+            #assert len(mask_inputs.shape) == 4 and mask_inputs.shape[:2] == (B, 1)
             if mask_inputs.shape[-2:] != self.sam_prompt_encoder.mask_input_size:
                 sam_mask_prompt = F.interpolate(
                     mask_inputs.float(),
@@ -347,6 +349,7 @@ class SAM2Base(torch.nn.Module):
             ious,
             sam_output_tokens,
             object_score_logits,
+            dual_output
         ) = self.sam_mask_decoder(
             image_embeddings=backbone_features,
             image_pe=self.sam_prompt_encoder.get_dense_pe(),
@@ -356,6 +359,18 @@ class SAM2Base(torch.nn.Module):
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
         )
+        
+        # Now dual_output contains both the mask and instance ID predictions
+        # Extract instance IDs from the dual-channel output
+        pred_instance_ids = dual_output[:, :, :, 1:].permute(0, 3, 1, 2)  # (B, 1, h, w)
+        
+        # Upsample instance IDs to the same size as high_res_masks
+        high_res_instance_ids = F.interpolate(
+            pred_instance_ids,
+            size=(self.image_size, self.image_size),
+            mode="nearest",  # Use nearest neighbor to preserve instance ID values
+        )
+        
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
 
@@ -410,6 +425,7 @@ class SAM2Base(torch.nn.Module):
             high_res_masks,
             obj_ptr,
             object_score_logits,
+            high_res_instance_ids
         )
 
     def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
@@ -430,6 +446,7 @@ class SAM2Base(torch.nn.Module):
         )
         # a dummy IoU prediction of all 1's under mask input
         ious = mask_inputs.new_ones(mask_inputs.size(0), 1).float()
+        high_res_instance_ids = torch.zeros_like(high_res_masks)
         if not self.use_obj_ptrs_in_encoder:
             # all zeros as a dummy object pointer (of shape [B, C])
             obj_ptr = torch.zeros(
@@ -437,7 +454,7 @@ class SAM2Base(torch.nn.Module):
             )
         else:
             # produce an object pointer using the SAM decoder from the mask input
-            _, _, _, _, _, obj_ptr, _ = self._forward_sam_heads(
+            _, _, _, _, _, obj_ptr, _, high_res_instance_ids = self._forward_sam_heads(
                 backbone_features=backbone_features,
                 mask_inputs=self.mask_downsample(mask_inputs_float),
                 high_res_features=high_res_features,
@@ -462,11 +479,13 @@ class SAM2Base(torch.nn.Module):
             high_res_masks,
             obj_ptr,
             object_score_logits,
+            high_res_instance_ids,  # Add instance IDs to return values
         )
 
     def forward_image(self, img_batch: torch.Tensor):
         """Get the image feature on the input batch."""
         backbone_out = self.image_encoder(img_batch)
+        
         if self.use_high_res_features_in_sam:
             # precompute projected level 0 and level 1 features in SAM decoder
             # to avoid running it again on every SAM click
@@ -507,6 +526,7 @@ class SAM2Base(torch.nn.Module):
     ):
         """Fuse the current frame's visual feature map with previous memory."""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
+        
         C = self.hidden_dim
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         device = current_vision_feats[-1].device
@@ -682,6 +702,7 @@ class SAM2Base(torch.nn.Module):
         pred_masks_high_res,
         object_score_logits,
         is_mask_from_pts,
+        instance_ids=None,   # NEW: optional instance IDs
     ):
         """Encode the current image and its prediction into a memory feature."""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
@@ -708,8 +729,10 @@ class SAM2Base(torch.nn.Module):
             mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
         if self.sigmoid_bias_for_mem_enc != 0.0:
             mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
+        
+        # NEW: Pass instance_ids (if available) to the memory encoder.
         maskmem_out = self.memory_encoder(
-            pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
+            pix_feat, mask_for_mem, instance_ids=instance_ids, skip_mask_sigmoid=True  # sigmoid already applied
         )
         maskmem_features = maskmem_out["vision_features"]
         maskmem_pos_enc = maskmem_out["vision_pos_enc"]
@@ -753,6 +776,7 @@ class SAM2Base(torch.nn.Module):
             # (see it as a GT mask) without using a SAM prompt encoder + mask decoder.
             pix_feat = current_vision_feats[-1].permute(1, 2, 0)
             pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
+            
             sam_outputs = self._use_mask_as_output(
                 pix_feat, high_res_features, mask_inputs
             )
@@ -768,6 +792,8 @@ class SAM2Base(torch.nn.Module):
                 num_frames=num_frames,
                 track_in_reverse=track_in_reverse,
             )
+            
+            
             # apply SAM-style segmentation head
             # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
             # e.g. in demo where such logits come from earlier interaction instead of correction sampling
@@ -786,6 +812,178 @@ class SAM2Base(torch.nn.Module):
 
         return current_out, sam_outputs, high_res_features, pix_feat
 
+    def set_logger(self, logger):
+        """Set the logger for the model to enable visualizations"""
+        self.logger = logger
+        self.current_step = 0  # Track steps for TensorBoard visualization
+        
+    def set_last_img(self, img):
+        """Set the img for the model to enable visualizations"""
+        self.last_img = img
+
+    def visualize_tensors_and_images(self, frame_idx, input_images, memory_tensors, step):
+        """
+        Visualize input images alongside their corresponding memory tensors
+        
+        Args:
+            frame_idx: Current frame index
+            input_images: Tensor of shape [B, C, H, W] containing the original images
+            memory_tensors: Tensor of shape [B, mem_size, C, H, W] or list of tensors 
+                        containing the memory features
+            step: Current training step for TensorBoard
+        """
+        import torch
+        import torch.nn.functional as F
+        
+        
+        B = input_images.shape[0]
+        
+        for b in range(B):  # Process each item in the batch
+            # First, log the original input image
+            img = input_images[b].detach().cpu()
+            
+            # Normalize image for visualization if needed
+            if img.max() > 1.0:
+                img = img / 255.0
+                
+            # Add the input image to TensorBoard
+            self.logger.tb_logger.writer.add_image(
+                f'input_image/batch_{b}_frame_{frame_idx}',
+                img,
+                global_step=step
+            )
+            
+            # For each memory tensor in the memory bank (up to 8)
+            if isinstance(memory_tensors, list):
+                num_mems = len(memory_tensors)
+                for mem_idx in range(num_mems):
+                    # Get this memory tensor
+                    mem = memory_tensors[mem_idx].detach().cpu()  # Shape: [C, H, W]
+                    self.visualize_3d_tensor(
+                        self.logger.tb_logger.writer,
+                        mem, 
+                        f'memory_bank/batch_{b}_frame_{frame_idx}/memory_{mem_idx}',
+                        step
+                    )
+            else:
+                # If memory_tensors is a single tensor with all memories stacked
+                # Shape: [B, mem_size, C, H, W]
+                num_mems = memory_tensors.shape[1]
+                for mem_idx in range(num_mems):
+                    mem = memory_tensors[mem_idx].detach().cpu()  # Shape: [C, H, W]
+                    self.visualize_3d_tensor(
+                        self.logger.tb_logger.writer,
+                        mem,
+                        f'memory_bank/batch_{b}_frame_{frame_idx}/memory_{mem_idx}',
+                        step
+                    )
+
+    def visualize_3d_tensor(self, writer, tensor, tag_prefix, step):
+        """
+        Comprehensive visualization of a 3D tensor (C×H×W) with different views
+        
+        Args:
+            writer: TensorBoard SummaryWriter
+            tensor: 3D tensor to visualize [C, H, W]
+            tag_prefix: Prefix for the tag in TensorBoard
+            step: Current training step
+        """
+        C, H, W = tensor.shape
+        
+        # 1. Channel-wise slices: Show individual channels (first 16)
+        num_channels = min(16, C)
+        for c in range(num_channels):
+            # Get single channel and normalize
+            channel = tensor[c].unsqueeze(0)  # [1, H, W]
+            channel_norm = self.normalize_tensor(channel)
+            
+            # Add to TensorBoard
+            writer.add_image(
+                f'{tag_prefix}/channel_{c}',
+                channel_norm,
+                global_step=step,
+                dataformats='CHW'
+            )
+        
+        # 2. Create a grid of channel slices (8×8 grid of first 64 channels)
+        num_grid_channels = min(64, C)
+        channels_to_grid = []
+        
+        for c in range(num_grid_channels):
+            # Get and normalize channel
+            channel = tensor[c]
+            channel_norm = self.normalize_tensor(channel)
+            # Expand to 3 channels for RGB grid
+            channels_to_grid.append(channel_norm.unsqueeze(0).expand(3, -1, -1))
+        
+        # Create 8×8 grid (or smaller if fewer channels)
+        channels_tensor = torch.stack(channels_to_grid)
+        from torchvision.utils import make_grid
+        grid = make_grid(channels_tensor, nrow=8)
+        
+        # Add grid to TensorBoard
+        writer.add_image(
+            f'{tag_prefix}/channel_grid',
+            grid,
+            global_step=step
+        )
+        
+        # 3. Different 2D projections of the 3D tensor
+        # Mean projection across channels
+        mean_projection = tensor.mean(dim=0, keepdim=True)
+        mean_projection_norm = self.normalize_tensor(mean_projection)
+        
+        # Max projection across channels
+        max_projection = tensor.max(dim=0, keepdim=True)[0]
+        max_projection_norm = self.normalize_tensor(max_projection)
+        
+        # Standard deviation projection across channels
+        std_projection = tensor.std(dim=0, keepdim=True)
+        std_projection_norm = self.normalize_tensor(std_projection)
+        
+        # Add projections to TensorBoard
+        writer.add_image(
+            f'{tag_prefix}/mean_projection',
+            mean_projection_norm,
+            global_step=step,
+            dataformats='CHW'
+        )
+        
+        writer.add_image(
+            f'{tag_prefix}/max_projection',
+            max_projection_norm,
+            global_step=step,
+            dataformats='CHW'
+        )
+        
+        writer.add_image(
+            f'{tag_prefix}/std_projection',
+            std_projection_norm,
+            global_step=step,
+            dataformats='CHW'
+        )
+        
+        # 4. Show first 3 channels as RGB composite (if C >= 3)
+        if C >= 3:
+            rgb_channels = tensor[:3]
+            rgb_norm = self.normalize_tensor(rgb_channels)
+            
+            writer.add_image(
+                f'{tag_prefix}/rgb_composite',
+                rgb_norm,
+                global_step=step
+            )
+
+    def normalize_tensor(self, tensor):
+        """Normalize tensor to range [0,1] for visualization"""
+        result = tensor.clone()
+        if result.numel() > 0:  # Check if tensor is not empty
+            min_val = result.min()
+            max_val = result.max()
+            if max_val > min_val:  # Avoid division by zero
+                result = (result - min_val) / (max_val - min_val)
+        return result
+
     def _encode_memory_in_output(
         self,
         current_vision_feats,
@@ -795,6 +993,7 @@ class SAM2Base(torch.nn.Module):
         high_res_masks,
         object_score_logits,
         current_out,
+        gt_instance_ids=None,  # NEW: ground-truth instance IDs
     ):
         if run_mem_encoder and self.num_maskmem > 0:
             high_res_masks_for_mem_enc = high_res_masks
@@ -804,9 +1003,82 @@ class SAM2Base(torch.nn.Module):
                 pred_masks_high_res=high_res_masks_for_mem_enc,
                 object_score_logits=object_score_logits,
                 is_mask_from_pts=(point_inputs is not None),
+                instance_ids=gt_instance_ids  # NEW: pass instance IDs here
             )
             current_out["maskmem_features"] = maskmem_features
             current_out["maskmem_pos_enc"] = maskmem_pos_enc
+            
+            # Visualize if logger is available
+            if hasattr(self, 'logger') and self.logger and hasattr(self.logger, 'tb_logger'):
+                frame_idx = current_out.get("frame_idx", 0)
+                
+                # Add input image visualization
+                if hasattr(self, 'current_input_image') and self.current_input_image is not None:
+                    # Get the input image for current frame
+                    input_img = self.current_input_image.detach().cpu()
+                    
+                    # For each batch item
+                    for b in range(input_img.shape[0]):
+                        # Denormalize the image
+                        img = input_img[b]
+                        
+                        # Option 1: Simple min-max normalization
+                        img_norm = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                        
+                        # Option 2: Try to reverse standard normalization (if using ImageNet means)
+                        #img_norm = img * std + mean
+                        #img_norm = (img_norm - img_norm.min()) / (img_norm.max() - img_norm.min() + 1e-8)
+                        
+                        self.logger.tb_logger.writer.add_image(
+                            f'input_image/frame_{frame_idx}/batch_{b}',
+                            img_norm,
+                            global_step=getattr(self, 'current_step', 0)
+                        )
+                        
+                        # Also try the alternative normalization approach
+                        img_alt = img.clone()
+                        # Shift to positive range
+                        img_alt = (img_alt + 2.5) / 5.0  # Assuming range is roughly [-2.5, 2.5]
+                        # Clip to [0, 1]
+                        img_alt = torch.clamp(img_alt, 0, 1)
+                        
+                        self.logger.tb_logger.writer.add_image(
+                            f'input_image_alt/frame_{frame_idx}/batch_{b}',
+                            img_alt, 
+                            global_step=getattr(self, 'current_step', 0)
+                        )
+                
+                # Visualize memory features
+                for mem_idx in range(len(maskmem_features)):
+                    mem = maskmem_features[mem_idx].detach().cpu()
+                    self.visualize_3d_tensor(
+                        self.logger.tb_logger.writer,
+                        mem, 
+                        f'memory_features/frame_{frame_idx}/memory_{mem_idx}',
+                        getattr(self, 'current_step', 0)
+                    )
+                
+                # Visualize position encodings
+                for mem_idx in range(len(maskmem_pos_enc)):
+                    pos_enc = maskmem_pos_enc[mem_idx].detach().cpu()
+                    
+                    # Handle different tensor shapes dynamically
+                    if len(pos_enc.shape) == 4:  # Has batch dimension [B, C, H, W]
+                        for b in range(pos_enc.shape[0]):
+                            enc = pos_enc[b]  # Shape: [C, H, W]
+                            self.visualize_3d_tensor(
+                                self.logger.tb_logger.writer,
+                                enc,
+                                f'position_encodings/frame_{frame_idx}/memory_{mem_idx}/batch_{b}',
+                                getattr(self, 'current_step', 0)
+                            )
+                    else:  # Standard 3D tensor [C, H, W]
+                        self.visualize_3d_tensor(
+                            self.logger.tb_logger.writer,
+                            pos_enc,
+                            f'position_encodings/frame_{frame_idx}/memory_{mem_idx}',
+                            getattr(self, 'current_step', 0)
+                        )
         else:
             current_out["maskmem_features"] = None
             current_out["maskmem_pos_enc"] = None
@@ -854,10 +1126,12 @@ class SAM2Base(torch.nn.Module):
             high_res_masks,
             obj_ptr,
             object_score_logits,
+            high_res_instance_ids,  # NEW: Extract instance IDs from final outputs
         ) = sam_outputs
 
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
+        current_out["pred_instance_ids"] = high_res_instance_ids  # NEW: Store instance IDs
         current_out["obj_ptr"] = obj_ptr
         if not self.training:
             # Only add this in inference (to avoid unused param in activation checkpointing;

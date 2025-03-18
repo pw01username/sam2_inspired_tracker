@@ -7,10 +7,18 @@
 from typing import List, Optional, Tuple, Type
 
 import torch
+from torch.nn import functional as F
 from torch import nn
 
 from sam2.modeling.sam2_utils import LayerNorm2d, MLP
 
+from enum import IntEnum, auto
+
+class InstanceIdMode(IntEnum):
+    DIRECT = 0
+    EMBEDDING_HEAD_CNN = 1
+    EMBEDDING_HEAD_MLP = 2
+    EMBEDDING_SHARED_MLP = 3
 
 class MaskDecoder(nn.Module):
     def __init__(
@@ -107,6 +115,61 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_stability_delta = dynamic_multimask_stability_delta
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
 
+        # *** New: Add an instance ID head for dual-channel output ***
+        self.instance_id_mode = InstanceIdMode.EMBEDDING_HEAD_MLP
+        self.embedding_dim = 32  # Adjust based on complexity of instances
+        
+        # We need to match the dimension of upscaled features
+        self.output_feature_dim = transformer_dim // 8
+        print("transforemr dim", transformer_dim)
+        
+        # We assume that output_upscaling produces feature maps of channel dimension transformer_dim//8?
+        match self.instance_id_mode:
+            case InstanceIdMode.DIRECT:
+                self.instance_id_head = nn.Conv2d(self.output_feature_dim, 1, kernel_size=1)
+            case InstanceIdMode.EMBEDDING_HEAD_CNN:
+                # Just a more advanced head to predict instance embeddings, using CNNs
+                self.instance_embedding_head = nn.Sequential(
+                    nn.Conv2d(self.output_feature_dim, transformer_dim // 4, kernel_size=3, padding=1),
+                    nn.GroupNorm(8, transformer_dim // 4),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(transformer_dim // 4, self.embedding_dim, kernel_size=1)
+                )
+            case InstanceIdMode.EMBEDDING_HEAD_MLP:
+                # Extended transformer MLP head to predict instance embeddings
+                
+                # Add embedding tokens alongside mask tokens
+                self.embedding_tokens = nn.Embedding(1, transformer_dim)
+                
+                # Add embedding prediction hypernetworks (parallel to mask hypernetworks)
+                self.embedding_hypernetworks_mlps = nn.ModuleList(
+                    [
+                        MLP(transformer_dim, transformer_dim, self.output_feature_dim, 3)
+                    ]
+                )
+            
+            case InstanceIdMode.EMBEDDING_SHARED_MLP:
+                # Shared MLP head to predict instance embeddings
+                # Use the same hypernetworks but with different output dimension
+                self.instance_id_head = nn.ModuleList(
+                    [
+                        nn.Linear(self.output_feature_dim, self.embedding_dim)
+                        for i in range(self.num_mask_tokens)
+                    ]
+                )
+                
+        # *** New: For the EMBEDDING_HEAD_MLP mode, add heads for bandwidth (sigma) and offsets ***
+        if self.instance_id_mode == InstanceIdMode.EMBEDDING_HEAD_MLP:
+            self.pred_bandwidth_head = nn.Conv2d(self.output_feature_dim, 1, kernel_size=1)
+            self.pred_offset_head = nn.Conv2d(self.output_feature_dim, 2, kernel_size=1)
+        else:
+            self.pred_bandwidth_head = None
+            self.pred_offset_head = None
+            
+        # Compute timer events
+        self.start = torch.cuda.Event(enable_timing=True)
+        self.end = torch.cuda.Event(enable_timing=True)
+    
     def forward(
         self,
         image_embeddings: torch.Tensor,
@@ -133,7 +196,9 @@ class MaskDecoder(nn.Module):
           torch.Tensor: batched predictions of mask quality
           torch.Tensor: batched SAM token for mask output
         """
-        masks, iou_pred, mask_tokens_out, object_score_logits = self.predict_masks(
+        
+        self.start.record()
+        masks, iou_pred, mask_tokens_out, object_score_logits, dual_output = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
@@ -162,8 +227,13 @@ class MaskDecoder(nn.Module):
             # are always the single mask token (and we'll let it be the object-memory token).
             sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
 
+
+        self.end.record()
+        torch.cuda.synchronize()
+        encoder_time = self.start.elapsed_time(self.end)  # milliseconds
+        #print("mask decoder forward run time in ms: ", encoder_time)
         # Prepare output
-        return masks, iou_pred, sam_tokens_out, object_score_logits
+        return masks, iou_pred, sam_tokens_out, object_score_logits, dual_output
 
     def predict_masks(
         self,
@@ -183,13 +253,14 @@ class MaskDecoder(nn.Module):
                     self.obj_score_token.weight,
                     self.iou_token.weight,
                     self.mask_tokens.weight,
+                    self.embedding_tokens.weight,
                 ],
                 dim=0,
             )
             s = 1
         else:
             output_tokens = torch.cat(
-                [self.iou_token.weight, self.mask_tokens.weight], dim=0
+                [self.iou_token.weight, self.mask_tokens.weight, self.embedding_tokens.weight], dim=0
             )
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
@@ -213,7 +284,8 @@ class MaskDecoder(nn.Module):
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
-
+        embedding_tokens_out = hs[:, (s + 1 + self.num_mask_tokens) : (s + 1 + self.num_mask_tokens + 1), :]
+    
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
         if not self.use_high_res_features:
@@ -224,12 +296,97 @@ class MaskDecoder(nn.Module):
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
+        # *** New: Generate an instance ID map using the new head ***
+        pred_bandwidth = None
+        pred_offsets = None
+        match self.instance_id_mode:
+            case InstanceIdMode.DIRECT:
+                instance_id_map = self.instance_id_head(upscaled_embedding)  # (B, 1, h, w)
+            case InstanceIdMode.EMBEDDING_HEAD_CNN:
+                # Use instance embeddings to predict instance ID map
+                instance_id_map = self.instance_embedding_head(upscaled_embedding)  # (B, embedding_dim, h, w)
+            case InstanceIdMode.EMBEDDING_HEAD_MLP:
+                # Get embedding tokens and process them through hypernetworks, similar to masks
+                embedding_hyper_in_list: List[torch.Tensor] = []
+                embedding_hyper_in_list.append(
+                    self.embedding_hypernetworks_mlps[0](embedding_tokens_out[:, 0, :])
+                )
+                embedding_hyper_in = torch.stack(embedding_hyper_in_list, dim=1)
+
+                # Create lazily initialized projection layers if they don't exist yet
+                if not hasattr(self, 'embedding_projections'):
+                    self.embedding_projections = nn.ModuleList([
+                        nn.Conv2d(1, self.embedding_dim, kernel_size=1).to(device=upscaled_embedding.device, dtype=upscaled_embedding.dtype)
+                    ])
+                
+                # Create instance embeddings using hypernetworks
+                instance_embedding_list = []
+                b, c, h, w = upscaled_embedding.shape
+                
+                for i in range(1): #self.num_mask_tokens
+                    # Get hypernetwork weights and ensure compatible dtype
+                    hyper_weights = embedding_hyper_in[:, i]  # [b, embedding_dim]
+                    
+                    # Create projection if needed to match upscaled_embedding channels
+                    if not hasattr(self, f'hyper_proj_{i}'):
+                        self.register_module(
+                            f'hyper_proj_{i}',
+                            nn.Linear(hyper_weights.shape[1], c).to(device=upscaled_embedding.device, dtype=upscaled_embedding.dtype)
+                        )
+                    
+                    # Project to match channel dimensions for bmm
+                    proj = getattr(self, f'hyper_proj_{i}')
+                    projected_weights = proj(hyper_weights.to(dtype=upscaled_embedding.dtype))
+                    
+                    # Apply the weights to get the base embedding
+                    base_embedding = torch.bmm(
+                        projected_weights.unsqueeze(1),  # [b, 1, c]
+                        upscaled_embedding.reshape(b, c, -1)  # [b, c, h*w]
+                    ).view(b, 1, h, w)  # [b, 1, h, w]
+                    
+                    # Make sure projection has matching dtype
+                    self.embedding_projections[i] = self.embedding_projections[i].to(
+                        device=base_embedding.device, 
+                        dtype=base_embedding.dtype
+                    )
+                    
+                    # Project to embedding dimension
+                    instance_embedding = self.embedding_projections[i](base_embedding)  # [b, embed_dim, h, w]
+                    instance_embedding_list.append(instance_embedding)
+
+                # Use the first token's embedding
+                instance_embeddings = instance_embedding_list[0]  # [b, embed_dim, h, w]
+                
+                # Use the first token's embeddings (consistent with taking first mask)
+                #instance_embeddings = embeddings[:, 0, :, :] # [b, embed_dim, h, w]
+                
+                # Combine information from all token embeddings using attention or weighted sum
+                #instance_embeddings = self.token_fusion(embeddings)  # [b, embed_dim, h, w]
+                
+                # Reshape and normalize embeddings (L2 normalization scales all vector to same size so only direction matters)
+                instance_embeddings = F.normalize(instance_embeddings, p=2, dim=1)
+                
+                # *** New: Predict bandwidth and offsets ***
+                #pred_bandwidth = self.pred_bandwidth_head(upscaled_embedding)  # (B, 1, H, W)
+                #pred_offsets = self.pred_offset_head(upscaled_embedding)        # (B, 2, H, W)
+
+            case InstanceIdMode.EMBEDDING_SHARED_MLP:
+                instance_embeddings = []
+                for i in range(self.num_mask_tokens):
+                    # Apply hypernetwork weights to get features, then project to embedding space
+                    features_i = (hyper_in[:, i] @ upscaled_embedding.view(b, c, h * w)).view(b, 1, h, w)
+                    embeddings_i = self.instance_id_head[i](features_i.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+                    instance_embeddings.append(embeddings_i)
+                instance_embeddings = torch.cat(instance_embeddings, dim=1)
+                
+        # Standard mask prediction using hypernetworks
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(
                 self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
             )
         hyper_in = torch.stack(hyper_in_list, dim=1)
+        
         b, c, h, w = upscaled_embedding.shape
         masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
 
@@ -242,7 +399,22 @@ class MaskDecoder(nn.Module):
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
-        return masks, iou_pred, mask_tokens_out, object_score_logits
+        # *** New: For final output, select the primary mask token as binary mask
+        # Here we take the first channel as the binary mask output.
+        binary_mask = masks[:, 0:1, :, :]
+
+        match self.instance_id_mode:
+            case InstanceIdMode.DIRECT:
+                # Combine binary mask and instance ID map to form a dual-channel output.
+                dual_channel_output = torch.cat([binary_mask, instance_id_map], dim=1)  # shape: (B, 2, h, w)
+                dual_channel_output = dual_channel_output.permute(0, 2, 3, 1)  # (B, h, w, 2)
+            case InstanceIdMode.EMBEDDING_HEAD_CNN| InstanceIdMode.EMBEDDING_HEAD_MLP:
+                dual_channel_output = torch.cat([binary_mask, instance_embeddings], dim=1)
+                dual_channel_output = dual_channel_output.permute(0, 2, 3, 1)  # [B, H, W, 1+embedding_dim]
+            case _:
+                raise NotImplementedError(f"InstanceIdMode {self.instance_id_mode} not implemented")
+                
+        return masks, iou_pred, mask_tokens_out, object_score_logits, dual_channel_output#, pred_bandwidth, pred_offsets
 
     def _get_stability_scores(self, mask_logits):
         """

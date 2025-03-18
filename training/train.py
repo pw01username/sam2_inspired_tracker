@@ -4,6 +4,17 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"Number of GPUs: {torch.cuda.device_count()}")
+print(f"Current device: {torch.cuda.current_device()}")
+print(f"Device name: {torch.cuda.get_device_name(0)}")
+
+import os
+os.environ["HYDRA_FULL_ERROR"] = "1"
+
+import os
+
 import logging
 import os
 import random
@@ -14,6 +25,7 @@ from argparse import ArgumentParser
 import submitit
 import torch
 
+import hydra
 from hydra import compose, initialize_config_module
 from hydra.utils import instantiate
 
@@ -23,7 +35,11 @@ from omegaconf import OmegaConf
 from training.utils.train_utils import makedir, register_omegaconf_resolvers
 
 os.environ["HYDRA_FULL_ERROR"] = "1"
-
+# Try multiple environment variables that might help
+os.environ["PYTORCH_DISABLE_LIBUV"] = "1"
+os.environ["PYTORCH_NO_LIBUV"] = "1"
+os.environ["USE_LIBUV"] = "0"
+os.environ["PYTORCH_NO_NVML"] = "1"
 
 def single_proc_run(local_rank, main_port, cfg, world_size):
     """Single GPU process"""
@@ -176,6 +192,7 @@ def main(args) -> None:
             args.qos if args.qos is not None else submitit_conf.get("qos", None)
         )
         job_kwargs = {
+            "use_libuv": False,
             "timeout_min": 60 * submitit_conf.timeout_hour,
             "name": (
                 submitit_conf.name if hasattr(submitit_conf, "name") else args.config
@@ -242,7 +259,13 @@ def main(args) -> None:
 
 if __name__ == "__main__":
 
-    initialize_config_module("sam2", version_base="1.2")
+    # hydra is initialized on import of sam2, which sets the search path which can't be modified
+    # so we need to clear the hydra instance
+    hydra.core.global_hydra.GlobalHydra.instance().clear()
+    # reinit hydra with a new search path for configs
+    hydra.initialize(config_path="../sam2")
+
+    #initialize_config_module("sam2", version_base="1.2")
     parser = ArgumentParser()
     parser.add_argument(
         "-c",
