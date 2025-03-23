@@ -15,8 +15,8 @@ dataset:
   # PATHS to Dataset
   #img_folder: C:\Users\patrick.wulff\Downloads\DAVIS-2017-trainval-480p\DAVIS\JPEGImages # PATH to MOSE JPEGImages folder
   #gt_folder: C:\Users\patrick.wulff\Downloads\DAVIS-2017-trainval-480p\DAVIS\Annotations  # PATH to MOSE Annotations folder
-  img_folder: \davis\DAVIS\JPEGImages
-  gt:folder: \davis\DAVIS\Annotations
+  img_folder: /davis/DAVIS/JPEGImages
+  gt_folder: /davis/DAVIS/Annotations
   file_list_txt: null #training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 2
 

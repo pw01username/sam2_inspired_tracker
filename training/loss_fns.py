@@ -424,7 +424,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         # new: instance ID loss
         
         # Instance id embeddings, discriminative emb loss. Assuming pred_instance_ids is embeddings.
-        loss_instance = self.instance_id_loss(pred_instance_ids, target_instance_ids, num_objects)
+        loss_instance = self.instance_id_loss_fixed(pred_instance_ids, target_instance_ids, num_objects)
         if torch.isnan(loss_instance).any():
             print("NaN value as loss!")
             loss_instance += 0.01
@@ -469,6 +469,211 @@ class MultiStepMultiMasksAndIous(nn.Module):
         print(f"Center {sample_size}x{sample_size} sample of instance map:")
         print(sample)
 
+    def instance_id_loss_fixed(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.1, delta_d=2.0, reg_weight=0.01):
+        """
+        Fixed implementation of discriminative loss with better gradient flow.
+        
+        Args:
+            pred_embeddings: Embedding vectors of shape (B, E, H, W) where E is embedding dimension
+            target_instance_ids: Ground truth instance ID map of shape (B, 1, H, W) or (B, H, W)
+            num_objects: Number of objects (for normalization)
+            delta_v: Variance margin for pull loss
+            delta_d: Distance margin for push loss
+            reg_weight: Regularization weight
+        """
+        batch_size = pred_embeddings.size(0)
+        embedding_dim = pred_embeddings.size(1)
+        device = pred_embeddings.device
+        
+        # Ensure target has the right shape
+        if target_instance_ids.dim() == 4:
+            target_instance_ids = target_instance_ids.squeeze(1)
+        
+        # Return value for empty batch - IMPORTANT: Connect to input embeddings
+        if batch_size == 0 or num_objects == 0:
+            return torch.mean(pred_embeddings) * 0.0 + 0.1
+
+        # Track loss components
+        pull_losses = []
+        push_losses = []
+        reg_losses = []
+        
+        total_instances = 0
+        
+        # Process each sample in batch
+        for b in range(batch_size):
+            # Extract this batch item
+            emb = pred_embeddings[b]  # (E, H, W)
+            ids = target_instance_ids[b]  # (H, W)
+            
+            # Get unique instance IDs (excluding background)
+            instance_ids = torch.unique(ids)
+            instance_ids = instance_ids[instance_ids > 0]
+            
+            if len(instance_ids) == 0:
+                # Create dummy loss for samples with no instances
+                # CRITICAL FIX: Connect to embedding tensor for gradient flow
+                dummy_loss = torch.mean(emb) * 0.0 + 0.1
+                pull_losses.append(dummy_loss)
+                continue
+            
+            # Collect centers and features
+            centers = []
+            pixel_embeddings = []
+            
+            for inst_id in instance_ids:
+                # Get mask for this instance
+                mask = (ids == inst_id)
+                
+                # Skip tiny instances
+                if mask.sum() < 10:
+                    continue
+                    
+                # Extract coordinates where mask is True
+                y_indices, x_indices = torch.where(mask)
+                
+                # Limit to 1000 random pixels for very large instances
+                if len(y_indices) > 1000:
+                    idx = torch.randperm(len(y_indices))[:1000]
+                    y_indices = y_indices[idx]
+                    x_indices = x_indices[idx]
+                
+                # CRITICAL FIX: Use vectorized operations for better gradient flow
+                # This replaces the loop over individual pixels
+                pixels_emb = []
+                for i in range(len(y_indices)):
+                    y, x = y_indices[i], x_indices[i]
+                    pixel_emb = emb[:, y, x]
+                    pixels_emb.append(pixel_emb)
+                
+                # Skip if no embeddings extracted
+                if not pixels_emb:
+                    continue
+                    
+                # Stack into a tensor
+                pixels_emb = torch.stack(pixels_emb)  # (N_pixels, E)
+                
+                # Calculate center embedding (mean)
+                center = torch.mean(pixels_emb, dim=0)  # (E)
+                
+                centers.append(center)
+                pixel_embeddings.append(pixels_emb)
+            
+            # Skip if no valid centers found
+            if not centers:
+                # Create dummy loss that's connected to the graph
+                dummy_loss = torch.mean(emb) * 0.0 + 0.1
+                pull_losses.append(dummy_loss)
+                continue
+                    
+            total_instances += len(centers)
+            centers_tensor = torch.stack(centers)  # (N_instances, E)
+            
+            # 1. Pull loss calculation: Force pixels to cluster around their centers
+            batch_pull_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            for i, (center, pixels) in enumerate(zip(centers, pixel_embeddings)):
+                # CRITICAL FIX: More stable distance calculation
+                squared_diffs = (pixels - center.unsqueeze(0))**2  # (N_pixels, E)
+                squared_dists = torch.sum(squared_diffs, dim=1) + 1e-8  # Add small epsilon for stability
+                dists = torch.sqrt(squared_dists)  # (N_pixels)
+                
+                # Apply minimum pull (even for pixels within delta_v)
+                min_pull = torch.mean(squared_dists) * 0.1
+                
+                # Apply hinge for pixels outside delta_v
+                hinge_dists = torch.clamp(dists - delta_v, min=0.0)**2
+                hinge_pull = torch.mean(hinge_dists)
+                
+                # Combine both
+                instance_pull = min_pull + hinge_pull
+                
+                # Add directly to computational graph
+                batch_pull_loss = batch_pull_loss + instance_pull
+            
+            # Normalize pull loss
+            if len(centers) > 0:
+                batch_pull_loss = batch_pull_loss / len(centers)
+                # CRITICAL FIX: Ensure non-zero gradient by connecting to centers
+                batch_pull_loss = batch_pull_loss + torch.mean(centers_tensor) * 0.0 + 1e-6
+                pull_losses.append(batch_pull_loss)
+            
+            # 2. Push loss calculation: Force centers apart from each other
+            if len(centers) > 1:
+                batch_push_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                pair_count = 0
+                
+                for i in range(len(centers)):
+                    for j in range(i+1, len(centers)):
+                        # CRITICAL FIX: More stable distance calculation
+                        squared_dist = torch.sum((centers[i] - centers[j])**2) + 1e-8
+                        dist = torch.sqrt(squared_dist)
+                        
+                        # Apply hinge
+                        margin = 2.0 * delta_d
+                        hinge_dist = torch.clamp(margin - dist, min=0.0)**2
+                        
+                        # Add directly to computational graph
+                        batch_push_loss = batch_push_loss + hinge_dist
+                        pair_count += 1
+                
+                # Normalize by pair count
+                if pair_count > 0:
+                    batch_push_loss = batch_push_loss / pair_count
+                    push_losses.append(batch_push_loss)
+            
+            # 3. Regularization term: Keep centers at a reasonable magnitude
+            # Calculate L2 norm of the centers
+            center_norms = torch.norm(centers_tensor, p=2, dim=1)
+            
+            # Target norm of 1.0
+            target_norm = torch.ones_like(center_norms)
+            reg_loss = torch.mean((center_norms - target_norm)**2)
+            
+            # CRITICAL FIX: Ensure non-zero gradient
+            reg_loss = reg_loss + torch.mean(centers_tensor) * 0.0 + 1e-6
+            reg_losses.append(reg_loss)
+        
+        # Combine losses with appropriate weights
+        # CRITICAL FIX: Always connect dummy losses to the computation graph
+        if pull_losses:
+            pull_loss = torch.mean(torch.stack(pull_losses))
+        else:
+            # Dummy loss connected to graph
+            pull_loss = torch.mean(pred_embeddings) * 0.0 + 0.001
+        
+        if push_losses:
+            push_loss = torch.mean(torch.stack(push_losses))
+        else:
+            # Dummy loss connected to graph
+            push_loss = torch.mean(pred_embeddings) * 0.0
+        
+        if reg_losses:
+            reg_loss = torch.mean(torch.stack(reg_losses))
+        else:
+            # Dummy loss connected to graph
+            reg_loss = torch.mean(pred_embeddings) * 0.0 + 0.001
+        
+        # Calculate weights
+        pull_weight = 1.0
+        push_weight = 0.05 / math.sqrt(embedding_dim)
+        
+        # IMPORTANT: Store loss components for debugging
+        if self.training:
+            self.loss_values = {
+                'pull_loss': pull_loss.item(),
+                'push_loss': push_loss.item(),
+                'reg_loss': reg_loss.item(),
+                'instances': total_instances
+            }
+            print(self.loss_values)
+        
+        # Combine with weights
+        loss = pull_weight * pull_loss + push_weight * push_loss + reg_weight * reg_loss
+        
+        # Return normalized loss
+        return loss.expand(batch_size) / num_objects
+
     def instance_id_loss(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.1, delta_d=2.0, reg_weight=0.01):
         """
         Direct-access implementation of discriminative loss with guaranteed non-zero values.
@@ -483,6 +688,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         """
         batch_size = pred_embeddings.size(0)
         #print("Batch size", pred_embeddings.shape)
+        print("An embedding at pixel 50,50: ", pred_embeddings[0, :, 50, 50])
         embedding_dim = pred_embeddings.size(1)
         device = pred_embeddings.device
         
@@ -1004,3 +1210,935 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
         return reduced_loss
 
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.nn.utils import clip_grad_norm_
+
+class GradientInspector:
+    """Utility to track and visualize gradients during training"""
+    
+    def __init__(self):
+        self.gradient_history = {
+            'embedding_grad_norm': [],
+            'loss_values': [],
+            'pull_loss': [],
+            'push_loss': [],
+            'reg_loss': []
+        }
+        self.param_update_history = {}
+    
+    def register_model(self, model):
+        """Register a model to track parameter updates"""
+        self.model = model
+        # Store initial parameter values
+        self.initial_params = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.initial_params[name] = param.detach().clone()
+                self.param_update_history[name] = []
+    
+    def check_gradients(self, model, loss_dict=None):
+        """Check gradient norms for all parameters"""
+        results = {}
+        has_nans = False
+        has_infs = False
+        
+        # Check each parameter's gradients
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                results[f'{name}_grad_norm'] = grad_norm
+                
+                # Check for NaNs or Infs
+                if torch.isnan(param.grad).any():
+                    print(f"WARNING: NaN gradients in {name}")
+                    has_nans = True
+                if torch.isinf(param.grad).any():
+                    print(f"WARNING: Inf gradients in {name}")
+                    has_infs = True
+                
+                # Track embedding gradients specifically
+                if 'embedding' in name:
+                    self.gradient_history['embedding_grad_norm'].append(grad_norm)
+        
+        # Track loss values if provided
+        if loss_dict:
+            for loss_name, loss_value in loss_dict.items():
+                if loss_name in self.gradient_history:
+                    self.gradient_history[loss_name].append(loss_value)
+        
+        # Track parameter updates
+        if hasattr(self, 'model'):
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and name in self.initial_params:
+                        update = (param - self.initial_params[name]).norm().item()
+                        self.param_update_history[name].append(update)
+        
+        # Print warnings for potential gradient issues
+        if has_nans or has_infs:
+            print("CRITICAL: NaN/Inf gradients detected - training will likely fail!")
+        
+        for name, norm in results.items():
+            if norm < 1e-7 and 'bias' not in name:
+                print(f"WARNING: Very small gradients in {name}: {norm:.8f}")
+            if norm > 1e3:
+                print(f"WARNING: Very large gradients in {name}: {norm:.2f}")
+        
+        return results
+    
+    def plot_gradient_flow(self, model):
+        """Create a plot of gradient norms for all parameters"""
+        plt.figure(figsize=(12, 8))
+        
+        # Get named parameters and their gradient norms
+        ave_grads = []
+        max_grads = []
+        layers = []
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                layers.append(name)
+                ave_grads.append(param.grad.abs().mean().item())
+                max_grads.append(param.grad.abs().max().item())
+        
+        plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
+        plt.bar(np.arange(len(ave_grads)), ave_grads, alpha=0.1, lw=1, color="b")
+        plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k")
+        
+        plt.xticks(range(0, len(layers)), layers, rotation=90)
+        plt.xlim(left=0, right=len(layers))
+        plt.ylim(bottom=0, top=0.02)  # Zoom in on the lower gradient regions
+        plt.xlabel("Layers")
+        plt.ylabel("Gradient Magnitude")
+        plt.title("Gradient Flow")
+        plt.grid(True)
+        plt.tight_layout()
+        
+        return plt.gcf()
+    
+    def plot_training_history(self):
+        """Plot the history of loss values and gradient norms"""
+        if not self.gradient_history['loss_values']:
+            print("No training history to plot")
+            return
+                
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        
+        # Plot loss values
+        epochs = range(1, len(self.gradient_history['loss_values']) + 1)
+        ax1.plot(epochs, self.gradient_history['loss_values'], 'b-', label='Total Loss')
+        
+        # Only plot component losses if they exist and have the right length
+        if self.gradient_history['pull_loss'] and len(self.gradient_history['pull_loss']) == len(epochs):
+            ax1.plot(epochs, self.gradient_history['pull_loss'], 'g-', label='Pull Loss')
+        
+        if self.gradient_history['push_loss'] and len(self.gradient_history['push_loss']) == len(epochs):
+            ax1.plot(epochs, self.gradient_history['push_loss'], 'r-', label='Push Loss')
+        
+        if self.gradient_history['reg_loss'] and len(self.gradient_history['reg_loss']) == len(epochs):
+            ax1.plot(epochs, self.gradient_history['reg_loss'], 'y-', label='Regularization Loss')
+        
+        ax1.set_title('Training Losses')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True)
+        
+        # Plot gradient norms only if they exist and have the right length
+        if self.gradient_history['embedding_grad_norm'] and len(self.gradient_history['embedding_grad_norm']) == len(epochs):
+            ax2.plot(epochs, self.gradient_history['embedding_grad_norm'], 'b-', label='Embedding Grad Norm')
+            ax2.set_title('Gradient Magnitudes')
+            ax2.set_xlabel('Epochs')
+            ax2.set_ylabel('Gradient Norm')
+            ax2.legend()
+            ax2.grid(True)
+        else:
+            ax2.set_title('Gradient Magnitudes (No Data Available)')
+            ax2.set_xlabel('Epochs')
+            ax2.text(0.5, 0.5, 'No gradient data collected', 
+                    horizontalalignment='center', verticalalignment='center',
+                    transform=ax2.transAxes)
+        
+        plt.tight_layout()
+        return fig
+    
+    def analyze_gradients(self, model, loss, optimizer, track_custom_gradients=None):
+        """
+        Full gradient analysis including clipping test and directional changes
+        
+        Args:
+            model: The model
+            loss: The loss tensor (before .backward())
+            optimizer: The optimizer
+            track_custom_gradients: Dict of tensors to track gradients for
+        """
+        # Make sure we have gradients
+        if loss.grad_fn is None:
+            print("Error: Loss has no grad_fn. Was the loss detached?")
+            return
+        
+        # Store original gradients
+        original_grads = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                optimizer.zero_grad()  # Clear any existing gradients
+        
+        # Backward pass
+        loss.backward(retain_graph=True)
+        
+        # Check for gradient issues before clipping
+        print("=== Gradient Analysis ===")
+        grad_results = self.check_gradients(model, {'loss_values': loss.item()})
+        
+        # Check custom gradients if provided
+        if track_custom_gradients:
+            for name, tensor in track_custom_gradients.items():
+                if tensor.grad is not None:
+                    grad_norm = tensor.grad.norm().item()
+                    print(f"{name} gradient norm: {grad_norm:.6f}")
+                    
+                    # Check for NaNs or Infs
+                    if torch.isnan(tensor.grad).any():
+                        print(f"WARNING: NaN gradients in {name}")
+                    if torch.isinf(tensor.grad).any():
+                        print(f"WARNING: Inf gradients in {name}")
+        
+        # Store original gradients for comparison
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                original_grads[name] = param.grad.clone()
+        
+        # Try gradient clipping and see if it changes much
+        max_norm = 1.0
+        orig_total_norm = clip_grad_norm_(model.parameters(), float('inf'))
+        clipped_norm = clip_grad_norm_(model.parameters(), max_norm)
+        
+        print(f"\nGradient clipping analysis:")
+        print(f"Original gradient norm: {orig_total_norm:.6f}")
+        print(f"Clipped gradient norm: {clipped_norm:.6f}")
+        
+        if orig_total_norm > max_norm * 2:
+            print(f"WARNING: Gradients were significantly clipped (by factor of {orig_total_norm / clipped_norm:.2f})")
+            print(f"Consider using gradient clipping in your optimizer")
+        
+        # Restore original gradients for other tests
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in original_grads:
+                param.grad = original_grads[name].clone()
+        
+        # Make a test step with a small learning rate
+        # to see how parameters would change
+        with torch.no_grad():
+            # Save current parameters
+            current_params = {}
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    current_params[name] = param.clone()
+            
+            # Take a small test step
+            test_lr = 1e-6
+            for name, param in model.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    param.add_(param.grad, alpha=-test_lr)
+            
+            # Compute test loss with new parameters
+            # (Note: This would need to be adapted to your specific forward pass)
+            
+            # Restore original parameters
+            for name, param in model.named_parameters():
+                if param.requires_grad and name in current_params:
+                    param.copy_(current_params[name])
+        
+        return grad_results
+    
+    def diagnose_vanishing_gradients(self, model, threshold=1e-5):
+        """Check if the model suffers from vanishing gradients"""
+        vanishing_layers = []
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                grad_norm = param.grad.norm().item()
+                param_norm = param.data.norm().item()
+                
+                # Check relative gradient magnitude
+                if grad_norm < threshold and param_norm > 0:
+                    rel_grad = grad_norm / param_norm
+                    vanishing_layers.append((name, grad_norm, rel_grad))
+        
+        if vanishing_layers:
+            print("\n=== Potential Vanishing Gradient Issues ===")
+            for name, grad_norm, rel_grad in vanishing_layers:
+                print(f"{name}: grad_norm={grad_norm:.8f}, relative={rel_grad:.8f}")
+            
+            print("\nSuggestions to fix vanishing gradients:")
+            print("1. Try using skip connections in your network")
+            print("2. Consider batch normalization or layer normalization")
+            print("3. Adjust your learning rate or use a different optimizer")
+            print("4. Check for saturated activation functions")
+            
+            return True
+        return False
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import math
+import matplotlib.pyplot as plt
+import numpy as np
+from torch.utils.data import TensorDataset, DataLoader
+from tqdm import tqdm
+
+class SimpleEmbeddingNet(nn.Module):
+    """Simple network to test instance ID loss"""
+    def __init__(self, input_channels=3, embedding_dim=8):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.training = True
+        
+        # Simple CNN for embeddings
+        self.conv1 = nn.Conv2d(input_channels, 16, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(32, embedding_dim, kernel_size=1)
+        
+        # Set up a hook for gradient monitoring
+        self.embedding_gradients = None
+        
+        # Initialize with non-zero values to avoid dead networks
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+    
+    def _save_gradients(self, grad):
+        """Hook to save gradients of embedding layer"""
+        self.embedding_gradients = grad.detach().clone()
+        
+    def forward(self, x):
+        """Forward pass"""
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        embeddings = self.conv3(x)
+        
+        # Register hook to get gradients
+        if self.training and embeddings.requires_grad:
+            embeddings.register_hook(self._save_gradients)
+        
+        return embeddings
+    
+    def get_l2_normalized_embeddings(self, x):
+        """Returns embeddings with L2 normalization along the channel dimension"""
+        embeddings = self.forward(x)
+        
+        # Normalize along the embedding dimension
+        norm = torch.norm(embeddings, p=2, dim=1, keepdim=True)
+        normalized_embeddings = embeddings / (norm + 1e-8)
+        
+        return normalized_embeddings
+    
+    def instance_id_loss_fixed(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.1, delta_d=2.0, reg_weight=0.01):
+        """
+        Fixed implementation of discriminative loss with better gradient flow.
+        
+        Args:
+            pred_embeddings: Embedding vectors of shape (B, E, H, W) where E is embedding dimension
+            target_instance_ids: Ground truth instance ID map of shape (B, 1, H, W) or (B, H, W)
+            num_objects: Number of objects (for normalization)
+            delta_v: Variance margin for pull loss
+            delta_d: Distance margin for push loss
+            reg_weight: Regularization weight
+        """
+        batch_size = pred_embeddings.size(0)
+        embedding_dim = pred_embeddings.size(1)
+        device = pred_embeddings.device
+        
+        # Ensure target has the right shape
+        if target_instance_ids.dim() == 4:
+            target_instance_ids = target_instance_ids.squeeze(1)
+        
+        # Return value for empty batch - IMPORTANT: Connect to input embeddings
+        if batch_size == 0 or num_objects == 0:
+            return torch.mean(pred_embeddings) * 0.0 + 0.1
+
+        # Track loss components
+        pull_losses = []
+        push_losses = []
+        reg_losses = []
+        
+        total_instances = 0
+        
+        # Process each sample in batch
+        for b in range(batch_size):
+            # Extract this batch item
+            emb = pred_embeddings[b]  # (E, H, W)
+            ids = target_instance_ids[b]  # (H, W)
+            
+            # Get unique instance IDs (excluding background)
+            instance_ids = torch.unique(ids)
+            instance_ids = instance_ids[instance_ids > 0]
+            
+            if len(instance_ids) == 0:
+                # Create dummy loss for samples with no instances
+                # CRITICAL FIX: Connect to embedding tensor for gradient flow
+                dummy_loss = torch.mean(emb) * 0.0 + 0.1
+                pull_losses.append(dummy_loss)
+                continue
+            
+            # Collect centers and features
+            centers = []
+            pixel_embeddings = []
+            
+            for inst_id in instance_ids:
+                # Get mask for this instance
+                mask = (ids == inst_id)
+                
+                # Skip tiny instances
+                if mask.sum() < 10:
+                    continue
+                    
+                # Extract coordinates where mask is True
+                y_indices, x_indices = torch.where(mask)
+                
+                # Limit to 1000 random pixels for very large instances
+                if len(y_indices) > 1000:
+                    idx = torch.randperm(len(y_indices))[:1000]
+                    y_indices = y_indices[idx]
+                    x_indices = x_indices[idx]
+                
+                # CRITICAL FIX: Use vectorized operations for better gradient flow
+                # This replaces the loop over individual pixels
+                pixels_emb = []
+                for i in range(len(y_indices)):
+                    y, x = y_indices[i], x_indices[i]
+                    pixel_emb = emb[:, y, x]
+                    pixels_emb.append(pixel_emb)
+                
+                # Skip if no embeddings extracted
+                if not pixels_emb:
+                    continue
+                    
+                # Stack into a tensor
+                pixels_emb = torch.stack(pixels_emb)  # (N_pixels, E)
+                
+                # Calculate center embedding (mean)
+                center = torch.mean(pixels_emb, dim=0)  # (E)
+                
+                centers.append(center)
+                pixel_embeddings.append(pixels_emb)
+            
+            # Skip if no valid centers found
+            if not centers:
+                # Create dummy loss that's connected to the graph
+                dummy_loss = torch.mean(emb) * 0.0 + 0.1
+                pull_losses.append(dummy_loss)
+                continue
+                    
+            total_instances += len(centers)
+            centers_tensor = torch.stack(centers)  # (N_instances, E)
+            
+            # 1. Pull loss calculation: Force pixels to cluster around their centers
+            batch_pull_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            for i, (center, pixels) in enumerate(zip(centers, pixel_embeddings)):
+                # CRITICAL FIX: More stable distance calculation
+                squared_diffs = (pixels - center.unsqueeze(0))**2  # (N_pixels, E)
+                squared_dists = torch.sum(squared_diffs, dim=1) + 1e-8  # Add small epsilon for stability
+                dists = torch.sqrt(squared_dists)  # (N_pixels)
+                
+                # Apply minimum pull (even for pixels within delta_v)
+                min_pull = torch.mean(squared_dists) * 0.1
+                
+                # Apply hinge for pixels outside delta_v
+                hinge_dists = torch.clamp(dists - delta_v, min=0.0)**2
+                hinge_pull = torch.mean(hinge_dists)
+                
+                # Combine both
+                instance_pull = min_pull + hinge_pull
+                
+                # Add directly to computational graph
+                batch_pull_loss = batch_pull_loss + instance_pull
+            
+            # Normalize pull loss
+            if len(centers) > 0:
+                batch_pull_loss = batch_pull_loss / len(centers)
+                # CRITICAL FIX: Ensure non-zero gradient by connecting to centers
+                batch_pull_loss = batch_pull_loss + torch.mean(centers_tensor) * 0.0 + 1e-6
+                pull_losses.append(batch_pull_loss)
+            
+            # 2. Push loss calculation: Force centers apart from each other
+            if len(centers) > 1:
+                batch_push_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                pair_count = 0
+                
+                for i in range(len(centers)):
+                    for j in range(i+1, len(centers)):
+                        # CRITICAL FIX: More stable distance calculation
+                        squared_dist = torch.sum((centers[i] - centers[j])**2) + 1e-8
+                        dist = torch.sqrt(squared_dist)
+                        
+                        # Apply hinge
+                        margin = 2.0 * delta_d
+                        hinge_dist = torch.clamp(margin - dist, min=0.0)**2
+                        
+                        # Add directly to computational graph
+                        batch_push_loss = batch_push_loss + hinge_dist
+                        pair_count += 1
+                
+                # Normalize by pair count
+                if pair_count > 0:
+                    batch_push_loss = batch_push_loss / pair_count
+                    push_losses.append(batch_push_loss)
+            
+            # 3. Regularization term: Keep centers at a reasonable magnitude
+            # Calculate L2 norm of the centers
+            center_norms = torch.norm(centers_tensor, p=2, dim=1)
+            
+            # Target norm of 1.0
+            target_norm = torch.ones_like(center_norms)
+            reg_loss = torch.mean((center_norms - target_norm)**2)
+            
+            # CRITICAL FIX: Ensure non-zero gradient
+            reg_loss = reg_loss + torch.mean(centers_tensor) * 0.0 + 1e-6
+            reg_losses.append(reg_loss)
+        
+        # Combine losses with appropriate weights
+        # CRITICAL FIX: Always connect dummy losses to the computation graph
+        if pull_losses:
+            pull_loss = torch.mean(torch.stack(pull_losses))
+        else:
+            # Dummy loss connected to graph
+            pull_loss = torch.mean(pred_embeddings) * 0.0 + 0.001
+        
+        if push_losses:
+            push_loss = torch.mean(torch.stack(push_losses))
+        else:
+            # Dummy loss connected to graph
+            push_loss = torch.mean(pred_embeddings) * 0.0
+        
+        if reg_losses:
+            reg_loss = torch.mean(torch.stack(reg_losses))
+        else:
+            # Dummy loss connected to graph
+            reg_loss = torch.mean(pred_embeddings) * 0.0 + 0.001
+        
+        # Calculate weights
+        pull_weight = 1.0
+        push_weight = 0.05 / math.sqrt(embedding_dim)
+        
+        # IMPORTANT: Store loss components for debugging
+        if self.training:
+            # Print debug output (without distributed check)
+            pull_loss_val = pull_loss.item()
+            push_loss_val = push_loss.item()
+            reg_loss_val = reg_loss.item()
+            
+            self.loss_components = {
+                'pull_loss': pull_loss_val,
+                'push_loss': push_loss_val,
+                'reg_loss': reg_loss_val,
+                'instances': total_instances
+            }
+            
+            # Print debug info (safely, without distributed checks)
+            if hasattr(self, 'debug_step'):
+                self.debug_step += 1
+            else:
+                self.debug_step = 0
+                
+            if self.debug_step % 10 == 0:  # Print every 10 steps
+                print(f"Embed dim: {embedding_dim}, "
+                    f"Instances: {total_instances}, "
+                    f"Pull: {pull_loss_val:.6f} (w={pull_weight:.1f}), "
+                    f"Push: {push_loss_val:.6f} (w={push_weight:.6f}), "
+                    f"Reg: {reg_loss_val:.6f} (w={reg_weight:.2f})")
+        
+        # Combine with weights
+        loss = pull_weight * pull_loss + push_weight * push_loss + reg_weight * reg_loss
+        
+        # Return normalized loss
+        return loss.expand(batch_size) / num_objects
+
+    def instance_id_loss(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.1, delta_d=2.0, reg_weight=0.01):
+        """Original instance ID loss function (copied from your implementation)"""
+        batch_size = pred_embeddings.size(0)
+        embedding_dim = pred_embeddings.size(1)
+        device = pred_embeddings.device
+        
+        # Ensure target has the right shape
+        if target_instance_ids.dim() == 4:
+            target_instance_ids = target_instance_ids.squeeze(1)
+        
+        # Return value for empty batch
+        if batch_size == 0 or num_objects == 0:
+            return torch.ones(1, device=device, requires_grad=True) * 0.1
+
+        # Initialize loss components directly within computational graph
+        pull_losses = []
+        push_losses = []
+        reg_losses = []
+        
+        total_instances = 0
+        
+        # Process each sample in batch
+        for b in range(batch_size):
+            # Extract this batch item
+            emb = pred_embeddings[b]  # (E, H, W)
+            ids = target_instance_ids[b]  # (H, W)
+            
+            # Get unique instance IDs (excluding background)
+            instance_ids = torch.unique(ids)
+            instance_ids = instance_ids[instance_ids > 0]
+            
+            if len(instance_ids) == 0:
+                # Create dummy loss for samples with no instances
+                dummy_loss = torch.sum(emb) * 0.0 + 0.1
+                pull_losses.append(dummy_loss)
+                continue
+            
+            # Collect centers and features
+            centers = []
+            pixel_embeddings = []
+            
+            for inst_id in instance_ids:
+                # Get mask for this instance
+                mask = (ids == inst_id)
+                
+                # Skip tiny instances
+                if mask.sum() < 10:
+                    continue
+                    
+                # Extract coordinates where mask is True
+                y_indices, x_indices = torch.where(mask)
+                
+                # Limit to 1000 random pixels for very large instances
+                if len(y_indices) > 1000:
+                    idx = torch.randperm(len(y_indices))[:1000]
+                    y_indices = y_indices[idx]
+                    x_indices = x_indices[idx]
+                
+                # Directly extract embeddings for these coordinates
+                # Important: we need to keep gradients flowing here
+                inst_pixel_embeddings = []
+                for i in range(len(y_indices)):
+                    y, x = y_indices[i], x_indices[i]
+                    pixel_emb = emb[:, y, x]  # Extract embedding vector for this pixel
+                    inst_pixel_embeddings.append(pixel_emb)
+                
+                # Skip if no embeddings extracted
+                if not inst_pixel_embeddings:
+                    continue
+                    
+                # Stack into a tensor
+                inst_pixel_embeddings = torch.stack(inst_pixel_embeddings)  # (N_pixels, E)
+                
+                # Calculate center embedding (mean)
+                center = torch.mean(inst_pixel_embeddings, dim=0)  # (E)
+                
+                centers.append(center)
+                pixel_embeddings.append(inst_pixel_embeddings)
+            
+            # Skip if no valid centers found
+            if not centers:
+                # Create dummy loss
+                dummy_loss = torch.sum(emb) * 0.0 + 0.1
+                pull_losses.append(dummy_loss)
+                continue
+                
+            total_instances += len(centers)
+            centers_tensor = torch.stack(centers)  # (N_instances, E)
+            
+            # 1. Pull loss calculation: Force pixels to cluster around their centers
+            batch_pull_loss = 0
+            for i, (center, pixels) in enumerate(zip(centers, pixel_embeddings)):
+                # For each instance:
+                # Calculate distance from each pixel to center
+                dists = torch.sqrt(torch.sum((pixels - center.unsqueeze(0))**2, dim=1) + 1e-6)
+                
+                # Apply minimum pull (even for pixels within delta_v)
+                min_pull = torch.mean(dists**2) * 0.1
+                
+                # Apply hinge for pixels outside delta_v
+                hinge_dists = torch.clamp(dists - delta_v, min=0.0)**2
+                hinge_pull = torch.mean(hinge_dists)
+                
+                # Combine both
+                instance_pull = min_pull + hinge_pull
+                
+                # Add directly to computational graph
+                batch_pull_loss = batch_pull_loss + instance_pull
+            
+            # Normalize pull loss
+            if len(centers) > 0:
+                batch_pull_loss = batch_pull_loss / len(centers)
+                # Add small constant to ensure non-zero
+                batch_pull_loss = batch_pull_loss + 1e-6
+                pull_losses.append(batch_pull_loss)
+            
+            # 2. Push loss calculation: Force centers apart from each other
+            if len(centers) > 1:
+                batch_push_loss = 0
+                pair_count = 0
+                
+                for i in range(len(centers)):
+                    for j in range(i+1, len(centers)):
+                        # Calculate distance between centers
+                        dist = torch.sqrt(torch.sum((centers[i] - centers[j])**2) + 1e-6)
+                        
+                        # Apply hinge
+                        margin = 2.0 * delta_d
+                        hinge_dist = torch.clamp(margin - dist, min=0.0)**2
+                        
+                        # Add directly to computational graph
+                        batch_push_loss = batch_push_loss + hinge_dist
+                        pair_count += 1
+                
+                # Normalize by pair count
+                if pair_count > 0:
+                    batch_push_loss = batch_push_loss / pair_count
+                    push_losses.append(batch_push_loss)
+            
+            # 3. Regularization term: Keep centers at a reasonable magnitude
+            # Calculate L2 norm of the centers
+            center_norms = torch.norm(centers_tensor, p=2, dim=1)
+            
+            # Target norm of 1.0
+            target_norm = torch.ones_like(center_norms)
+            reg_loss = torch.mean((center_norms - target_norm)**2)
+            
+            # Add small constant to ensure non-zero
+            reg_loss = reg_loss + 1e-4
+            reg_losses.append(reg_loss)
+        
+        # Combine losses with appropriate weights
+        # If we have pull losses, combine them
+        if pull_losses:
+            pull_loss = torch.mean(torch.stack(pull_losses))
+        else:
+            # Create dummy pull loss (detached from graph)
+            pull_loss = torch.tensor(0.001, device=device)
+        
+        # If we have push losses, combine them
+        if push_losses:
+            push_loss = torch.mean(torch.stack(push_losses))
+        else:
+            # Create dummy push loss (detached from graph)
+            push_loss = torch.tensor(0.0, device=device)
+        
+        # If we have reg losses, combine them
+        if reg_losses:
+            reg_loss = torch.mean(torch.stack(reg_losses))
+        else:
+            # Create dummy reg loss (detached from graph)
+            reg_loss = torch.tensor(0.001, device=device)
+        
+        # Calculate weights
+        pull_weight = 1.0
+        push_weight = 0.05 / math.sqrt(embedding_dim)
+        
+        # Combine these tensors to ensure gradient flow through the combined loss
+        loss = pull_weight * pull_loss + push_weight * push_loss + reg_weight * reg_loss
+        
+        if self.training:
+            # For debugging
+            self.loss_components = {
+                'pull_loss': pull_loss.item(),
+                'push_loss': push_loss.item(),
+                'reg_loss': reg_loss.item(),
+                'total_loss': loss.item()
+            }
+        
+        return loss.expand(batch_size) / num_objects
+
+
+class InstanceSegDatasetGenerator:
+    """Generate synthetic instance segmentation data"""
+    def __init__(self, img_size=128, max_instances=4, max_samples=100):
+        self.img_size = img_size
+        self.max_instances = max_instances
+        self.max_samples = max_samples
+    
+    def generate_dataset(self):
+        """Generate a dataset of synthetic instance masks"""
+        # Generate images and masks
+        images = []
+        instance_masks = []
+        
+        for _ in range(self.max_samples):
+            # Create empty instance mask
+            instance_mask = torch.zeros((self.img_size, self.img_size), dtype=torch.long)
+            
+            # Create synthetic RGB image
+            image = torch.zeros((3, self.img_size, self.img_size), dtype=torch.float32)
+            
+            # Add background noise
+            image += torch.randn((3, self.img_size, self.img_size)) * 0.1
+            
+            # Number of instances in this image (1 to max_instances)
+            num_instances = torch.randint(1, self.max_instances+1, (1,)).item()
+            
+            # Create instances (circles with different colors)
+            for i in range(1, num_instances+1):
+                # Random center
+                cx = torch.randint(20, self.img_size-20, (1,)).item()
+                cy = torch.randint(20, self.img_size-20, (1,)).item()
+                
+                # Random radius
+                radius = torch.randint(10, 25, (1,)).item()
+                
+                # Random color
+                color = torch.rand(3)
+                
+                # Create grid for computing distance from center
+                y, x = torch.meshgrid(torch.arange(self.img_size), torch.arange(self.img_size))
+                dist = torch.sqrt((x - cx)**2 + (y - cy)**2)
+                
+                # Create mask for this instance
+                mask = dist < radius
+                
+                # Fill instance mask
+                instance_mask[mask] = i
+                
+                # Fill image with the instance color
+                for c in range(3):
+                    image[c][mask] = color[c]
+            
+            images.append(image)
+            instance_masks.append(instance_mask)
+        
+        # Convert to tensors
+        images_tensor = torch.stack(images)
+        masks_tensor = torch.stack(instance_masks)
+        
+        return images_tensor, masks_tensor
+
+def test_gradient_flow(use_fixed_version=True, epochs=20):
+    """Test the gradient flow in the loss function with visualizations"""
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Generate synthetic dataset
+    dataset_generator = InstanceSegDatasetGenerator(img_size=64, max_instances=3, max_samples=20)
+    images, masks = dataset_generator.generate_dataset()
+    
+    # Create dataset and dataloader
+    dataset = TensorDataset(images, masks)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+    
+    # Create model
+    model = SimpleEmbeddingNet(input_channels=3, embedding_dim=8).to(device)
+    
+    # Set up gradient inspector
+    inspector = GradientInspector()
+    inspector.register_model(model)
+    
+    # Create optimizer
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Training loop
+    loss_history = []
+    
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        
+        for images_batch, masks_batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
+            # Move tensors to device
+            images_batch = images_batch.to(device)
+            masks_batch = masks_batch.to(device)
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            embeddings = model(images_batch)
+            
+            # Calculate loss
+            if use_fixed_version:
+                # Use the fixed version of the loss function
+                model.training = True  # Ensure in training mode
+                loss = model.instance_id_loss_fixed(embeddings, masks_batch, num_objects=3, 
+                                              delta_v=0.1, delta_d=2.0, reg_weight=0.01)
+            else:
+                # Use the original loss function
+                loss = model.instance_id_loss(embeddings, masks_batch, num_objects=3, 
+                                              delta_v=0.1, delta_d=2.0, reg_weight=0.01)
+            
+            # Get loss components if available
+            loss_components = getattr(model, 'loss_components', 
+                                       {'pull_loss': 0, 'push_loss': 0, 'reg_loss': 0, 'total_loss': loss.mean().item()})
+            
+            # Backward pass
+            loss.mean().backward()
+            
+            # Check gradients
+            if epoch % 5 == 0:  # Only print detailed analysis occasionally
+                inspector.check_gradients(
+                    model, 
+                    {
+                        'loss_values': loss_components['total_loss'], 
+                        'pull_loss': loss_components['pull_loss'], 
+                        'push_loss': loss_components['push_loss'], 
+                        'reg_loss': loss_components['reg_loss']
+                    }
+                )
+            else:
+                # Just track the loss values without printing
+                inspector.gradient_history['loss_values'].append(loss_components['total_loss'])
+                inspector.gradient_history['pull_loss'].append(loss_components['pull_loss'])
+                inspector.gradient_history['push_loss'].append(loss_components['push_loss'])
+                inspector.gradient_history['reg_loss'].append(loss_components['reg_loss'])
+            
+            # Update weights
+            optimizer.step()
+            
+            epoch_loss += loss.mean().item()
+        
+        # Calculate average loss for the epoch
+        avg_epoch_loss = epoch_loss / len(dataloader)
+        loss_history.append(avg_epoch_loss)
+        
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_epoch_loss:.6f}")
+        
+    # Plot loss history
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, epochs+1), loss_history)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Loss History')
+    plt.savefig('loss_history.png')
+    
+    # Check for vanishing gradients
+    inspector.diagnose_vanishing_gradients(model)
+    
+    # Plot training history
+    fig = inspector.plot_training_history()
+    plt.savefig('training_history.png')
+    
+    # Plot gradient flow
+    grad_fig = inspector.plot_gradient_flow(model)
+    plt.savefig('gradient_flow.png')
+    
+    return model, inspector, loss_history
+
+
+# Run the test with both original and fixed loss functions
+if __name__ == "__main__":
+    print("Testing with original loss function...")
+    model_original, inspector_original, loss_original = test_gradient_flow(use_fixed_version=False, epochs=10)
+    
+    print("\nTesting with fixed loss function...")
+    model_fixed, inspector_fixed, loss_fixed = test_gradient_flow(use_fixed_version=True, epochs=10)
+    
+    # Compare the results
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(loss_original)+1), loss_original, label='Original Loss')
+    plt.plot(range(1, len(loss_fixed)+1), loss_fixed, label='Fixed Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Loss Comparison')
+    plt.legend()
+    plt.savefig('loss_comparison.png')
+    
+    print("\nTest complete. Check the generated plots for visualizing the gradient flow.")

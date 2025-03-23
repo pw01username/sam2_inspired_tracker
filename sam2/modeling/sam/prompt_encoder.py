@@ -65,6 +65,21 @@ class PromptEncoder(nn.Module):
         )
         self.no_mask_embed = nn.Embedding(1, embed_dim)
 
+        # Add an instance ID embedding to differentiate between instance masks
+        # Support up to 500 different instances
+        self.instance_id_embed = nn.Embedding(500, embed_dim)
+        
+        # Add cross-instance attention mechanism
+        self.instance_attention = nn.MultiheadAttention(embed_dim, 8, batch_first=True)
+        
+        # Add a mask embedding fusion mechanism
+        self.mask_fusion = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+
     def get_dense_pe(self) -> torch.Tensor:
         """
         Returns the positional encoding used to encode point prompts,
@@ -131,10 +146,41 @@ class PromptEncoder(nn.Module):
         corner_embedding[:, 1, :] += self.point_embeddings[3].weight
         return corner_embedding
 
-    def _embed_masks(self, masks: torch.Tensor) -> torch.Tensor:
-        """Embeds mask inputs."""
+    def _embed_mask(self, masks: torch.Tensor) -> torch.Tensor:
+        """Embeds mask inputs for single mask."""
         mask_embedding = self.mask_downscaling(masks)
         return mask_embedding
+
+    def _embed_masks(self, masks: torch.Tensor, instance_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Embeds mask inputs with optional instance IDs.
+        
+        Args:
+            masks: Tensor of shape (batch_size, num_instances, H, W) or (batch_size, 1, H, W)
+            instance_ids: Optional tensor of shape (batch_size, num_instances) with IDs for each mask
+            
+        Returns:
+            Tensor of embeddings for each mask and instance
+        """
+        b, n, h, w = masks.shape
+        
+        # Process each mask individually
+        mask_embeddings = []
+        for i in range(n):
+            mask_slice = masks[:, i:i+1, :, :]  # (batch_size, 1, H, W)
+            mask_embedding = self.mask_downscaling(mask_slice)  # (batch_size, embed_dim, h', w')
+            mask_embeddings.append(mask_embedding)
+        
+        # Add instance ID embeddings if provided
+        if instance_ids is not None:
+            for i in range(n):
+                instance_embedding = self.instance_id_embed(instance_ids[:, i])  # (batch_size, embed_dim)
+                # Reshape for broadcasting addition
+                instance_embedding = instance_embedding.unsqueeze(-1).unsqueeze(-1)  # (batch_size, embed_dim, 1, 1)
+                # Add instance embedding to mask embedding
+                mask_embeddings[i] = mask_embeddings[i] + instance_embedding
+        
+        return mask_embeddings
 
     def _get_batch_size(
         self,
@@ -156,6 +202,58 @@ class PromptEncoder(nn.Module):
 
     def _get_device(self) -> torch.device:
         return self.point_embeddings[0].weight.device
+
+    def _fuse_mask_embeddings(self, mask_embeddings: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Fuses multiple mask embeddings into a single embedding.
+        Uses cross-attention to allow masks to interact with each other.
+        
+        Args:
+            mask_embeddings: List of mask embeddings, each of shape (batch_size, embed_dim, h, w)
+            
+        Returns:
+            Fused mask embedding of shape (batch_size, embed_dim, h, w)
+        """
+        if len(mask_embeddings) == 0:
+            return None
+        
+        if len(mask_embeddings) == 1:
+            return mask_embeddings[0]
+        
+        # Average the embeddings as initial fusion
+        fused_embedding = sum(mask_embeddings) / len(mask_embeddings)
+        
+        # Reshape for attention: (batch_size, h*w, embed_dim)
+        b, c, h, w = mask_embeddings[0].shape
+        reshaped_embeddings = [emb.reshape(b, c, -1).permute(0, 2, 1) for emb in mask_embeddings]
+        
+        # Stack along a new dimension: (batch_size, num_masks, h*w, embed_dim)
+        stacked_embeddings = torch.stack(reshaped_embeddings, dim=1)
+        
+        # Flatten for attention: (batch_size*num_masks, h*w, embed_dim)
+        num_masks = len(mask_embeddings)
+        flattened_embeddings = stacked_embeddings.reshape(b * num_masks, h * w, c)
+        
+        # Self-attention to allow interaction between spatial locations
+        attended_embeddings, _ = self.instance_attention(
+            flattened_embeddings, flattened_embeddings, flattened_embeddings
+        )
+        
+        # Reshape back to original dimensions
+        attended_embeddings = attended_embeddings.reshape(b, num_masks, h * w, c)
+        
+        # Process each attended mask embedding
+        processed_embeddings = []
+        for i in range(num_masks):
+            mask_emb = attended_embeddings[:, i]  # (batch_size, h*w, embed_dim)
+            processed_emb = self.mask_fusion(mask_emb)  # Apply fusion MLP
+            processed_emb = processed_emb.permute(0, 2, 1).reshape(b, c, h, w)  # (batch_size, embed_dim, h, w)
+            processed_embeddings.append(processed_emb)
+        
+        # Sum all processed embeddings
+        final_embedding = sum(processed_embeddings)
+        
+        return final_embedding
 
     def forward(
         self,
@@ -192,11 +290,28 @@ class PromptEncoder(nn.Module):
             box_embeddings = self._embed_boxes(boxes)
             sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
+        mask_embeddings = None
         if masks is not None:
-            dense_embeddings = self._embed_masks(masks)
+            use_single_obj_mask_input = True
+            if use_single_obj_mask_input:
+                dense_embeddings = self._embed_mask(masks)
+            else:
+                # Handle multiple masks with instance IDs
+                if masks.dim() == 3:
+                    masks = masks.unsqueeze(1)  # Add instance dimension if not present
+                
+                if instance_ids is None and masks.shape[1] > 1:
+                    # If instance IDs not provided but multiple masks present, create sequential IDs
+                    instance_ids = torch.arange(masks.shape[1], device=masks.device).unsqueeze(0).expand(masks.shape[0], -1)
+                
+                # Embed each mask
+                mask_embeddings = self._embed_masks(masks, instance_ids)
+                
+                # Fuse mask embeddings
+                dense_embeddings = self._fuse_mask_embeddings(mask_embeddings)
         else:
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
 
-        return sparse_embeddings, dense_embeddings
+        return sparse_embeddings, dense_embeddings #, mask_embeddings  # Return individual mask embeddings too

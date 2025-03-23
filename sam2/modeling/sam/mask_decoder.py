@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple, Type
 import torch
 from torch.nn import functional as F
 from torch import nn
+from sam2.modeling.sam.transformer import Attention
 
 from sam2.modeling.sam2_utils import LayerNorm2d, MLP
 
@@ -19,6 +20,64 @@ class InstanceIdMode(IntEnum):
     EMBEDDING_HEAD_CNN = 1
     EMBEDDING_HEAD_MLP = 2
     EMBEDDING_SHARED_MLP = 3
+
+class SpatialEmbeddingAggregator(nn.Module):
+    """Aggregates embeddings using cross-attention that preserves spatial information."""
+    
+    def __init__(self, embedding_dim, num_heads=8, dropout=0.0):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        
+        # Query projection for each spatial position
+        self.query_proj = nn.Conv2d(embedding_dim, embedding_dim, kernel_size=1)
+        
+        # Cross-attention for combining embeddings
+        self.cross_attention = Attention(
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        
+        self.norm = nn.LayerNorm(embedding_dim)
+        
+    def forward(self, embedding_list):
+        """
+        Args:
+            embedding_list: List of tensors, each of shape [b, c, h, w]
+            
+        Returns:
+            Tensor of shape [b, c, h, w]
+        """
+        b, c, h, w = embedding_list[0].shape
+        num_embeddings = len(embedding_list)
+        
+        # Generate queries from the first embedding
+        # This could also be the average, or a learned combination
+        queries = self.query_proj(embedding_list[0])  # [b, c, h, w]
+        
+        # Reshape queries for attention: [b, h*w, c]
+        queries = queries.view(b, c, h*w).permute(0, 2, 1)
+        
+        # Prepare keys and values by stacking embeddings along sequence dimension
+        # First reshape each embedding to [b, h*w, c]
+        keys_values_list = []
+        for embed in embedding_list:
+            # [b, c, h, w] -> [b, h*w, c]
+            embed_flat = embed.view(b, c, h*w).permute(0, 2, 1)
+            keys_values_list.append(embed_flat)
+        
+        # Stack along a new sequence dimension: [b, num_embeddings*h*w, c]
+        keys_values = torch.cat(keys_values_list, dim=1)
+        
+        # Apply cross attention
+        attn_out = self.cross_attention(q=queries, k=keys_values, v=keys_values)
+        output = queries + attn_out
+        output = self.norm(output)
+        
+        # Reshape back to [b, c, h, w]
+        output = output.permute(0, 2, 1).view(b, c, h, w)
+        
+        return output
 
 class MaskDecoder(nn.Module):
     def __init__(
@@ -117,8 +176,9 @@ class MaskDecoder(nn.Module):
 
         # *** New: Add an instance ID head for dual-channel output ***
         self.instance_id_mode = InstanceIdMode.EMBEDDING_HEAD_MLP
-        self.embedding_dim = 32  # Adjust based on complexity of instances
-        
+        self.embedding_dim = 64
+        self.num_embedding_tokens = 64
+
         # We need to match the dimension of upscaled features
         self.output_feature_dim = transformer_dim // 8
         print("transforemr dim", transformer_dim)
@@ -139,7 +199,7 @@ class MaskDecoder(nn.Module):
                 # Extended transformer MLP head to predict instance embeddings
                 
                 # Add embedding tokens alongside mask tokens
-                self.embedding_tokens = nn.Embedding(1, transformer_dim)
+                self.embedding_tokens = nn.Embedding(self.num_embedding_tokens, transformer_dim)
                 
                 # Add embedding prediction hypernetworks (parallel to mask hypernetworks)
                 self.embedding_hypernetworks_mlps = nn.ModuleList(
@@ -170,6 +230,31 @@ class MaskDecoder(nn.Module):
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
     
+    def process_embeddings(self, embedding_list):
+        """Process a list of instance embeddings to create a single embedding volume.
+        
+        Args:
+            embedding_list: List of tensors, each with shape [b, c, h, w]
+            
+        Returns:
+            Tensor with shape [b, c, h, w] representing the combined embedding
+        """
+        # If we only have one embedding, just return it
+        if len(embedding_list) == 1:
+            return embedding_list[0]
+            
+        # Create the aggregator if it doesn't exist
+        if not hasattr(self, 'embedding_aggregator'):
+            b, c, h, w = embedding_list[0].shape
+            self.embedding_aggregator = SpatialEmbeddingAggregator(
+                embedding_dim=c,
+                num_heads=8,
+                dropout=0.1
+            ).to(embedding_list[0].device)
+        
+        # Use the aggregator to combine embeddings
+        return self.embedding_aggregator(embedding_list)
+
     def forward(
         self,
         image_embeddings: torch.Tensor,
@@ -284,8 +369,13 @@ class MaskDecoder(nn.Module):
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
-        embedding_tokens_out = hs[:, (s + 1 + self.num_mask_tokens) : (s + 1 + self.num_mask_tokens + 1), :]
-    
+        embedding_tokens_out = hs[:,  : (s + 1 + self.num_mask_tokens + 1), :]
+        
+        start_idx = (s + 1 + self.num_mask_tokens)
+        end_idx = start_idx + self.num_embedding_tokens
+        embedding_tokens_out = hs[:, start_idx : end_idx, :]
+        #print("shape of embed tokens out: ", embedding_tokens_out.shape, "hs shape", hs.shape)
+
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
         if not self.use_high_res_features:
@@ -306,56 +396,48 @@ class MaskDecoder(nn.Module):
                 # Use instance embeddings to predict instance ID map
                 instance_id_map = self.instance_embedding_head(upscaled_embedding)  # (B, embedding_dim, h, w)
             case InstanceIdMode.EMBEDDING_HEAD_MLP:
-                # Get embedding tokens and process them through hypernetworks, similar to masks
                 embedding_hyper_in_list: List[torch.Tensor] = []
-                embedding_hyper_in_list.append(
-                    self.embedding_hypernetworks_mlps[0](embedding_tokens_out[:, 0, :])
-                )
+                # Process each embedding token through the hypernetwork
+                for j in range(self.num_embedding_tokens):
+                    embedding_hyper_in_list.append(
+                        self.embedding_hypernetworks_mlps[0](embedding_tokens_out[:, j, :])
+                    )
                 embedding_hyper_in = torch.stack(embedding_hyper_in_list, dim=1)
-
-                # Create lazily initialized projection layers if they don't exist yet
-                if not hasattr(self, 'embedding_projections'):
-                    self.embedding_projections = nn.ModuleList([
-                        nn.Conv2d(1, self.embedding_dim, kernel_size=1).to(device=upscaled_embedding.device, dtype=upscaled_embedding.dtype)
-                    ])
                 
                 # Create instance embeddings using hypernetworks
                 instance_embedding_list = []
                 b, c, h, w = upscaled_embedding.shape
                 
-                for i in range(1): #self.num_mask_tokens
+                for i in range(self.num_embedding_tokens):
                     # Get hypernetwork weights and ensure compatible dtype
                     hyper_weights = embedding_hyper_in[:, i]  # [b, embedding_dim]
                     
-                    # Create projection if needed to match upscaled_embedding channels
+                    # Create a projection that outputs a c×c transformation matrix
                     if not hasattr(self, f'hyper_proj_{i}'):
                         self.register_module(
                             f'hyper_proj_{i}',
-                            nn.Linear(hyper_weights.shape[1], c).to(device=upscaled_embedding.device, dtype=upscaled_embedding.dtype)
+                            nn.Linear(hyper_weights.shape[1], c*c).to(device=upscaled_embedding.device, dtype=upscaled_embedding.dtype)
                         )
                     
-                    # Project to match channel dimensions for bmm
+                    # Project to get a full transformation matrix
                     proj = getattr(self, f'hyper_proj_{i}')
                     projected_weights = proj(hyper_weights.to(dtype=upscaled_embedding.dtype))
                     
-                    # Apply the weights to get the base embedding
-                    base_embedding = torch.bmm(
-                        projected_weights.unsqueeze(1),  # [b, 1, c]
-                        upscaled_embedding.reshape(b, c, -1)  # [b, c, h*w]
-                    ).view(b, 1, h, w)  # [b, 1, h, w]
+                    # Reshape to create a transformation matrix for each batch item
+                    transformation_matrix = projected_weights.view(b, c, c)  # [b, c, c]
                     
-                    # Make sure projection has matching dtype
-                    self.embedding_projections[i] = self.embedding_projections[i].to(
-                        device=base_embedding.device, 
-                        dtype=base_embedding.dtype
-                    )
+                    # Apply the transformation to all pixels while preserving the channel dimension
+                    reshaped_features = upscaled_embedding.reshape(b, c, -1)  # [b, c, h*w]
+                    transformed_features = torch.bmm(transformation_matrix, reshaped_features)  # [b, c, h*w]
                     
-                    # Project to embedding dimension
-                    instance_embedding = self.embedding_projections[i](base_embedding)  # [b, embed_dim, h, w]
-                    instance_embedding_list.append(instance_embedding)
+                    # Reshape back to spatial dimensions, preserving all c channels
+                    base_embedding = transformed_features.view(b, c, h, w)  # [b, c, h, w]
+                    
+                    instance_embedding_list.append(base_embedding)
+                    #print("base emb shape", base_embedding.shape)
 
                 # Use the first token's embedding
-                instance_embeddings = instance_embedding_list[0]  # [b, embed_dim, h, w]
+                instance_embeddings = self.process_embeddings(instance_embedding_list)  # [b, embed_dim, h, w]
                 
                 # Use the first token's embeddings (consistent with taking first mask)
                 #instance_embeddings = embeddings[:, 0, :, :] # [b, embed_dim, h, w]
