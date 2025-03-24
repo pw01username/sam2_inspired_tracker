@@ -158,10 +158,6 @@ class MultiStepMultiMasksAndIous(nn.Module):
         assert "loss_mask" in self.weight_dict
         assert "loss_dice" in self.weight_dict
         assert "loss_iou" in self.weight_dict
-        if "loss_instance" not in self.weight_dict:
-            self.weight_dict["loss_instance"] = 20.0  # Default weight for instance loss
-        if "loss_class" not in self.weight_dict:
-            self.weight_dict["loss_class"] = 0.0
 
         self.focal_alpha_obj_score = focal_alpha_obj_score
         self.focal_gamma_obj_score = focal_gamma_obj_score
@@ -170,9 +166,9 @@ class MultiStepMultiMasksAndIous(nn.Module):
         self.pred_obj_scores = pred_obj_scores
             
         # Add visualization parameters
-        self.enable_visualization = False
+        self.enable_visualization = True
         self.vis_save_dir = "./vis"
-        self.vis_freq = 100
+        self.vis_freq = 10
         self.iteration = 0
         
         if self.enable_visualization:
@@ -197,7 +193,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 
         
         # Add visualization after loss calculation
-        if self.enable_visualization and self.iteration % self.vis_freq == 0:
+        if self.enable_visualization and self.iteration % self.vis_freq == 0 and False:
             # Save visualization only on the main process in distributed training
             if not is_dist_avail_and_initialized() or torch.distributed.get_rank() == 0:
                 try:
@@ -304,11 +300,12 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
         target_masks = targets.unsqueeze(1).float()
         assert target_masks.dim() == 4  # [N, 1, H, W]
-        src_masks_list = outputs["multistep_pred_multimasks_high_res"]
+        src_masks_list = outputs["multistep_pred_multimasks_high_res"] #outputs["multistep_pred_masks_high_res"] would always give just first mask but rest of loss code thinks we use multi mask
         ious_list = outputs["multistep_pred_ious"]
         object_score_logits_list = outputs["multistep_object_score_logits"]
-
         pred_instance_ids_list = outputs["multistep_pred_instance_ids"]
+
+        #print("target masks shape ", target_masks.shape, " src masks list shape", len(src_masks_list), src_masks_list[0].shape)
 
         assert len(src_masks_list) == len(ious_list)
         assert len(object_score_logits_list) == len(ious_list)
@@ -330,9 +327,14 @@ class MultiStepMultiMasksAndIous(nn.Module):
     ):
         #print("target_instance_ids: ", target_instance_ids.shape)
         #print("pred_instance_ids: ", pred_instance_ids.shape)
+
+        # Convert src_masks to match target masks shape of 4 dim
+        if src_masks.dim() == 3:  # [B, H, W]
+            src_masks = src_masks.unsqueeze(1)  # [B, 1, H, W]
         
         # Get the binary masks for foreground/background segmentation
         # Ensure target_masks has the right shape for comparisons
+        #print("target_masks.shape", target_masks.shape, "src mask shape", src_masks.shape)
         if target_masks.shape[0] != src_masks.shape[0]:
             # Expand target_masks to match batch size of src_masks
             target_masks = target_masks.expand(src_masks.shape[0], -1, -1, -1)
@@ -340,6 +342,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         # Expand target_masks along mask dimension if needed
         if target_masks.shape[1] != src_masks.shape[1]:
             target_masks = target_masks.expand(-1, src_masks.shape[1], -1, -1)
+        #print("after potential expand target_masks.shape", target_masks.shape, "src mask shape", src_masks.shape)
         
         # Convert target_instance_ids to match pred_instance_ids shape if needed
         if target_instance_ids.dim() == 3:  # [B, H, W]
@@ -424,10 +427,10 @@ class MultiStepMultiMasksAndIous(nn.Module):
         # new: instance ID loss
         
         # Instance id embeddings, discriminative emb loss. Assuming pred_instance_ids is embeddings.
-        loss_instance = self.instance_id_loss_fixed(pred_instance_ids, target_instance_ids, num_objects)
+        loss_instance = self.instance_id_loss_fixed(pred_instance_ids, target_instance_ids, num_objects, delta_v=0.8, delta_d=0.5, reg_weight=0.2)
         if torch.isnan(loss_instance).any():
             print("NaN value as loss!")
-            loss_instance += 0.01
+            loss_instance = torch.mean(pred_embeddings) * 0.0 + 0.1
         
         # L1
         #loss_instance = self.instance_id_loss_L1(pred_instance_ids, target_instance_ids, num_objects)
@@ -533,10 +536,10 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 y_indices, x_indices = torch.where(mask)
                 
                 # Limit to 1000 random pixels for very large instances
-                if len(y_indices) > 1000:
-                    idx = torch.randperm(len(y_indices))[:1000]
-                    y_indices = y_indices[idx]
-                    x_indices = x_indices[idx]
+                # if len(y_indices) > 1000:
+                #     idx = torch.randperm(len(y_indices))[:1000]
+                #     y_indices = y_indices[idx]
+                #     x_indices = x_indices[idx]
                 
                 # CRITICAL FIX: Use vectorized operations for better gradient flow
                 # This replaces the loop over individual pixels
@@ -642,6 +645,13 @@ class MultiStepMultiMasksAndIous(nn.Module):
             # Dummy loss connected to graph
             pull_loss = torch.mean(pred_embeddings) * 0.0 + 0.001
         
+        # Check gradients in key tensors
+        #if pull_loss.requires_grad:
+        #    pull_loss.register_hook(lambda grad: print(f"Pull loss grad: {grad.item():.6f}"))
+            
+        # Print if centers require grad
+        #print(f"Centers require grad: {centers_tensor.requires_grad}")
+
         if push_losses:
             push_loss = torch.mean(torch.stack(push_losses))
         else:
@@ -655,8 +665,8 @@ class MultiStepMultiMasksAndIous(nn.Module):
             reg_loss = torch.mean(pred_embeddings) * 0.0 + 0.001
         
         # Calculate weights
-        pull_weight = 1.0
-        push_weight = 0.05 / math.sqrt(embedding_dim)
+        pull_weight = 2.0
+        push_weight = 3 #0.5 / math.sqrt(embedding_dim)
         
         # IMPORTANT: Store loss components for debugging
         if self.training:
@@ -666,10 +676,10 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 'reg_loss': reg_loss.item(),
                 'instances': total_instances
             }
-            print(self.loss_values)
         
         # Combine with weights
         loss = pull_weight * pull_loss + push_weight * push_loss + reg_weight * reg_loss
+        print(self.loss_values, "loss: ", loss)
         
         # Return normalized loss
         return loss.expand(batch_size) / num_objects
@@ -688,7 +698,8 @@ class MultiStepMultiMasksAndIous(nn.Module):
         """
         batch_size = pred_embeddings.size(0)
         #print("Batch size", pred_embeddings.shape)
-        print("An embedding at pixel 50,50: ", pred_embeddings[0, :, 50, 50])
+        print("An embedding at pixel 100,100: ", pred_embeddings[0, 5:20, 100, 100])
+        print("An embedding at pixel 101,101: ", pred_embeddings[0, 5:20, 101, 101])
         embedding_dim = pred_embeddings.size(1)
         device = pred_embeddings.device
         

@@ -239,8 +239,10 @@ class MaskDecoder(nn.Module):
         Returns:
             Tensor with shape [b, c, h, w] representing the combined embedding
         """
+        #print("len embedding_list", len(embedding_list), embedding_list[0].shape)
         # If we only have one embedding, just return it
         if len(embedding_list) == 1:
+            print("Returning just one embed")
             return embedding_list[0]
             
         # Create the aggregator if it doesn't exist
@@ -283,7 +285,7 @@ class MaskDecoder(nn.Module):
         """
         
         self.start.record()
-        masks, iou_pred, mask_tokens_out, object_score_logits, dual_output = self.predict_masks(
+        masks, iou_pred, mask_tokens_out, object_score_logits, instance_embeddings = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
@@ -317,8 +319,12 @@ class MaskDecoder(nn.Module):
         torch.cuda.synchronize()
         encoder_time = self.start.elapsed_time(self.end)  # milliseconds
         #print("mask decoder forward run time in ms: ", encoder_time)
+
+        # Check gradients flowing to embeddings
+        #print(f"Dual output requires grad: {instance_embeddings.requires_grad}")
+
         # Prepare output
-        return masks, iou_pred, sam_tokens_out, object_score_logits, dual_output
+        return masks, iou_pred, sam_tokens_out, object_score_logits, instance_embeddings
 
     def predict_masks(
         self,
@@ -447,7 +453,7 @@ class MaskDecoder(nn.Module):
                 
                 # Reshape and normalize embeddings (L2 normalization scales all vector to same size so only direction matters)
                 instance_embeddings = F.normalize(instance_embeddings, p=2, dim=1)
-                
+                #print("instance_embeddings requries grad:", instance_embeddings.requires_grad, "instance_embeddings shape", instance_embeddings.shape)
                 # *** New: Predict bandwidth and offsets ***
                 #pred_bandwidth = self.pred_bandwidth_head(upscaled_embedding)  # (B, 1, H, W)
                 #pred_offsets = self.pred_offset_head(upscaled_embedding)        # (B, 2, H, W)
@@ -488,15 +494,13 @@ class MaskDecoder(nn.Module):
         match self.instance_id_mode:
             case InstanceIdMode.DIRECT:
                 # Combine binary mask and instance ID map to form a dual-channel output.
-                dual_channel_output = torch.cat([binary_mask, instance_id_map], dim=1)  # shape: (B, 2, h, w)
-                dual_channel_output = dual_channel_output.permute(0, 2, 3, 1)  # (B, h, w, 2)
+                instance_embeddings = instance_id_map  # shape: (B, 1, h, w)
             case InstanceIdMode.EMBEDDING_HEAD_CNN| InstanceIdMode.EMBEDDING_HEAD_MLP:
-                dual_channel_output = torch.cat([binary_mask, instance_embeddings], dim=1)
-                dual_channel_output = dual_channel_output.permute(0, 2, 3, 1)  # [B, H, W, 1+embedding_dim]
+                pass
             case _:
                 raise NotImplementedError(f"InstanceIdMode {self.instance_id_mode} not implemented")
                 
-        return masks, iou_pred, mask_tokens_out, object_score_logits, dual_channel_output#, pred_bandwidth, pred_offsets
+        return masks, iou_pred, mask_tokens_out, object_score_logits, instance_embeddings#, pred_bandwidth, pred_offsets
 
     def _get_stability_scores(self, mask_logits):
         """

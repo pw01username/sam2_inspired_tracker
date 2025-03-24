@@ -791,6 +791,16 @@ class Trainer:
                         self.model, rank=self.distributed_rank, where=self.where
                     )
 
+                # After scaler.scale(loss).backward()
+                for name, param in self.model.named_parameters():
+                    if 'embedding' in name.lower() and param.grad is None:
+                        print(f"WARNING: No gradient for {name}")
+                    elif 'embedding' in name.lower() and param.grad is not None:
+                        # If gradients are tiny, amplify them
+                        if param.grad.norm() < 1e-6:
+                            print(f"Amplifying tiny gradient for {name}")
+                            param.grad = param.grad * 10.0
+
                 # Optimizer step: the scaler will make sure gradients are not
                 # applied if the gradients are infinite
                 self.scaler.step(self.optim.optimizer)
@@ -886,6 +896,17 @@ class Trainer:
                 return
 
         self.scaler.scale(loss).backward()
+
+        # After scaler.scale(loss).backward()
+        for name, param in self.model.named_parameters():
+            if 'embedding' in name.lower() and param.grad is None:
+                print(f"WARNING: No gradient for {name}")
+            elif 'embedding' in name.lower() and param.grad is not None:
+                # If gradients are tiny, amplify them
+                if param.grad.norm() < 1e-6:
+                    print(f"Amplifying tiny gradient for {name}")
+                    param.grad = param.grad * 10.0
+
         loss_mts[loss_key].update(loss.item(), batch_size)
         for extra_loss_key, extra_loss in extra_losses.items():
             if extra_loss_key not in extra_loss_mts:

@@ -3,10 +3,10 @@
 scratch:
   resolution: 256 #1024
   train_batch_size: 1
-  num_train_workers: 1 #10
-  num_frames: 8
-  max_num_objects: 3
-  base_lr: 5.0e-1 # original 5.0e-6
+  num_train_workers: 3 #10
+  num_frames: 4 #8
+  max_num_objects: 5 #3
+  base_lr: 5.0e-2 # original 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
   num_epochs: 40
@@ -15,10 +15,10 @@ dataset:
   # PATHS to Dataset
   #img_folder: C:\Users\patrick.wulff\Downloads\DAVIS-2017-trainval-480p\DAVIS\JPEGImages # PATH to MOSE JPEGImages folder
   #gt_folder: C:\Users\patrick.wulff\Downloads\DAVIS-2017-trainval-480p\DAVIS\Annotations  # PATH to MOSE Annotations folder
-  img_folder: /davis/DAVIS/JPEGImages
-  gt_folder: /davis/DAVIS/Annotations
+  img_folder: /davis/DAVIS/JPEGImages_overfit
+  gt_folder: /davis/DAVIS/Annotations_overfit
   file_list_txt: null #training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
-  multiplier: 2
+  multiplier: 20 #2
 
 # Video transforms
 vos:
@@ -156,7 +156,7 @@ trainer:
     # use high-resolution feature map in the SAM mask decoder
     use_high_res_features_in_sam: true
     # output 3 masks on the first click on initial conditioning frames
-    multimask_output_in_sam: true
+    multimask_output_in_sam: false #true
     # SAM heads
     iou_prediction_use_sigmoid: True
     # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
@@ -245,7 +245,7 @@ trainer:
 
     gradient_clip:
       _target_: training.optimizer.GradientClipper
-      max_norm: 0.1
+      max_norm: 0.3 #0.1
       norm_type: 2
 
     param_group_modifiers:
@@ -284,11 +284,11 @@ trainer:
     all:
       _target_: training.loss_fns.MultiStepMultiMasksAndIous
       weight_dict:
-        loss_mask: 3
-        loss_dice: 1
-        loss_iou: 1
-        loss_class: 1
-        loss_instance: 50
+        loss_mask: 0 #1
+        loss_dice: 0 #1
+        loss_iou: 0 #1
+        loss_class: 0 #1
+        loss_instance: 20
       supervise_all_iou: true
       iou_use_l1_loss: true
       pred_obj_scores: true
@@ -296,7 +296,7 @@ trainer:
       focal_alpha_obj_score: -1.0
 
   distributed:
-    backend: gloo
+    backend: nccl #gloo and nccl are options.
     find_unused_parameters: True
 
   logging:
@@ -311,7 +311,7 @@ trainer:
   # initialize from a SAM 2 checkpoint
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 1 # 0 only last checkpoint is saved.
+    save_freq: 0 # 0 only last checkpoint is saved.
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model

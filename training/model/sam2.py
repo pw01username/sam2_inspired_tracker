@@ -266,7 +266,7 @@ class SAM2Train(SAM2Base):
                 gt_masks_per_frame[t] = combined_mask
                 
                 # Optionally add this line to visualize the result
-                #self.visualize_masks(combined_mask, combined_mask)
+                self.visualize_masks(combined_mask, combined_mask)
             else:
                 # Just use the regular combined mask without instance borders
                 gt_masks_per_frame[t] = input.combined_masks[t].unsqueeze(1)
@@ -402,7 +402,7 @@ class SAM2Train(SAM2Base):
          
         return backbone_out
 
-    def visualize_masks(self, masks, border_enhanced_masks):
+    def visualize_masks(self, masks, border_enhanced_masks, path='./mask_input.png'):
         """
         Helper function to visualize original masks side by side with border enhanced masks.
         Returns a visualization array that can be displayed with matplotlib.
@@ -424,6 +424,11 @@ class SAM2Train(SAM2Base):
         if isinstance(border_enhanced_masks, torch.Tensor):
             border_enhanced_masks = border_enhanced_masks.cpu().numpy()
         
+        # Skip visualization if either input is 1D or doesn't have the right shape
+        if len(masks.shape) < 2 or len(border_enhanced_masks.shape) < 2:
+            print(f"Skipping visualization due to invalid dimensions. Masks shape: {masks.shape}, Border masks shape: {border_enhanced_masks.shape}")
+            return
+        
         # Create a custom colormap for the border enhanced masks
         colors = [(0, 0, 0, 0), (0, 0, 1, 0.5), (1, 0, 0, 1)]  # transparent -> blue -> red
         positions = [0, 0.5, 1]
@@ -443,7 +448,8 @@ class SAM2Train(SAM2Base):
         axes[1].axis('off')
         
         plt.tight_layout()
-        plt.show()
+        plt.savefig(path)
+        plt.close(fig)
 
     def create_border_emphasized_masks(self, masks, border_width=2, border_value=1.0, interior_value=0.5):
         """
@@ -574,10 +580,7 @@ class SAM2Train(SAM2Base):
             if not backbone_out.get("use_pt_input", False):
                 # Option 1: Use the combined mask (all objects together)
                 #mask_inputs = backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {})
-                mask_inputs = self._combine_object_mask_prompts(
-                    backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {}),
-                    objects_in_frame
-                )
+                mask_inputs = backbone_out.get("gt_masks_per_frame", {}).get(stage_id, {})[0]
                 # Option 2: Create a combined mask from individual object masks
                 # mask_inputs = self._combine_object_mask_prompts(
                 #         backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {}),
@@ -588,6 +591,13 @@ class SAM2Train(SAM2Base):
             gt_masks = None
             if stage_id in init_cond_frames:
                 gt_masks = backbone_out["gt_masks_per_frame"].get(stage_id, None)
+                # Gt masks have borders internally so just quickfix make global binary mask for GT mask:
+                gt_masks = self._combine_object_mask_prompts(
+                            backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {}),
+                            objects_in_frame
+                        )
+
+                self.visualize_masks(gt_masks, mask_inputs, path='./gtmask_vs_inputmask.png')
 
             # Get output masks based on this frame's prompts and previous memory
             current_out = self.track_step(

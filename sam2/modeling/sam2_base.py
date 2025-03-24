@@ -349,7 +349,7 @@ class SAM2Base(torch.nn.Module):
             ious,
             sam_output_tokens,
             object_score_logits,
-            dual_output
+            instance_embeddings
         ) = self.sam_mask_decoder(
             image_embeddings=backbone_features,
             image_pe=self.sam_prompt_encoder.get_dense_pe(),
@@ -359,14 +359,10 @@ class SAM2Base(torch.nn.Module):
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
         )
-        
-        # Now dual_output contains both the mask and instance ID predictions
-        # Extract instance IDs from the dual-channel output
-        pred_instance_ids = dual_output[:, :, :, 1:].permute(0, 3, 1, 2)  # (B, 1, h, w)
-        
+
         # Upsample instance IDs to the same size as high_res_masks
         high_res_instance_ids = F.interpolate(
-            pred_instance_ids,
+            instance_embeddings,
             size=(self.image_size, self.image_size),
             mode="nearest",  # Use nearest neighbor to preserve instance ID values
         )
