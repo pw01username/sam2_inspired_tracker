@@ -137,6 +137,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         pred_obj_scores=False,
         focal_gamma_obj_score=0.0,
         focal_alpha_obj_score=-1,
+        use_instance_loss=False,
     ):
         """
         This class computes the multi-step multi-mask and IoU losses.
@@ -164,7 +165,9 @@ class MultiStepMultiMasksAndIous(nn.Module):
         self.supervise_all_iou = supervise_all_iou
         self.iou_use_l1_loss = iou_use_l1_loss
         self.pred_obj_scores = pred_obj_scores
-            
+        
+        self.use_instance_loss = use_instance_loss
+
         # Add visualization parameters
         self.enable_visualization = True
         self.vis_save_dir = "./vis"
@@ -178,9 +181,11 @@ class MultiStepMultiMasksAndIous(nn.Module):
         
         assert len(outs_batch) == len(targets_batch)
         assert len(outs_batch) == len(instance_ids_batch)
+
         num_objects = torch.tensor(
             (targets_batch.shape[1]), device=targets_batch.device, dtype=torch.float
-        )  # Number of objects is fixed within a batch
+        )  # Can number of objects vary within a batch? Yes, should support this to use max obj num for a batch? 
+
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_objects)
         num_objects = torch.clamp(num_objects / get_world_size(), min=1).item()
@@ -234,7 +239,6 @@ class MultiStepMultiMasksAndIous(nn.Module):
                     import traceback
                     traceback.print_exc()
     
-            
         # Save visualization only on the main process in distributed training
         if not is_dist_avail_and_initialized() or torch.distributed.get_rank() == 0 and (self.enable_visualization and self.iteration % self.vis_freq == 0):
             try:
@@ -298,9 +302,14 @@ class MultiStepMultiMasksAndIous(nn.Module):
         If `supervise_all_iou` is True, we backpropagate ious losses for all predicted masks.
         """
 
-        target_masks = targets.unsqueeze(1).float()
-        assert target_masks.dim() == 4  # [N, 1, H, W]
-        src_masks_list = outputs["multistep_pred_multimasks_high_res"] #outputs["multistep_pred_masks_high_res"] would always give just first mask but rest of loss code thinks we use multi mask
+        # Ensure targets is [num_objects, 1, H, W] for per-object processing
+        if targets.dim() == 3:  # [num_objects, H, W]
+            target_masks = targets.unsqueeze(1).float()  # [num_objects, 1, H, W]
+        else:
+            target_masks = targets.float()  # Already [num_objects, 1, H, W]
+        assert target_masks.dim() == 4  # [num_objects, 1, H, W]
+
+        src_masks_list = outputs["multistep_pred_masks_high_res"] #outputs["multistep_pred_multimasks_high_res"]
         ious_list = outputs["multistep_pred_ious"]
         object_score_logits_list = outputs["multistep_object_score_logits"]
         pred_instance_ids_list = outputs["multistep_pred_instance_ids"]
@@ -309,10 +318,14 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
         assert len(src_masks_list) == len(ious_list)
         assert len(object_score_logits_list) == len(ious_list)
-        assert len(pred_instance_ids_list) == len(ious_list)
+        if self.use_instance_loss:
+            assert len(pred_instance_ids_list) == len(ious_list)
 
         # accumulate the loss over prediction steps
-        losses = {"loss_mask": 0, "loss_dice": 0, "loss_iou": 0, "loss_class": 0, "loss_instance": 0}
+        losses = {"loss_mask": 0, "loss_dice": 0, "loss_iou": 0, "loss_class": 0}
+        if self.use_instance_loss:
+            losses["loss_instance"] = 0
+        
         for src_masks, ious, object_score_logits, pred_instance_ids  in zip(
             src_masks_list, ious_list, object_score_logits_list, pred_instance_ids_list 
         ):
@@ -340,45 +353,112 @@ class MultiStepMultiMasksAndIous(nn.Module):
             target_masks = target_masks.expand(src_masks.shape[0], -1, -1, -1)
         
         # Expand target_masks along mask dimension if needed
-        if target_masks.shape[1] != src_masks.shape[1]:
-            target_masks = target_masks.expand(-1, src_masks.shape[1], -1, -1)
+        # if target_masks.shape[1] != src_masks.shape[1]:
+        #     target_masks = target_masks.expand(-1, src_masks.shape[1], -1, -1)
         #print("after potential expand target_masks.shape", target_masks.shape, "src mask shape", src_masks.shape)
-        
-        # Convert target_instance_ids to match pred_instance_ids shape if needed
-        if target_instance_ids.dim() == 3:  # [B, H, W]
-            target_instance_ids = target_instance_ids.unsqueeze(1)  # [B, 1, H, W]
-        
-        # Handle batch size mismatch for instance IDs
-        if target_instance_ids.shape[0] != pred_instance_ids.shape[0]:
-            target_instance_ids = target_instance_ids.expand(pred_instance_ids.shape[0], -1, -1, -1)
         
         # target_masks = target_masks.expand_as(src_masks)
         # get focal, dice and iou loss on all output masks in a prediction step
-        loss_multimask = sigmoid_focal_loss(
+        # loss_multimask = sigmoid_focal_loss(
+        #     src_masks,
+        #     target_masks,
+        #     num_objects,
+        #     alpha=self.focal_alpha,
+        #     gamma=self.focal_gamma,
+        #     loss_on_multimask=True,
+        # )
+        # loss_multidice = dice_loss(
+        #     src_masks, target_masks, num_objects, loss_on_multimask=True
+        # )
+        # if not self.pred_obj_scores:
+        #     loss_class = torch.tensor(
+        #         0.0, dtype=loss_multimask.dtype, device=loss_multimask.device
+        #     )
+        #     target_obj = torch.ones(
+        #         loss_multimask.shape[0],
+        #         1,
+        #         dtype=loss_multimask.dtype,
+        #         device=loss_multimask.device,
+        #     )
+        # else:
+        #     target_obj = torch.any((target_masks[:, 0] > 0).flatten(1), dim=-1)[
+        #         ..., None
+        #     ].float()
+        #     loss_class = sigmoid_focal_loss(
+        #         object_score_logits,
+        #         target_obj,
+        #         num_objects,
+        #         alpha=self.focal_alpha_obj_score,
+        #         gamma=self.focal_gamma_obj_score,
+        #     )
+
+        # loss_multiiou = iou_loss(
+        #     src_masks,
+        #     target_masks,
+        #     ious,
+        #     num_objects,
+        #     loss_on_multimask=True,
+        #     use_l1_loss=self.iou_use_l1_loss,
+        # )
+        # assert loss_multimask.dim() == 2
+        # assert loss_multidice.dim() == 2
+        # assert loss_multiiou.dim() == 2
+        # if loss_multimask.size(1) > 1:
+        #     # take the mask indices with the smallest focal + dice loss for back propagation
+        #     loss_combo = (
+        #         loss_multimask * self.weight_dict["loss_mask"]
+        #         + loss_multidice * self.weight_dict["loss_dice"]
+        #     )
+        #     best_loss_inds = torch.argmin(loss_combo, dim=-1)
+        #     batch_inds = torch.arange(loss_combo.size(0), device=loss_combo.device)
+        #     loss_mask = loss_multimask[batch_inds, best_loss_inds].unsqueeze(1)
+        #     loss_dice = loss_multidice[batch_inds, best_loss_inds].unsqueeze(1)
+        #     # calculate the iou prediction and slot losses only in the index
+        #     # with the minimum loss for each mask (to be consistent w/ SAM)
+        #     if self.supervise_all_iou:
+        #         loss_iou = loss_multiiou.mean(dim=-1).unsqueeze(1)
+        #     else:
+        #         loss_iou = loss_multiiou[batch_inds, best_loss_inds].unsqueeze(1)
+        # else:
+        #     loss_mask = loss_multimask
+        #     loss_dice = loss_multidice
+        #     loss_iou = loss_multiiou
+
+        # Compute losses for each object separately
+        loss_mask = sigmoid_focal_loss(
             src_masks,
             target_masks,
             num_objects,
             alpha=self.focal_alpha,
             gamma=self.focal_gamma,
-            loss_on_multimask=True,
         )
-        loss_multidice = dice_loss(
-            src_masks, target_masks, num_objects, loss_on_multimask=True
+        
+        loss_dice = dice_loss(
+            src_masks, target_masks, num_objects
         )
+        
+        loss_iou = iou_loss(
+            src_masks,
+            target_masks,
+            ious,
+            num_objects,
+            use_l1_loss=self.iou_use_l1_loss,
+        )
+        
+        # Object score loss
         if not self.pred_obj_scores:
             loss_class = torch.tensor(
-                0.0, dtype=loss_multimask.dtype, device=loss_multimask.device
+                0.0, dtype=loss_mask.dtype, device=loss_mask.device
             )
             target_obj = torch.ones(
-                loss_multimask.shape[0],
+                loss_mask.shape[0],
                 1,
-                dtype=loss_multimask.dtype,
-                device=loss_multimask.device,
+                dtype=loss_mask.dtype,
+                device=loss_mask.device,
             )
         else:
-            target_obj = torch.any((target_masks[:, 0] > 0).flatten(1), dim=-1)[
-                ..., None
-            ].float()
+            # For multiple objects, check presence of each object
+            target_obj = torch.any((target_masks > 0).flatten(2), dim=-1).float()
             loss_class = sigmoid_focal_loss(
                 object_score_logits,
                 target_obj,
@@ -387,90 +467,39 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 gamma=self.focal_gamma_obj_score,
             )
 
-        loss_multiiou = iou_loss(
-            src_masks,
-            target_masks,
-            ious,
-            num_objects,
-            loss_on_multimask=True,
-            use_l1_loss=self.iou_use_l1_loss,
-        )
-        assert loss_multimask.dim() == 2
-        assert loss_multidice.dim() == 2
-        assert loss_multiiou.dim() == 2
-        if loss_multimask.size(1) > 1:
-            # take the mask indices with the smallest focal + dice loss for back propagation
-            loss_combo = (
-                loss_multimask * self.weight_dict["loss_mask"]
-                + loss_multidice * self.weight_dict["loss_dice"]
-            )
-            best_loss_inds = torch.argmin(loss_combo, dim=-1)
-            batch_inds = torch.arange(loss_combo.size(0), device=loss_combo.device)
-            loss_mask = loss_multimask[batch_inds, best_loss_inds].unsqueeze(1)
-            loss_dice = loss_multidice[batch_inds, best_loss_inds].unsqueeze(1)
-            # calculate the iou prediction and slot losses only in the index
-            # with the minimum loss for each mask (to be consistent w/ SAM)
-            if self.supervise_all_iou:
-                loss_iou = loss_multiiou.mean(dim=-1).unsqueeze(1)
-            else:
-                loss_iou = loss_multiiou[batch_inds, best_loss_inds].unsqueeze(1)
-        else:
-            loss_mask = loss_multimask
-            loss_dice = loss_multidice
-            loss_iou = loss_multiiou
-
         # backprop focal, dice and iou loss only if obj present
         loss_mask = loss_mask * target_obj
         loss_dice = loss_dice * target_obj
         loss_iou = loss_iou * target_obj
 
-        # new: instance ID loss
-        
-        # Instance id embeddings, discriminative emb loss. Assuming pred_instance_ids is embeddings.
-        loss_instance = self.instance_id_loss_fixed(pred_instance_ids, target_instance_ids, num_objects, delta_v=0.8, delta_d=0.5, reg_weight=0.2)
-        if torch.isnan(loss_instance).any():
-            print("NaN value as loss!")
-            loss_instance = torch.mean(pred_embeddings) * 0.0 + 0.1
-        
-        # L1
-        #loss_instance = self.instance_id_loss_L1(pred_instance_ids, target_instance_ids, num_objects)
-        #print("target instance ids: ", target_instance_ids)
-        
-        #self.debug_instance_map(pred_instance_ids.cpu().detach())
-        #self.debug_instance_map(target_instance_ids.cpu())
-        
         # sum over batch dimension (note that the losses are already divided by num_objects)
         losses["loss_mask"] += loss_mask.sum()
         losses["loss_dice"] += loss_dice.sum()
         losses["loss_iou"] += loss_iou.sum()
         losses["loss_class"] += loss_class
-        losses["loss_instance"] += loss_instance.mean()
-        #print("losses instance: ", losses["loss_instance"])
 
-    def debug_instance_map(self, instance_map_tensor):
-        # Move to CPU and convert to numpy
-        instance_map = instance_map_tensor[0].numpy()  # Take first batch item
-        
-        # Print shape and statistics
-        print(f"Instance map shape: {instance_map.shape}")
-        print(f"Min value: {np.min(instance_map)}, Max value: {np.max(instance_map)}")
-        
-        # Print unique values and their counts
-        unique_ids, counts = np.unique(instance_map, return_counts=True)
-        for id_val, count in zip(unique_ids, counts):
-            if id_val > 0:  # Only show non-background IDs
-                print(f"Instance ID {id_val}: {count} pixels")
-        
-        # Print a small sample of the map (center region)
-        b, h, w = instance_map.shape
-        center_y, center_x = h // 2, w // 2
-        sample_size = 10
-        sample = instance_map[
-            center_y - sample_size // 2:center_y + sample_size // 2,
-            center_x - sample_size // 2:center_x + sample_size // 2
-        ]
-        print(f"Center {sample_size}x{sample_size} sample of instance map:")
-        print(sample)
+        # Instance ID loss - only if enabled
+        if self.use_instance_loss and pred_instance_ids is not None:
+            # Convert target_instance_ids to match pred_instance_ids shape if needed
+            if target_instance_ids.dim() == 3:  # [B, H, W]
+                target_instance_ids = target_instance_ids.unsqueeze(1)  # [B, 1, H, W]
+            
+            # Handle batch size mismatch for instance IDs
+            if target_instance_ids.shape[0] != pred_instance_ids.shape[0]:
+                target_instance_ids = target_instance_ids.expand(pred_instance_ids.shape[0], -1, -1, -1)
+                
+            # Compute instance ID loss
+            loss_instance = self.instance_id_loss_fixed(
+                pred_instance_ids, target_instance_ids, num_objects, 
+                delta_v=0.8, delta_d=0.5, reg_weight=0.2
+            )
+            
+            # Handle NaN values
+            if torch.isnan(loss_instance).any():
+                print("NaN value detected in instance loss!")
+                loss_instance = torch.mean(pred_instance_ids) * 0.0 + 0.1
+                
+            losses["loss_instance"] += loss_instance.mean()
 
     def instance_id_loss_fixed(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.1, delta_d=2.0, reg_weight=0.01):
         """
@@ -684,414 +713,6 @@ class MultiStepMultiMasksAndIous(nn.Module):
         # Return normalized loss
         return loss.expand(batch_size) / num_objects
 
-    def instance_id_loss(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.1, delta_d=2.0, reg_weight=0.01):
-        """
-        Direct-access implementation of discriminative loss with guaranteed non-zero values.
-        
-        Args:
-            pred_embeddings: Embedding vectors of shape (B, E, H, W) where E is embedding dimension
-            target_instance_ids: Ground truth instance ID map of shape (B, 1, H, W) or (B, H, W)
-            num_objects: Number of objects (for normalization)
-            delta_v: Variance margin for pull loss
-            delta_d: Distance margin for push loss
-            reg_weight: Regularization weight (increased to 0.01)
-        """
-        batch_size = pred_embeddings.size(0)
-        #print("Batch size", pred_embeddings.shape)
-        print("An embedding at pixel 100,100: ", pred_embeddings[0, 5:20, 100, 100])
-        print("An embedding at pixel 101,101: ", pred_embeddings[0, 5:20, 101, 101])
-        embedding_dim = pred_embeddings.size(1)
-        device = pred_embeddings.device
-        
-        # Ensure target has the right shape
-        if target_instance_ids.dim() == 4:
-            target_instance_ids = target_instance_ids.squeeze(1)
-        
-        # Return value for empty batch
-        if batch_size == 0 or num_objects == 0:
-            return torch.ones(1, device=device, requires_grad=True) * 0.1
-
-        # Initialize loss components directly within computational graph
-        pull_losses = []
-        push_losses = []
-        reg_losses = []
-        
-        total_instances = 0
-        
-        # Process each sample in batch
-        for b in range(batch_size):
-            # Extract this batch item
-            emb = pred_embeddings[b]  # (E, H, W)
-            ids = target_instance_ids[b]  # (H, W)
-            
-            # Get unique instance IDs (excluding background)
-            instance_ids = torch.unique(ids)
-            instance_ids = instance_ids[instance_ids > 0]
-            
-            if len(instance_ids) == 0:
-                # Create dummy loss for samples with no instances
-                dummy_loss = torch.sum(emb) * 0.0 + 0.1
-                pull_losses.append(dummy_loss)
-                continue
-            
-            # Collect centers and features
-            centers = []
-            pixel_embeddings = []
-            
-            for inst_id in instance_ids:
-                # Get mask for this instance
-                mask = (ids == inst_id)
-                
-                # Skip tiny instances
-                if mask.sum() < 10:
-                    continue
-                    
-                # Extract coordinates where mask is True
-                y_indices, x_indices = torch.where(mask)
-                
-                # Limit to 1000 random pixels for very large instances
-                if len(y_indices) > 1000:
-                    idx = torch.randperm(len(y_indices))[:1000]
-                    y_indices = y_indices[idx]
-                    x_indices = x_indices[idx]
-                
-                # Directly extract embeddings for these coordinates
-                # Important: we need to keep gradients flowing here
-                inst_pixel_embeddings = []
-                for i in range(len(y_indices)):
-                    y, x = y_indices[i], x_indices[i]
-                    pixel_emb = emb[:, y, x]  # Extract embedding vector for this pixel
-                    inst_pixel_embeddings.append(pixel_emb)
-                
-                # Skip if no embeddings extracted
-                if not inst_pixel_embeddings:
-                    continue
-                    
-                # Stack into a tensor
-                inst_pixel_embeddings = torch.stack(inst_pixel_embeddings)  # (N_pixels, E)
-                
-                # Calculate center embedding (mean)
-                center = torch.mean(inst_pixel_embeddings, dim=0)  # (E)
-                
-                centers.append(center)
-                pixel_embeddings.append(inst_pixel_embeddings)
-            
-            # Skip if no valid centers found
-            if not centers:
-                # Create dummy loss
-                dummy_loss = torch.sum(emb) * 0.0 + 0.1
-                pull_losses.append(dummy_loss)
-                continue
-                
-            total_instances += len(centers)
-            centers_tensor = torch.stack(centers)  # (N_instances, E)
-            
-            # 1. Pull loss calculation: Force pixels to cluster around their centers
-            batch_pull_loss = 0
-            for i, (center, pixels) in enumerate(zip(centers, pixel_embeddings)):
-                # For each instance:
-                # Calculate distance from each pixel to center
-                dists = torch.sqrt(torch.sum((pixels - center.unsqueeze(0))**2, dim=1) + 1e-6)
-                
-                # Apply minimum pull (even for pixels within delta_v)
-                min_pull = torch.mean(dists**2) * 0.1
-                
-                # Apply hinge for pixels outside delta_v
-                hinge_dists = torch.clamp(dists - delta_v, min=0.0)**2
-                hinge_pull = torch.mean(hinge_dists)
-                
-                # Combine both
-                instance_pull = min_pull + hinge_pull
-                
-                # Add directly to computational graph
-                batch_pull_loss = batch_pull_loss + instance_pull
-            
-            # Normalize pull loss
-            if len(centers) > 0:
-                batch_pull_loss = batch_pull_loss / len(centers)
-                # Add small constant to ensure non-zero
-                batch_pull_loss = batch_pull_loss + 1e-6
-                pull_losses.append(batch_pull_loss)
-            
-            # 2. Push loss calculation: Force centers apart from each other
-            if len(centers) > 1:
-                batch_push_loss = 0
-                pair_count = 0
-                
-                for i in range(len(centers)):
-                    for j in range(i+1, len(centers)):
-                        # Calculate distance between centers
-                        dist = torch.sqrt(torch.sum((centers[i] - centers[j])**2) + 1e-6)
-                        
-                        # Apply hinge
-                        margin = 2.0 * delta_d
-                        hinge_dist = torch.clamp(margin - dist, min=0.0)**2
-                        
-                        # Add directly to computational graph
-                        batch_push_loss = batch_push_loss + hinge_dist
-                        pair_count += 1
-                
-                # Normalize by pair count
-                if pair_count > 0:
-                    batch_push_loss = batch_push_loss / pair_count
-                    push_losses.append(batch_push_loss)
-            
-            # 3. Regularization term: Keep centers at a reasonable magnitude
-            # Calculate L2 norm of the centers
-            center_norms = torch.norm(centers_tensor, p=2, dim=1)
-            
-            # Target norm of 1.0
-            target_norm = torch.ones_like(center_norms)
-            reg_loss = torch.mean((center_norms - target_norm)**2)
-            
-            # Add small constant to ensure non-zero
-            reg_loss = reg_loss + 1e-4
-            reg_losses.append(reg_loss)
-        
-        # Combine losses with appropriate weights
-        # If we have pull losses, combine them
-        if pull_losses:
-            pull_loss = torch.mean(torch.stack(pull_losses))
-        else:
-            # Create dummy pull loss (detached from graph)
-            pull_loss = torch.tensor(0.001, device=device)
-        
-        # If we have push losses, combine them
-        if push_losses:
-            push_loss = torch.mean(torch.stack(push_losses))
-        else:
-            # Create dummy push loss (detached from graph)
-            push_loss = torch.tensor(0.0, device=device)
-        
-        # If we have reg losses, combine them
-        if reg_losses:
-            reg_loss = torch.mean(torch.stack(reg_losses))
-        else:
-            # Create dummy reg loss (detached from graph)
-            reg_loss = torch.tensor(0.001, device=device)
-        
-        # Calculate weights
-        pull_weight = 1.0
-        push_weight = 0.05 / math.sqrt(embedding_dim)
-        
-        # This is key: we need to directly combine these tensors
-        # to ensure gradient flow through the combined loss
-        loss = pull_weight * pull_loss + push_weight * push_loss + reg_weight * reg_loss
-        
-        if torch.isnan(emb).any():
-            print("NaN detected in embeddings!")
-        if torch.isnan(centers_tensor).any():
-            print("NaN detected in centers tensor!")
-        if torch.isnan(dists).any():
-            print("NaN detected in distance calculation!")
-
-        # Debug output
-        if self.training and is_dist_avail_and_initialized() and torch.distributed.get_rank() == 0:
-            print(f"Embed dim: {embedding_dim}, "
-                f"Instances: {total_instances}, "
-                f"Pull: {pull_loss.item():.6f} (w={pull_weight:.1f}), "
-                f"Push: {push_loss.item():.6f} (w={push_weight:.6f}), "
-                f"Reg: {reg_loss.item():.6f} (w={reg_weight:.2f}), "
-                f"Total: {loss.item():.6f}")
-        
-        # We need to ensure the loss has the proper gradient.
-        # Instead of using torch.full, we'll return the scalar loss
-        # expanded to batch size, directly preserving gradients.
-        return loss.expand(batch_size) / num_objects
-    
-    def instance_id_loss_first(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.2, delta_d=1.5, reg_weight=0.001):
-        """
-        Discriminative loss for instance segmentation with embeddings.
-        
-        Args:
-            pred_embeddings: Embedding vectors of shape (B, E, H, W) where E is embedding dimension
-            target_instance_ids: Ground truth instance ID map of shape (B, 1, H, W) or (B, H, W)
-            num_objects: Number of objects (for normalization)
-            delta_v: Variance margin - pull loss margin
-            delta_d: Distance margin - push loss margin
-        
-        Returns:
-            Instance embedding loss (discriminative loss)
-        """
-        batch_size = pred_embeddings.size(0)
-        #print("Input pred_embeddings shape:", pred_embeddings.shape)
-        
-        avg_instances = sum(len(torch.unique(target_instance_ids[i])[torch.unique(target_instance_ids[i]) > 0]) 
-                    for i in range(batch_size)) / batch_size
-        
-        # Ensure target has the right shape - we need (B, H, W)
-        if target_instance_ids.dim() == 4:  # (B, 1, H, W)
-            target_instance_ids = target_instance_ids.squeeze(1)
-        
-        # Move embeddings to shape expected by discriminative loss (B, H, W, E)
-        embeddings = pred_embeddings.permute(0, 2, 3, 1)  # (B, E, H, W) -> (B, H, W, E)
-        
-        # Get embedding dimension
-        embedding_dim = embeddings.size(3)
-        #print("Embeddings shape: ", embeddings.shape)
-        
-        # Initialize loss components
-        pull_losses = []
-        push_losses = []
-        reg_losses = []
-        
-        # Process each sample in the batch
-        for b in range(batch_size):
-            sample_embeddings = embeddings[b]  # (H, W, E)
-            sample_targets = target_instance_ids[b]  # (H, W)
-            
-            # Get unique instance IDs (excluding background)
-            instance_ids = torch.unique(sample_targets)
-            instance_ids = instance_ids[instance_ids > 0]
-            
-            if len(instance_ids) == 0:
-                # No instances in this sample, skip
-                print(f"WARNING: No instances found in batch {b}")
-                continue
-            
-            # Print debug info about instances
-            #print(f"Batch {b}: Found {len(instance_ids)} instances")
-            
-            # Calculate mean embeddings for each instance
-            means = []
-            instance_masks = []
-            
-            for instance_id in instance_ids:
-                mask = (sample_targets == instance_id)
-                if not torch.any(mask):
-                    continue
-                    
-                # Get embeddings for this instance
-                instance_embeddings = sample_embeddings[mask.nonzero(as_tuple=True)]  # (N, E) where N is number of pixels
-                
-                # Skip if too few pixels (avoid numerical issues)
-                if instance_embeddings.size(0) < 10:
-                    continue
-                
-                # Calculate mean embedding (centroid)
-                mean_embedding = torch.mean(instance_embeddings, dim=0)  # (E)
-                
-                # L2 normalize the mean embedding to constrain it to unit hypersphere
-                mean_embedding = F.normalize(mean_embedding, p=2, dim=0)
-                
-                means.append(mean_embedding)
-                instance_masks.append(mask.sum())
-            
-            if len(means) == 0:
-                continue
-                
-            # Convert to tensor
-            means = torch.stack(means, dim=0)  # (I, E) where I is number of instances
-            
-            # 1. Variance (pull) term - pull embeddings towards their cluster center
-            pull_loss = 0
-            for i, instance_id in enumerate(instance_ids[:len(means)]):
-                mask = instance_masks[i]
-                if not torch.any(mask):
-                    continue
-                    
-                instance_embeddings = sample_embeddings[mask.nonzero(as_tuple=True)]  # (N, E)
-            
-                # L2 normalize instance embeddings
-                instance_embeddings = F.normalize(instance_embeddings, p=2, dim=1)
-                
-                # Calculate distances from pixels to cluster center
-                mean = means[i].unsqueeze(0)  # (1, E)
-                distances = torch.sqrt(torch.sum((instance_embeddings - mean) ** 2, dim=1))  # (N)
-                
-                
-                # Apply hinge - only penalize distances beyond delta_v
-                hinge_distances = torch.clamp(distances - delta_v, min=0.0)
-                pull_loss += torch.mean(hinge_distances ** 2)
-            
-             # Average pull loss over all instances
-            if len(means) > 0:
-                pull_loss = pull_loss / len(means)
-                pull_losses.append(pull_loss)
-            
-            # 2. Distance (push) term - push cluster centers apart
-            if len(means) > 1:
-                push_loss = 0
-                n_pairs = 0
-                
-                # Calculate pairwise distances between cluster centers
-                for i in range(len(means)):
-                    for j in range(i+1, len(means)):
-                        # Calculate cosine similarity between centers
-                        similarity = torch.sum(means[i] * means[j])
-                        
-                        # Convert to distance (1 - similarity) and scale
-                        distance = 1.0 - similarity
-                        
-                        # Apply hinge with 2*delta_d margin
-                        margin = 2.0 * delta_d
-                        hinge_distance = torch.clamp(margin - distance, min=0.0)
-                        
-                        # Square the hinge distance and add to loss
-                        push_loss += hinge_distance ** 2
-                        n_pairs += 1
-                
-                # Normalize push loss by number of pairs and scale down
-                if n_pairs > 0:
-                    # Apply a scaling factor that decreases with more instances
-                    # This prevents push loss from growing too large with many instances
-                    scale_factor = 1.0 / (1.0 + math.log(max(1, len(means) - 1)))
-                    push_loss = push_loss * scale_factor / n_pairs
-                    push_losses.append(push_loss)
-            
-            # 3. Regularization term - keep embeddings bounded
-            if len(means) > 0:
-                # L2 regularization on centers (should be small since we normalize)
-                reg_loss = torch.mean(torch.norm(means, p=2, dim=1))
-                reg_losses.append(reg_loss)
-        
-        # Return early with zero loss if no valid losses found
-        if not pull_losses and not push_losses:
-            return torch.zeros(batch_size, device=pred_embeddings.device, requires_grad=True)
-        
-        # Combine batch losses with appropriate weights
-        batch_losses = []
-        
-        # Calculate appropriate weight for push loss based on embedding dimension
-        # Higher embedding dimensions need smaller push weights
-        embed_scale = 1.0 / math.sqrt(embedding_dim)
-        push_weight = 0.1 * embed_scale  # Reduce push weight significantly
-        
-        for b in range(batch_size):
-            # Get losses for this batch item (or zero if none)
-            batch_pull = pull_losses[b] if b < len(pull_losses) else torch.tensor(0.0, device=pred_embeddings.device)
-            batch_push = push_losses[b] if b < len(push_losses) else torch.tensor(0.0, device=pred_embeddings.device)
-            batch_reg = reg_losses[b] if b < len(reg_losses) else torch.tensor(0.0, device=pred_embeddings.device)
-            
-            # Combine losses with appropriate weights
-            batch_loss = batch_pull + push_weight * batch_push + reg_weight * batch_reg
-            batch_losses.append(batch_loss)
-        
-        # Stack batch losses and normalize by num_objects
-        final_loss = torch.stack(batch_losses) if batch_losses else torch.zeros(batch_size, device=pred_embeddings.device)
-        
-        if torch.isnan(emb).any():
-            print("NaN detected in embeddings!")
-        if torch.isnan(centers_tensor).any():
-            print("NaN detected in centers tensor!")
-        if torch.isnan(dists).any():
-            print("NaN detected in distance calculation!")
-
-
-        # Print debug info
-        if pull_losses and push_losses and self.training and is_dist_avail_and_initialized() and torch.distributed.get_rank() == 0:
-            pull_loss_mean = torch.mean(torch.stack(pull_losses))
-            push_loss_mean = torch.mean(torch.stack(push_losses))
-            reg_loss_mean = torch.mean(torch.stack(reg_losses)) if reg_losses else torch.tensor(0.0)
-            
-            print(f"Embed dim: {embedding_dim}, "
-                f"Avg instances: {avg_instances:.1f}, "
-                f"Pull loss: {pull_loss_mean.item():.4f}, "
-                f"Push loss: {push_loss_mean.item():.4f} (weight: {push_weight:.6f}), "
-                f"Reg loss: {reg_loss_mean.item():.4f}")
-        
-        return final_loss / num_objects
-
     def instance_id_loss_stem_seg(self, pred_embeddings, target_instance_ids, num_objects,
                          pred_bandwidth=None, pred_offsets=None,
                          delta_v=0.5, delta_d=2, reg_weight=0.1,
@@ -1221,6 +842,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
         return reduced_loss
 
+# DEBUG ----------------------------------------------------------------------------------------------
 import torch
 import numpy as np
 import matplotlib.pyplot as plt

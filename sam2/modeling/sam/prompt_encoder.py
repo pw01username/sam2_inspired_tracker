@@ -169,16 +169,16 @@ class PromptEncoder(nn.Module):
         for i in range(n):
             mask_slice = masks[:, i:i+1, :, :]  # (batch_size, 1, H, W)
             mask_embedding = self.mask_downscaling(mask_slice)  # (batch_size, embed_dim, h', w')
-            mask_embeddings.append(mask_embedding)
-        
-        # Add instance ID embeddings if provided
-        if instance_ids is not None:
-            for i in range(n):
+            
+            # Add instance ID embeddings if provided
+            if instance_ids is not None:
                 instance_embedding = self.instance_id_embed(instance_ids[:, i])  # (batch_size, embed_dim)
                 # Reshape for broadcasting addition
                 instance_embedding = instance_embedding.unsqueeze(-1).unsqueeze(-1)  # (batch_size, embed_dim, 1, 1)
                 # Add instance embedding to mask embedding
-                mask_embeddings[i] = mask_embeddings[i] + instance_embedding
+                mask_embedding = mask_embedding + instance_embedding
+            
+            mask_embeddings.append(mask_embedding)
         
         return mask_embeddings
 
@@ -221,7 +221,7 @@ class PromptEncoder(nn.Module):
             return mask_embeddings[0]
         
         # Average the embeddings as initial fusion
-        fused_embedding = sum(mask_embeddings) / len(mask_embeddings)
+        #fused_embedding = sum(mask_embeddings) / len(mask_embeddings)
         
         # Reshape for attention: (batch_size, h*w, embed_dim)
         b, c, h, w = mask_embeddings[0].shape
@@ -292,18 +292,20 @@ class PromptEncoder(nn.Module):
 
         mask_embeddings = None
         if masks is not None:
-            use_single_obj_mask_input = True
-            if use_single_obj_mask_input:
+            use_original_mask_input = False
+            if use_original_mask_input:
                 dense_embeddings = self._embed_mask(masks)
             else:
                 # Handle multiple masks with instance IDs
                 if masks.dim() == 3:
                     masks = masks.unsqueeze(1)  # Add instance dimension if not present
                 
+                instance_ids = None
                 if instance_ids is None and masks.shape[1] > 1:
                     # If instance IDs not provided but multiple masks present, create sequential IDs
-                    instance_ids = torch.arange(masks.shape[1], device=masks.device).unsqueeze(0).expand(masks.shape[0], -1)
-                
+                    #instance_ids = torch.arange(masks.shape[1], device=masks.device).unsqueeze(0).expand(masks.shape[0], -1)
+                    pass
+
                 # Embed each mask
                 mask_embeddings = self._embed_masks(masks, instance_ids)
                 

@@ -152,10 +152,8 @@ class SAM2Train(SAM2Base):
         a custom `start_frame_idx` to the end of the video (for evaluation purposes).
         """
         
-        border_emphasis_mask_GT_per_obj = False  # Control for per-object masks
-        border_emphasis_combined_with_instance_borders = True  # Control for adding instance borders to combined masks
+        # Border parameters
         border_width = 1  # Width of the border in pixels
-        
         
         # Get the individual object masks (instead of combined masks)
         # The masks tensor is of shape [T, O, H, W] where O is the number of objects across all frames
@@ -173,117 +171,106 @@ class SAM2Train(SAM2Base):
             # This is already the case by construction, so we just need all objects indices for frame t
             frame_to_objects[t] = list(range(input.obj_to_frame_idx[t].shape[0]))
         
-        # Store individual object masks per frame
+        # Store both regular and bordered individual object masks per frame
         gt_masks_per_frame_per_obj = {}
+        bordered_masks_per_frame_per_obj = {}
+        
         for t, obj_indices in frame_to_objects.items():
             gt_masks_per_frame_per_obj[t] = {}
+            bordered_masks_per_frame_per_obj[t] = {}
+            
             for obj_idx in obj_indices:
                 # Get the mask for this object in this frame
                 obj_mask = input.masks[t, obj_idx].unsqueeze(0).unsqueeze(0)  # Add batch and channel dims [1, 1, H, W]
-                if border_emphasis_mask_GT_per_obj:
-                    obj_mask_border = self.create_border_emphasized_masks(obj_mask, border_width=border_width)
-                    gt_masks_per_frame_per_obj[t][obj_idx] = obj_mask_border
-                else:
-                    gt_masks_per_frame_per_obj[t][obj_idx] = obj_mask
+                
+                # Save the regular mask
+                gt_masks_per_frame_per_obj[t][obj_idx] = obj_mask
+                
+                # Create and save the bordered mask
+                obj_mask_border = self.create_border_emphasized_masks(obj_mask, border_width=border_width)
+                bordered_masks_per_frame_per_obj[t][obj_idx] = obj_mask_border
         
-        # Load the ground-truth masks on all frames (so that we can later
-        # sample correction points from them)
-        # gt_masks_per_frame = {
-        #     stage_id: targets.segments.unsqueeze(1)  # [B, 1, H_im, W_im]
-        #     for stage_id, targets in enumerate(input.find_targets)
-        # }
-        # Original:
-        # gt_masks_per_frame = {
-        #     stage_id: masks.unsqueeze(1)  # [B, 1, H_im, W_im]
-        #     for stage_id, masks in enumerate(input.masks)
-        # }
-        
-        # Get the ground-truth masks on all frames (so that we can later
-        # sample correction points from them)
+        # Get the ground-truth masks for combined views (with and without borders)
         gt_masks_per_frame = {}
-    
+        bordered_masks_per_frame = {}
+
         for t in range(num_frames):
-            # Replace the instance border creation code with this approach
-            if border_emphasis_combined_with_instance_borders:
-                # Start with an empty mask
-                obj_indices = frame_to_objects[t]
-                if not obj_indices:
-                    gt_masks_per_frame[t] = torch.zeros_like(input.combined_masks[t]).unsqueeze(1)
-                    continue
-                    
-                # Get shape from the first object mask
-                first_obj_mask = input.masks[t, obj_indices[0]]
-                h, w = first_obj_mask.shape
-                combined_mask = torch.zeros((1, 1, h, w), device=first_obj_mask.device)
+            obj_indices = frame_to_objects[t]
+            
+            # Handle empty frames
+            if not obj_indices:
+                gt_masks_per_frame[t] = torch.zeros_like(input.combined_masks[t]).unsqueeze(1)
+                bordered_masks_per_frame[t] = torch.zeros_like(input.combined_masks[t]).unsqueeze(1)
+                continue
                 
-                # First create a mask where interior pixels have values equal to instance IDs
-                # This ensures non-overlapping values for each instance
-                instance_id_mask = torch.zeros((h, w), device=first_obj_mask.device)
-                for i, obj_idx in enumerate(obj_indices):
-                    # Use i+1 as the instance ID (keeping 0 as background)
-                    instance_id = i + 1
-                    # Fill the instance mask with the instance ID
-                    instance_mask = input.masks[t, obj_idx]
-                    instance_id_mask = torch.where(instance_mask > 0, 
-                                                torch.tensor(instance_id, device=instance_mask.device),
-                                                instance_id_mask)
-                
-                # Now detect borders by checking if any adjacent pixel has a different non-zero value
-                border_mask = torch.zeros((h, w), device=first_obj_mask.device)
-                
-                # Check each pixel's neighborhood for different instance IDs
-                for i in range(1, h-1):
-                    for j in range(1, w-1):
-                        if instance_id_mask[i, j] > 0:  # If this is part of an instance
-                            # Check 8-connected neighborhood
-                            center_id = instance_id_mask[i, j]
-                            
-                            # Check if any neighbor has a different non-zero ID or is background
-                            is_border = False
-                            
-                            # Check if any neighbor is background (0)
-                            if (instance_id_mask[i-1:i+2, j-1:j+2] == 0).any():
+            # Get shape from the first object mask
+            first_obj_mask = input.masks[t, obj_indices[0]]
+            h, w = first_obj_mask.shape
+            
+            # Save the regular combined mask
+            gt_masks_per_frame[t] = input.combined_masks[t].unsqueeze(1)
+            
+            # Create the bordered combined mask
+            # First create a mask where interior pixels have values equal to instance IDs
+            instance_id_mask = torch.zeros((h, w), device=first_obj_mask.device)
+            for i, obj_idx in enumerate(obj_indices):
+                # Use i+1 as the instance ID (keeping 0 as background)
+                instance_id = i + 1
+                # Fill the instance mask with the instance ID
+                instance_mask = input.masks[t, obj_idx]
+                instance_id_mask = torch.where(instance_mask > 0, 
+                                            torch.tensor(instance_id, device=instance_mask.device),
+                                            instance_id_mask)
+            
+            # Now detect borders by checking if any adjacent pixel has a different non-zero value
+            border_mask = torch.zeros((h, w), device=first_obj_mask.device)
+            
+            # Check each pixel's neighborhood for different instance IDs
+            for i in range(1, h-1):
+                for j in range(1, w-1):
+                    if instance_id_mask[i, j] > 0:  # If this is part of an instance
+                        # Check 8-connected neighborhood
+                        center_id = instance_id_mask[i, j]
+                        
+                        # Check if any neighbor has a different non-zero ID or is background
+                        is_border = False
+                        
+                        # Check if any neighbor is background (0)
+                        if (instance_id_mask[i-1:i+2, j-1:j+2] == 0).any():
+                            is_border = True
+                        # Check if any neighbor has a different instance ID
+                        else:
+                            neighbors = instance_id_mask[i-1:i+2, j-1:j+2]
+                            if ((neighbors != center_id) & (neighbors > 0)).any():
                                 is_border = True
-                            # Check if any neighbor has a different instance ID
-                            else:
-                                neighbors = instance_id_mask[i-1:i+2, j-1:j+2]
-                                if ((neighbors != center_id) & (neighbors > 0)).any():
-                                    is_border = True
-                                    
-                            if is_border:
-                                border_mask[i, j] = 1.0
-                
-                # Create combined mask with:
-                # - Borders = 1.0
-                # - Interior = 0.5
-                # - Background = 0.0
-                combined_mask[0, 0] = torch.where(border_mask > 0,
-                                                torch.tensor(1.0, device=border_mask.device),
-                                                torch.where(instance_id_mask > 0,
-                                                        torch.tensor(0.5, device=instance_id_mask.device),
-                                                        torch.tensor(0.0, device=instance_id_mask.device)))
-                
-                gt_masks_per_frame[t] = combined_mask
-                
-                # Optionally add this line to visualize the result
-                self.visualize_masks(combined_mask, combined_mask)
-            else:
-                # Just use the regular combined mask without instance borders
-                gt_masks_per_frame[t] = input.combined_masks[t].unsqueeze(1)
+                                
+                        if is_border:
+                            border_mask[i, j] = 1.0
+            
+            # Create combined mask with:
+            # - Borders = 1.0
+            # - Interior = 0.5
+            # - Background = 0.0
+            combined_border_mask = torch.zeros((1, 1, h, w), device=first_obj_mask.device)
+            combined_border_mask[0, 0] = torch.where(border_mask > 0,
+                                            torch.tensor(1.0, device=border_mask.device),
+                                            torch.where(instance_id_mask > 0,
+                                                    torch.tensor(0.5, device=instance_id_mask.device),
+                                                    torch.tensor(0.0, device=instance_id_mask.device)))
+            
+            bordered_masks_per_frame[t] = combined_border_mask
+            
+            # Optionally add this line to visualize the result
+            self.visualize_masks(combined_border_mask, combined_border_mask)
         
-        # gt_masks_per_frame = input.masks.unsqueeze(2) # [T,B,1,H_im,W_im] keep everything in tensor form
-        
-        # this will store GT mask for every frame, making model know GT and predict perfect every time due to overfitting.
-        #backbone_out["gt_masks_per_frame"] = gt_masks_per_frame
-        #backbone_out["gt_masks_per_frame_per_obj"] = gt_masks_per_frame_per_obj
-        
+        # Store everything in backbone_out
         backbone_out["frame_to_objects"] = frame_to_objects
         backbone_out["num_frames"] = num_frames
 
         # Randomly decide whether to use point inputs or mask inputs
         if self.training:
-            prob_to_use_pt_input = 0# self.prob_to_use_pt_input_for_train
-            prob_to_use_box_input = 0 #self.prob_to_use_box_input_for_train
+            prob_to_use_pt_input = 0  # self.prob_to_use_pt_input_for_train
+            prob_to_use_box_input = 0  # self.prob_to_use_box_input_for_train
             num_frames_to_correct = self.num_frames_to_correct_for_train
             rand_frames_to_correct = self.rand_frames_to_correct_for_train
             num_init_cond_frames = self.num_init_cond_frames_for_train
@@ -298,7 +285,7 @@ class SAM2Train(SAM2Base):
         if num_frames == 1:
             # here we handle a special case for mixing video + SAM on image training,
             # where we force using point input for the SAM task on static images
-            prob_to_use_pt_input = 0 #1.0
+            prob_to_use_pt_input = 0  # 1.0
             num_frames_to_correct = 1
             num_init_cond_frames = 1
         assert num_init_cond_frames >= 1
@@ -336,26 +323,34 @@ class SAM2Train(SAM2Base):
             t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
         ]
         
+        # Save both regular and bordered masks for the initial frames
         backbone_out["gt_masks_per_frame"] = {t: gt_masks_per_frame[t] for t in init_cond_frames}
+        backbone_out["bordered_masks_per_frame"] = {t: bordered_masks_per_frame[t] for t in init_cond_frames}
         backbone_out["gt_masks_per_frame_per_obj"] = {t: gt_masks_per_frame_per_obj[t] for t in init_cond_frames}
+        backbone_out["bordered_masks_per_frame_per_obj"] = {t: bordered_masks_per_frame_per_obj[t] for t in init_cond_frames}
         
-        # Prepare mask or point inputs on initial conditioning frames
-        #backbone_out["mask_inputs_per_frame"] = {}  # {frame_idx: <input_masks>}
-        #backbone_out["point_inputs_per_frame"] = {}  # {frame_idx: <input_points>}
         
         # Prepare mask or point inputs for each object in initial conditioning frames
         backbone_out["mask_inputs_per_frame_per_obj"] = {}  # {frame_idx: {obj_idx: mask}}
+        backbone_out["bordered_mask_inputs_per_frame"] = {}  # {frame_idx: {obj_idx: bordered_mask}}
         backbone_out["point_inputs_per_frame_per_obj"] = {}  # {frame_idx: {obj_idx: points}}
         
         for t in init_cond_frames:
             backbone_out["mask_inputs_per_frame_per_obj"][t] = {}
+            backbone_out["bordered_mask_inputs_per_frame"][t] = {}
             backbone_out["point_inputs_per_frame_per_obj"][t] = {}
         
+            bordered_mask = bordered_masks_per_frame[t]
+            backbone_out["bordered_mask_inputs_per_frame"][t] = bordered_mask
+
             # Process each object in this frame
             for obj_idx in frame_to_objects[t]:
+                # Get both regular and bordered masks
                 gt_mask = gt_masks_per_frame_per_obj[t][obj_idx]
                 
+                
                 if not use_pt_input:
+                    # Save both regular and bordered masks as inputs
                     backbone_out["mask_inputs_per_frame_per_obj"][t][obj_idx] = gt_mask
                 else:
                     # During training # P(box) = prob_to_use_pt_input * prob_to_use_box_input
@@ -417,6 +412,28 @@ class SAM2Train(SAM2Base):
         import matplotlib.pyplot as plt
         from matplotlib.colors import LinearSegmentedColormap
         
+        # Early check - if inputs are None, skip visualization
+        if masks is None or border_enhanced_masks is None:
+            print("Skipping visualization: One or both inputs are None")
+            return
+
+        # If masks is a dict, take the first element
+        if isinstance(masks, dict):
+            print("Masks is a dict, taking first element")
+            if len(masks) > 0:
+                masks = next(iter(masks.values()))
+            else:
+                print("Empty masks dict, skipping visualization")
+                return
+                
+        # If border_enhanced_masks is a dict, take the first element
+        if isinstance(border_enhanced_masks, dict):
+            print("Border_enhanced_masks is a dict, taking first element")
+            if len(border_enhanced_masks) > 0:
+                border_enhanced_masks = next(iter(border_enhanced_masks.values()))
+            else:
+                print("Empty border_enhanced_masks dict, skipping visualization")
+                return
         
         # Convert to numpy for visualization
         if isinstance(masks, torch.Tensor):
@@ -428,7 +445,8 @@ class SAM2Train(SAM2Base):
         if len(masks.shape) < 2 or len(border_enhanced_masks.shape) < 2:
             print(f"Skipping visualization due to invalid dimensions. Masks shape: {masks.shape}, Border masks shape: {border_enhanced_masks.shape}")
             return
-        
+            
+            
         # Create a custom colormap for the border enhanced masks
         colors = [(0, 0, 0, 0), (0, 0, 1, 0.5), (1, 0, 0, 1)]  # transparent -> blue -> red
         positions = [0, 0.5, 1]
@@ -436,20 +454,25 @@ class SAM2Train(SAM2Base):
         
         # Prepare visualization
         fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        
-        # Display original masks
-        axes[0].imshow(masks[0, 0], cmap='gray')
-        axes[0].set_title("Original Mask")
-        axes[0].axis('off')
-        
-        # Display border enhanced masks
-        axes[1].imshow(border_enhanced_masks[0, 0], cmap=border_cmap)
-        axes[1].set_title("Border Enhanced Mask")
-        axes[1].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(path)
-        plt.close(fig)
+
+        try:
+            # Display original masks
+            axes[0].imshow(masks[0, 0], cmap='gray')
+            axes[0].set_title("Original Mask")
+            axes[0].axis('off')
+            
+            # Display border enhanced masks
+            axes[1].imshow(border_enhanced_masks[0, 0], cmap=border_cmap)
+            axes[1].set_title("Border Enhanced Mask")
+            axes[1].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(path)
+            plt.close(fig)
+        except Exception as e:
+            # If any error occurs during visualization, catch it and print a message
+            print(f"Error during visualization: {e}")
+            plt.close(fig)  # Make sure to close the figure to prevent memory leaks
 
     def create_border_emphasized_masks(self, masks, border_width=2, border_value=1.0, interior_value=0.5):
         """
@@ -578,26 +601,28 @@ class SAM2Train(SAM2Base):
             
             mask_inputs = None
             if not backbone_out.get("use_pt_input", False):
-                # Option 1: Use the combined mask (all objects together)
-                #mask_inputs = backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {})
-                mask_inputs = backbone_out.get("gt_masks_per_frame", {}).get(stage_id, {})[0]
-                # Option 2: Create a combined mask from individual object masks
-                # mask_inputs = self._combine_object_mask_prompts(
-                #         backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {}),
-                #         objects_in_frame
-                #     )
+                global_binary_mask = self._combine_object_mask_prompts(backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {}), objects_in_frame)
+                global_bordered_binary_mask = backbone_out.get("bordered_mask_inputs_per_frame", {}).get(stage_id, {})
+                
+                if global_binary_mask == None or global_bordered_binary_mask == None:
+                    #print("masks none for stage id", stage_id)
+                    pass
+                else:
+                    self.visualize_masks(global_binary_mask, global_bordered_binary_mask, path='./normal_vsborder.png')
+                    mask_inputs = global_bordered_binary_mask
             
             # Get combined ground truth masks, only for conditioning frames
             gt_masks = None
             if stage_id in init_cond_frames:
-                gt_masks = backbone_out["gt_masks_per_frame"].get(stage_id, None)
+                #gt_masks = backbone_out["gt_masks_per_frame"].get(stage_id, None)
+                gt_masks = backbone_out["gt_masks_per_frame_per_obj"].get(stage_id, None)
                 # Gt masks have borders internally so just quickfix make global binary mask for GT mask:
-                gt_masks = self._combine_object_mask_prompts(
-                            backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {}),
-                            objects_in_frame
-                        )
+                # gt_masks = self._combine_object_mask_prompts(
+                #             backbone_out.get("mask_inputs_per_frame_per_obj", {}).get(stage_id, {}),
+                #             objects_in_frame
+                #         )
 
-                self.visualize_masks(gt_masks, mask_inputs, path='./gtmask_vs_inputmask.png')
+                self.visualize_masks(self._combine_object_mask_prompts(gt_masks, objects_in_frame), mask_inputs, path='./gtmask_vs_inputmask.png')
 
             # Get output masks based on this frame's prompts and previous memory
             current_out = self.track_step(
@@ -752,7 +777,8 @@ class SAM2Train(SAM2Base):
         combined_output = {
             "frame_idx": frame_idx,
             "object_outputs": {},  # Store per-object outputs here
-            "num_objects": len(objects_in_frame)
+            "num_objects": len(objects_in_frame),
+            "obj_ptrs": []  # Will store one obj_ptr per object for tracking
         }
         
         # Process each object in the frame separately
@@ -770,6 +796,7 @@ class SAM2Train(SAM2Base):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
+            num_objects=len(objects_in_frame)  # Pass number of objects explicitly
         )
 
         (
@@ -778,7 +805,7 @@ class SAM2Train(SAM2Base):
             ious,
             low_res_masks,
             high_res_masks,
-            obj_ptr,
+            obj_ptrs,
             object_score_logits,
             high_res_instance_ids,
         ) = sam_outputs
@@ -792,36 +819,10 @@ class SAM2Train(SAM2Base):
         current_out["multistep_object_score_logits"] = [object_score_logits]
         current_out["multistep_pred_instance_ids"] = [high_res_instance_ids]
 
-        # Optionally, sample correction points iteratively to correct the mask
-        # if frame_idx in frames_to_add_correction_pt:
-        #     point_inputs, final_sam_outputs = self._iter_correct_pt_sampling(
-        #         is_init_cond_frame,
-        #         point_inputs,
-        #         gt_masks,
-        #         high_res_features,
-        #         pix_feat,
-        #         low_res_multimasks,
-        #         high_res_multimasks,
-        #         ious,
-        #         low_res_masks,
-        #         high_res_masks,
-        #         object_score_logits,
-        #         current_out,
-        #     )
-        #     (
-        #         _,
-        #         _,
-        #         _,
-        #         low_res_masks,
-        #         high_res_masks,
-        #         obj_ptr,
-        #         object_score_logits,
-        #     ) = final_sam_outputs
-
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
-        current_out["obj_ptr"] = obj_ptr
+        current_out["obj_ptrs"] = obj_ptrs
         current_out["pred_instance_ids"] = high_res_instance_ids 
 
         # Finally run the memory encoder on the predicted mask to encode
@@ -834,7 +835,7 @@ class SAM2Train(SAM2Base):
             high_res_masks,
             object_score_logits,
             current_out,
-            gt_instance_ids=gt_instance_ids  # NEW: pass instance ids to memory encoder
+            gt_instance_ids=None, #gt_instance_ids  # NEW: pass instance ids to memory encoder
         )
         
         return current_out

@@ -15,11 +15,12 @@ from sam2.modeling.sam2_utils import LayerNorm2d, MLP
 
 from enum import IntEnum, auto
 
-class InstanceIdMode(IntEnum):
+class model_prediction_mode(IntEnum):
     DIRECT = 0
     EMBEDDING_HEAD_CNN = 1
     EMBEDDING_HEAD_MLP = 2
     EMBEDDING_SHARED_MLP = 3
+    MULTI_MASK_OUTPUT = 4
 
 class SpatialEmbeddingAggregator(nn.Module):
     """Aggregates embeddings using cross-attention that preserves spatial information."""
@@ -97,6 +98,7 @@ class MaskDecoder(nn.Module):
         pred_obj_scores: bool = False,
         pred_obj_scores_mlp: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
+        max_num_objects: int = 5,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -119,14 +121,16 @@ class MaskDecoder(nn.Module):
         self.transformer = transformer
 
         self.num_multimask_outputs = num_multimask_outputs
+        self.max_num_objects = max_num_objects
 
         self.iou_token = nn.Embedding(1, transformer_dim)
-        self.num_mask_tokens = num_multimask_outputs + 1
+
+        self.num_mask_tokens = max_num_objects #num_multimask_outputs + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
 
         self.pred_obj_scores = pred_obj_scores
         if self.pred_obj_scores:
-            self.obj_score_token = nn.Embedding(1, transformer_dim)
+            self.obj_score_token = nn.Embedding(max_num_objects, transformer_dim)
         self.use_multimask_token_for_obj_ptr = use_multimask_token_for_obj_ptr
 
         self.output_upscaling = nn.Sequential(
@@ -163,10 +167,18 @@ class MaskDecoder(nn.Module):
             iou_head_depth,
             sigmoid_output=iou_prediction_use_sigmoid,
         )
+
         if self.pred_obj_scores:
-            self.pred_obj_score_head = nn.Linear(transformer_dim, 1)
             if pred_obj_scores_mlp:
-                self.pred_obj_score_head = MLP(transformer_dim, transformer_dim, 1, 3)
+                self.pred_obj_score_head = nn.ModuleList([
+                    MLP(transformer_dim, transformer_dim, 1, 3)
+                    for _ in range(max_num_objects)
+                ])
+            else:
+                self.pred_obj_score_head = nn.ModuleList([
+                    nn.Linear(transformer_dim, 1)
+                    for _ in range(max_num_objects)
+                ])
 
         # When outputting a single mask, optionally we can dynamically fall back to the best
         # multimask output token if the single mask output token gives low stability scores.
@@ -175,7 +187,7 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
 
         # *** New: Add an instance ID head for dual-channel output ***
-        self.instance_id_mode = InstanceIdMode.EMBEDDING_HEAD_MLP
+        self.model_prediction_mode = model_prediction_mode.MULTI_MASK_OUTPUT
         self.embedding_dim = 64
         self.num_embedding_tokens = 64
 
@@ -184,10 +196,10 @@ class MaskDecoder(nn.Module):
         print("transforemr dim", transformer_dim)
         
         # We assume that output_upscaling produces feature maps of channel dimension transformer_dim//8?
-        match self.instance_id_mode:
-            case InstanceIdMode.DIRECT:
+        match self.model_prediction_mode:
+            case model_prediction_mode.DIRECT:
                 self.instance_id_head = nn.Conv2d(self.output_feature_dim, 1, kernel_size=1)
-            case InstanceIdMode.EMBEDDING_HEAD_CNN:
+            case model_prediction_mode.EMBEDDING_HEAD_CNN:
                 # Just a more advanced head to predict instance embeddings, using CNNs
                 self.instance_embedding_head = nn.Sequential(
                     nn.Conv2d(self.output_feature_dim, transformer_dim // 4, kernel_size=3, padding=1),
@@ -195,7 +207,7 @@ class MaskDecoder(nn.Module):
                     nn.ReLU(inplace=True),
                     nn.Conv2d(transformer_dim // 4, self.embedding_dim, kernel_size=1)
                 )
-            case InstanceIdMode.EMBEDDING_HEAD_MLP:
+            case model_prediction_mode.EMBEDDING_HEAD_MLP:
                 # Extended transformer MLP head to predict instance embeddings
                 
                 # Add embedding tokens alongside mask tokens
@@ -207,8 +219,7 @@ class MaskDecoder(nn.Module):
                         MLP(transformer_dim, transformer_dim, self.output_feature_dim, 3)
                     ]
                 )
-            
-            case InstanceIdMode.EMBEDDING_SHARED_MLP:
+            case model_prediction_mode.EMBEDDING_SHARED_MLP:
                 # Shared MLP head to predict instance embeddings
                 # Use the same hypernetworks but with different output dimension
                 self.instance_id_head = nn.ModuleList(
@@ -217,9 +228,10 @@ class MaskDecoder(nn.Module):
                         for i in range(self.num_mask_tokens)
                     ]
                 )
-                
+            case model_prediction_mode.MULTI_MASK_OUTPUT:
+                pass
         # *** New: For the EMBEDDING_HEAD_MLP mode, add heads for bandwidth (sigma) and offsets ***
-        if self.instance_id_mode == InstanceIdMode.EMBEDDING_HEAD_MLP:
+        if self.model_prediction_mode == model_prediction_mode.EMBEDDING_HEAD_MLP:
             self.pred_bandwidth_head = nn.Conv2d(self.output_feature_dim, 1, kernel_size=1)
             self.pred_offset_head = nn.Conv2d(self.output_feature_dim, 2, kernel_size=1)
         else:
@@ -266,6 +278,7 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        num_objects: int = None  # New parameter to specify number of objects to process
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -285,6 +298,14 @@ class MaskDecoder(nn.Module):
         """
         
         self.start.record()
+
+        # If num_objects not specified, use max_num_objects
+        if num_objects is None:
+            num_objects = self.max_num_objects
+        else:
+            # Ensure we don't exceed our limit
+            num_objects = min(num_objects, self.max_num_objects)
+
         masks, iou_pred, mask_tokens_out, object_score_logits, instance_embeddings = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
@@ -294,26 +315,34 @@ class MaskDecoder(nn.Module):
             high_res_features=high_res_features,
         )
 
+        # Original code tracking just one obj:
         # Select the correct mask or masks for output
-        if multimask_output:
-            masks = masks[:, 1:, :, :]
-            iou_pred = iou_pred[:, 1:]
-        elif self.dynamic_multimask_via_stability and not self.training:
-            masks, iou_pred = self._dynamic_multimask_via_stability(masks, iou_pred)
-        else:
-            masks = masks[:, 0:1, :, :]
-            iou_pred = iou_pred[:, 0:1]
+        # if multimask_output:
+        #     masks = masks[:, 1:, :, :]
+        #     iou_pred = iou_pred[:, 1:]
+        # elif self.dynamic_multimask_via_stability and not self.training:
+        #     masks, iou_pred = self._dynamic_multimask_via_stability(masks, iou_pred)
+        # else:
+        #     masks = masks[:, 0:1, :, :]
+        #     iou_pred = iou_pred[:, 0:1]
 
-        if multimask_output and self.use_multimask_token_for_obj_ptr:
-            sam_tokens_out = mask_tokens_out[:, 1:]  # [b, 3, c] shape
-        else:
-            # Take the mask output token. Here we *always* use the token for single mask output.
-            # At test time, even if we track after 1-click (and using multimask_output=True),
-            # we still take the single mask token here. The rationale is that we always track
-            # after multiple clicks during training, so the past tokens seen during training
-            # are always the single mask token (and we'll let it be the object-memory token).
-            sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
+        # if multimask_output and self.use_multimask_token_for_obj_ptr:
+        #     sam_tokens_out = mask_tokens_out[:, 1:]  # [b, 3, c] shape
+        # else:
+        #     # Take the mask output token. Here we *always* use the token for single mask output.
+        #     # At test time, even if we track after 1-click (and using multimask_output=True),
+        #     # we still take the single mask token here. The rationale is that we always track
+        #     # after multiple clicks during training, so the past tokens seen during training
+        #     # are always the single mask token (and we'll let it be the object-memory token).
+        #     sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
 
+        # Return masks for all specified objects
+        # Each object gets its own channel in the output
+        masks = masks[:, :num_objects, :, :]
+        iou_pred = iou_pred[:, :num_objects]
+        
+        # Return one SAM token per object for tracking identity
+        sam_tokens_out = mask_tokens_out[:, :num_objects]  # [b, num_objects, c]
 
         self.end.record()
         torch.cuda.synchronize()
@@ -334,8 +363,14 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        num_objects: int = None  # New parameter to specify number of objects to process
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
+
+        # If num_objects not specified, use max_num_objects
+        if num_objects is None:
+            num_objects = self.max_num_objects
+
         # Concatenate output tokens
         s = 0
         if self.pred_obj_scores:
@@ -344,14 +379,18 @@ class MaskDecoder(nn.Module):
                     self.obj_score_token.weight,
                     self.iou_token.weight,
                     self.mask_tokens.weight,
-                    self.embedding_tokens.weight,
+                    #self.embedding_tokens.weight,
                 ],
                 dim=0,
             )
-            s = 1
+            s = num_objects #1
         else:
             output_tokens = torch.cat(
-                [self.iou_token.weight, self.mask_tokens.weight, self.embedding_tokens.weight], dim=0
+                [
+                    self.iou_token.weight,
+                    self.mask_tokens.weight,
+                    #self.embedding_tokens.weight
+                ], dim=0
             )
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
@@ -373,14 +412,29 @@ class MaskDecoder(nn.Module):
 
         # Run the transformer
         hs, src = self.transformer(src, pos_src, tokens)
-        iou_token_out = hs[:, s, :]
-        mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
-        embedding_tokens_out = hs[:,  : (s + 1 + self.num_mask_tokens + 1), :]
+
+        # For single obj 
+        # iou_token_out = hs[:, s, :]
+        # mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
+        # embedding_tokens_out = hs[:,  : (s + 1 + self.num_mask_tokens + 1), :]
         
-        start_idx = (s + 1 + self.num_mask_tokens)
-        end_idx = start_idx + self.num_embedding_tokens
-        embedding_tokens_out = hs[:, start_idx : end_idx, :]
-        #print("shape of embed tokens out: ", embedding_tokens_out.shape, "hs shape", hs.shape)
+        # start_idx = (s + 1 + self.num_mask_tokens)
+        # end_idx = start_idx + self.num_embedding_tokens
+        # embedding_tokens_out = hs[:, start_idx : end_idx, :]
+
+        # Get output tokens for each component
+        if self.pred_obj_scores:
+            # Get obj score tokens (one per object)
+            obj_score_tokens_out = hs[:, :s, :]  # [b, num_objects, c]
+            # Get single IoU token
+            iou_token_out = hs[:, s, :]  # [b, c]
+            # Get mask tokens (one per object)
+            mask_tokens_out = hs[:, s+1:s+1+num_objects, :]  # [b, num_objects, c]
+        else:
+            # Get single IoU token
+            iou_token_out = hs[:, 0, :]  # [b, c]
+            # Get mask tokens (one per object)
+            mask_tokens_out = hs[:, 1:1+num_objects, :]  # [b, num_objects, c]
 
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
@@ -395,13 +449,13 @@ class MaskDecoder(nn.Module):
         # *** New: Generate an instance ID map using the new head ***
         pred_bandwidth = None
         pred_offsets = None
-        match self.instance_id_mode:
-            case InstanceIdMode.DIRECT:
+        match self.model_prediction_mode:
+            case model_prediction_mode.DIRECT:
                 instance_id_map = self.instance_id_head(upscaled_embedding)  # (B, 1, h, w)
-            case InstanceIdMode.EMBEDDING_HEAD_CNN:
+            case model_prediction_mode.EMBEDDING_HEAD_CNN:
                 # Use instance embeddings to predict instance ID map
                 instance_id_map = self.instance_embedding_head(upscaled_embedding)  # (B, embedding_dim, h, w)
-            case InstanceIdMode.EMBEDDING_HEAD_MLP:
+            case model_prediction_mode.EMBEDDING_HEAD_MLP:
                 embedding_hyper_in_list: List[torch.Tensor] = []
                 # Process each embedding token through the hypernetwork
                 for j in range(self.num_embedding_tokens):
@@ -457,8 +511,7 @@ class MaskDecoder(nn.Module):
                 # *** New: Predict bandwidth and offsets ***
                 #pred_bandwidth = self.pred_bandwidth_head(upscaled_embedding)  # (B, 1, H, W)
                 #pred_offsets = self.pred_offset_head(upscaled_embedding)        # (B, 2, H, W)
-
-            case InstanceIdMode.EMBEDDING_SHARED_MLP:
+            case model_prediction_mode.EMBEDDING_SHARED_MLP:
                 instance_embeddings = []
                 for i in range(self.num_mask_tokens):
                     # Apply hypernetwork weights to get features, then project to embedding space
@@ -466,10 +519,12 @@ class MaskDecoder(nn.Module):
                     embeddings_i = self.instance_id_head[i](features_i.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
                     instance_embeddings.append(embeddings_i)
                 instance_embeddings = torch.cat(instance_embeddings, dim=1)
-                
+            case model_prediction_mode.MULTI_MASK_OUTPUT:
+                pass
+
         # Standard mask prediction using hypernetworks
         hyper_in_list: List[torch.Tensor] = []
-        for i in range(self.num_mask_tokens):
+        for i in range(self.num_objects):
             hyper_in_list.append(
                 self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
             )
@@ -481,24 +536,30 @@ class MaskDecoder(nn.Module):
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
         if self.pred_obj_scores:
-            assert s == 1
-            object_score_logits = self.pred_obj_score_head(hs[:, 0, :])
+            #single obj: object_score_logits = self.pred_obj_score_head(hs[:, 0, :])
+            object_score_logits = torch.cat([
+                self.pred_obj_score_head[i](obj_score_tokens_out[:, i, :])
+                for i in range(num_objects)
+            ], dim=1)
         else:
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
-            object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
+            object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], num_objects)
 
         # *** New: For final output, select the primary mask token as binary mask
         # Here we take the first channel as the binary mask output.
         binary_mask = masks[:, 0:1, :, :]
 
-        match self.instance_id_mode:
-            case InstanceIdMode.DIRECT:
+        match self.model_prediction_mode:
+            case model_prediction_mode.DIRECT:
                 # Combine binary mask and instance ID map to form a dual-channel output.
                 instance_embeddings = instance_id_map  # shape: (B, 1, h, w)
-            case InstanceIdMode.EMBEDDING_HEAD_CNN| InstanceIdMode.EMBEDDING_HEAD_MLP:
+            case model_prediction_mode.EMBEDDING_HEAD_CNN| model_prediction_mode.EMBEDDING_HEAD_MLP:
+                pass
+            case model_prediction_mode.MULTI_MASK_OUTPUT:
+                instance_embeddings = None
                 pass
             case _:
-                raise NotImplementedError(f"InstanceIdMode {self.instance_id_mode} not implemented")
+                raise NotImplementedError(f"model_prediction_mode {self.model_prediction_mode} not implemented")
                 
         return masks, iou_pred, mask_tokens_out, object_score_logits, instance_embeddings#, pred_bandwidth, pred_offsets
 

@@ -261,6 +261,7 @@ class SAM2Base(torch.nn.Module):
         mask_inputs=None,
         high_res_features=None,
         multimask_output=False,
+        num_objects=None,
     ):
         """
         Forward SAM prompt encoders and mask heads.
@@ -304,6 +305,14 @@ class SAM2Base(torch.nn.Module):
         B = backbone_features.size(0)
         
         device = backbone_features.device
+
+        # If num_objects not specified, try to infer from inputs or use default
+        if num_objects is None:
+            if mask_inputs is not None and len(mask_inputs.shape) > 4:  # [B, O, 1, H, W] format
+                num_objects = mask_inputs.shape[1]
+            else:
+                num_objects = 1  # Default to single object
+
         assert backbone_features.size(1) == self.sam_prompt_embed_dim
         assert backbone_features.size(2) == self.sam_image_embedding_size
         assert backbone_features.size(3) == self.sam_image_embedding_size
@@ -347,7 +356,7 @@ class SAM2Base(torch.nn.Module):
         (
             low_res_multimasks,
             ious,
-            sam_output_tokens,
+            obj_ptrs, #sam_output_tokens,
             object_score_logits,
             instance_embeddings
         ) = self.sam_mask_decoder(
@@ -358,6 +367,7 @@ class SAM2Base(torch.nn.Module):
             multimask_output=multimask_output,
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
+            num_objects=num_objects,
         )
 
         # Upsample instance IDs to the same size as high_res_masks
@@ -401,17 +411,17 @@ class SAM2Base(torch.nn.Module):
             low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
         # Extract object pointer from the SAM output token (with occlusion handling)
-        obj_ptr = self.obj_ptr_proj(sam_output_token)
-        if self.pred_obj_scores:
-            # Allow *soft* no obj ptr, unlike for masks
-            if self.soft_no_obj_ptr:
-                lambda_is_obj_appearing = object_score_logits.sigmoid()
-            else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
+        # obj_ptr = self.obj_ptr_proj(sam_output_token)
+        # if self.pred_obj_scores:
+        #     # Allow *soft* no obj ptr, unlike for masks
+        #     if self.soft_no_obj_ptr:
+        #         lambda_is_obj_appearing = object_score_logits.sigmoid()
+        #     else:
+        #         lambda_is_obj_appearing = is_obj_appearing.float()
 
-            if self.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+        #     if self.fixed_no_obj_ptr:
+        #         obj_ptr = lambda_is_obj_appearing * obj_ptr
+        #     obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
         return (
             low_res_multimasks,
@@ -419,7 +429,7 @@ class SAM2Base(torch.nn.Module):
             ious,
             low_res_masks,
             high_res_masks,
-            obj_ptr,
+            obj_ptrs,
             object_score_logits,
             high_res_instance_ids
         )
@@ -450,7 +460,7 @@ class SAM2Base(torch.nn.Module):
             )
         else:
             # produce an object pointer using the SAM decoder from the mask input
-            _, _, _, _, _, obj_ptr, _, high_res_instance_ids = self._forward_sam_heads(
+            _, _, _, _, _, obj_ptrs, _, high_res_instance_ids = self._forward_sam_heads(
                 backbone_features=backbone_features,
                 mask_inputs=self.mask_downsample(mask_inputs_float),
                 high_res_features=high_res_features,
@@ -464,8 +474,8 @@ class SAM2Base(torch.nn.Module):
         object_score_logits = out_scale * lambda_is_obj_appearing + out_bias
         if self.pred_obj_scores:
             if self.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+                obj_ptrs = lambda_is_obj_appearing * obj_ptrs
+            obj_ptrs = obj_ptrs + (1 - lambda_is_obj_appearing) * self.no_obj_ptrs
 
         return (
             low_res_masks,
@@ -473,7 +483,7 @@ class SAM2Base(torch.nn.Module):
             ious,
             low_res_masks,
             high_res_masks,
-            obj_ptr,
+            obj_ptrs,
             object_score_logits,
             high_res_instance_ids,  # Add instance IDs to return values
         )
