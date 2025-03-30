@@ -36,7 +36,7 @@ class MaskDownSampler(nn.Module):
         num_layers = int(math.log2(total_stride) // math.log2(stride))
         assert stride**num_layers == total_stride
         self.encoder = nn.Sequential()
-        mask_in_chans, mask_out_chans = 1, 1
+        mask_in_chans, mask_out_chans = 5, 1 #1, 1
         for _ in range(num_layers):
             mask_out_chans = mask_in_chans * (stride**2)
             self.encoder.append(
@@ -55,6 +55,19 @@ class MaskDownSampler(nn.Module):
         self.encoder.append(nn.Conv2d(mask_out_chans, embed_dim, kernel_size=1))
 
     def forward(self, x):
+        # Check if input has fewer than 5 channels
+        if x.shape[1] < 5:
+            # Get current batch size and spatial dimensions
+            batch_size, channels, height, width = x.shape
+            
+            # Create a zero tensor with 5 channels
+            x_padded = torch.zeros(batch_size, 5, height, width, device=x.device, dtype=x.dtype)
+            
+            # Copy the existing channels
+            x_padded[:, :channels] = x
+            
+            # Use the padded tensor instead
+            x = x_padded
         return self.encoder(x)
 
 

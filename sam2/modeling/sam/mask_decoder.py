@@ -524,7 +524,7 @@ class MaskDecoder(nn.Module):
 
         # Standard mask prediction using hypernetworks
         hyper_in_list: List[torch.Tensor] = []
-        for i in range(self.num_objects):
+        for i in range(num_objects):
             hyper_in_list.append(
                 self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
             )
@@ -536,11 +536,13 @@ class MaskDecoder(nn.Module):
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
         if self.pred_obj_scores:
-            #single obj: object_score_logits = self.pred_obj_score_head(hs[:, 0, :])
-            object_score_logits = torch.cat([
-                self.pred_obj_score_head[i](obj_score_tokens_out[:, i, :])
-                for i in range(num_objects)
-            ], dim=1)
+            #single obj: 
+            object_score_logits = self.pred_obj_score_head[0](hs[:, 0, :])
+            #multi obj, one score per obj:
+            # object_score_logits = torch.cat([
+            #     self.pred_obj_score_head[i](obj_score_tokens_out[:, i, :])
+            #     for i in range(num_objects)
+            # ], dim=1)
         else:
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], num_objects)

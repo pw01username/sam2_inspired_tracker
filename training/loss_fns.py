@@ -20,7 +20,7 @@ from training.utils.distributed import get_world_size, is_dist_avail_and_initial
 from training.utils.visualize_instance_segmentation import visualize_frame, visualize_instance_predictions
 
 
-def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
+def dice_loss(inputs, targets, num_objects, loss_on_multimask=True):
     """
     Compute the DICE loss, similar to generalized IOU for masks
     Args:
@@ -35,6 +35,7 @@ def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
         Dice loss tensor
     """
     inputs = inputs.sigmoid()
+    print("DICE LOSS inputs shape: ", inputs.shape, ". targets shape: ", targets.shape)
     if loss_on_multimask:
         # inputs and targets are [N, M, H, W] where M corresponds to multiple predicted masks
         assert inputs.dim() == 4 and targets.dim() == 4
@@ -58,7 +59,7 @@ def sigmoid_focal_loss(
     num_objects,
     alpha: float = 0.25,
     gamma: float = 2,
-    loss_on_multimask=False,
+    loss_on_multimask=True,
 ):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
@@ -94,7 +95,7 @@ def sigmoid_focal_loss(
 
 
 def iou_loss(
-    inputs, targets, pred_ious, num_objects, loss_on_multimask=False, use_l1_loss=False
+    inputs, targets, pred_ious, num_objects, loss_on_multimask=True, use_l1_loss=False
 ):
     """
     Args:
@@ -178,7 +179,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
             os.makedirs(self.vis_save_dir, exist_ok=True)
 
     def forward(self, outs_batch: List[Dict], targets_batch: torch.Tensor, instance_ids_batch: torch.Tensor):
-        
+
         assert len(outs_batch) == len(targets_batch)
         assert len(outs_batch) == len(instance_ids_batch)
 
@@ -323,8 +324,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
         # accumulate the loss over prediction steps
         losses = {"loss_mask": 0, "loss_dice": 0, "loss_iou": 0, "loss_class": 0}
-        if self.use_instance_loss:
-            losses["loss_instance"] = 0
+        losses["loss_instance"] = 0
         
         for src_masks, ious, object_score_logits, pred_instance_ids  in zip(
             src_masks_list, ious_list, object_score_logits_list, pred_instance_ids_list 
@@ -338,9 +338,6 @@ class MultiStepMultiMasksAndIous(nn.Module):
     def _update_losses(
         self, losses, src_masks, target_masks, ious, num_objects, object_score_logits, pred_instance_ids, target_instance_ids
     ):
-        #print("target_instance_ids: ", target_instance_ids.shape)
-        #print("pred_instance_ids: ", pred_instance_ids.shape)
-
         # Convert src_masks to match target masks shape of 4 dim
         if src_masks.dim() == 3:  # [B, H, W]
             src_masks = src_masks.unsqueeze(1)  # [B, 1, H, W]
@@ -352,6 +349,15 @@ class MultiStepMultiMasksAndIous(nn.Module):
             # Expand target_masks to match batch size of src_masks
             target_masks = target_masks.expand(src_masks.shape[0], -1, -1, -1)
         
+
+        print("src_masks: ", src_masks.shape)
+        print("target_masks: ", target_masks.shape)
+
+        # Visualize tensors for debugging
+        #visualize_4d_tensor(outs, f"dice_inputs_iter{self.iteration}")
+        #visualize_4d_tensor(targets, f"dice_targets_iter{self.iteration}")
+        visualize_masks_with_gt(src_masks, target_masks, f"mask_comparison_iter{self.iteration}")
+
         # Expand target_masks along mask dimension if needed
         # if target_masks.shape[1] != src_masks.shape[1]:
         #     target_masks = target_masks.expand(-1, src_masks.shape[1], -1, -1)
@@ -425,6 +431,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         #     loss_iou = loss_multiiou
 
         # Compute losses for each object separately
+        print("src masks shape", src_masks.shape, " target mask shape", target_masks.shape)
         loss_mask = sigmoid_focal_loss(
             src_masks,
             target_masks,
@@ -434,7 +441,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         )
         
         loss_dice = dice_loss(
-            src_masks, target_masks, num_objects
+            src_masks, target_masks, num_objects, loss_on_multimask=True
         )
         
         loss_iou = iou_loss(
@@ -446,7 +453,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         )
         
         # Object score loss
-        if not self.pred_obj_scores:
+        if not self.pred_obj_scores or 1 == 1:
             loss_class = torch.tensor(
                 0.0, dtype=loss_mask.dtype, device=loss_mask.device
             )
@@ -477,7 +484,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         losses["loss_dice"] += loss_dice.sum()
         losses["loss_iou"] += loss_iou.sum()
         losses["loss_class"] += loss_class
-
+        
         # Instance ID loss - only if enabled
         if self.use_instance_loss and pred_instance_ids is not None:
             # Convert target_instance_ids to match pred_instance_ids shape if needed
@@ -500,6 +507,8 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 loss_instance = torch.mean(pred_instance_ids) * 0.0 + 0.1
                 
             losses["loss_instance"] += loss_instance.mean()
+        else:
+            losses["loss_instance"] += loss_iou.sum() * 0.0
 
     def instance_id_loss_fixed(self, pred_embeddings, target_instance_ids, num_objects, delta_v=0.1, delta_d=2.0, reg_weight=0.01):
         """
@@ -1112,6 +1121,197 @@ class GradientInspector:
             
             return True
         return False
+
+
+
+
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from typing import Optional, Union, Tuple
+
+def visualize_4d_tensor(
+    tensor: torch.Tensor, 
+    filename: str, 
+    cmap: str = 'viridis',
+    normalize: bool = True,
+    title: Optional[str] = None,
+    figsize: Tuple[int, int] = None,
+    save_dir: str = 'sam2_proj/viz/'
+) -> None:
+    """
+    Visualize a 4D tensor (B, C, H, W) as a grid of images.
+    
+    Args:
+        tensor: 4D tensor of shape (B, C, H, W) to visualize
+        filename: Name of the output file (without extension)
+        cmap: Colormap to use for visualization
+        normalize: Whether to normalize values to [0, 1] for each channel
+        title: Optional title for the plot
+        figsize: Custom figure size as (width, height)
+        save_dir: Directory to save the visualization
+    """
+    # Ensure tensor is on CPU and convert to numpy
+    if torch.is_tensor(tensor):
+        tensor = tensor.detach().cpu()
+        
+    # Ensure tensor is 4D
+    if tensor.dim() != 4:
+        raise ValueError(f"Expected 4D tensor (B,C,H,W), got shape {tensor.shape}")
+    
+    B, C, H, W = tensor.shape
+    
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Determine grid size
+    if B == 1:
+        # For single batch, just display channels in a row or grid
+        n_cols = min(C, 4)  # Limit columns for better visibility
+        n_rows = (C + n_cols - 1) // n_cols
+    else:
+        # For multiple batches, display each batch with channels
+        n_cols = min(C, 3)  # Limit columns for better visibility
+        n_rows = B * ((C + n_cols - 1) // n_cols)
+    
+    # Auto-determine figure size if not provided
+    if figsize is None:
+        figsize = (n_cols * 3, n_rows * 3)
+    
+    # Create figure and gridspec for flexible layout
+    fig = plt.figure(figsize=figsize)
+    
+    # Add overall title if provided
+    if title:
+        fig.suptitle(title, fontsize=16)
+    
+    # Plot each tensor slice
+    for b in range(B):
+        for c in range(C):
+            # Calculate subplot index
+            if B == 1:
+                ax_idx = c + 1
+            else:
+                c_group = c // n_cols
+                ax_idx = b * ((C + n_cols - 1) // n_cols) * n_cols + c + 1
+            
+            # Create subplot
+            ax = fig.add_subplot(n_rows, n_cols, ax_idx)
+            
+            # Get current slice
+            slice_data = tensor[b, c].numpy()
+            
+            # Normalize if requested
+            if normalize:
+                vmin, vmax = slice_data.min(), slice_data.max()
+                if vmin == vmax:  # Handle constant data
+                    vmin, vmax = 0, 1
+            else:
+                vmin, vmax = None, None
+            
+            # Plot the image
+            im = ax.imshow(slice_data, cmap=cmap, vmin=vmin, vmax=vmax)
+            
+            # Add title for each subplot
+            if B > 1:
+                ax.set_title(f"Batch {b}, Channel {c}")
+            else:
+                ax.set_title(f"Channel {c}")
+            
+            # Hide axes for cleaner look
+            ax.axis('off')
+            
+            # Add colorbar if it's the last item in row
+            if (c + 1) % n_cols == 0 or c == C - 1:
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save figure
+    save_path = os.path.join(save_dir, f"{filename}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Saved visualization to {save_path}")
+    
+    # Close figure to free memory
+    plt.close(fig)
+
+def visualize_masks_with_gt(
+    pred_masks: torch.Tensor,
+    gt_masks: torch.Tensor,
+    filename: str,
+    save_dir: str = 'viz/',
+    alpha: float = 0.5
+) -> None:
+    """
+    Visualize predicted masks with ground truth overlay.
+    
+    Args:
+        pred_masks: Predicted masks tensor of shape (B, C, H, W)
+        gt_masks: Ground truth masks tensor of shape (B, 1, H, W) or (B, H, W)
+        filename: Name of the output file (without extension)
+        save_dir: Directory to save the visualization
+        alpha: Transparency for the overlay
+    """
+    # Ensure tensors are on CPU
+    if torch.is_tensor(pred_masks):
+        pred_masks = pred_masks.detach().cpu()
+    if torch.is_tensor(gt_masks):
+        gt_masks = gt_masks.detach().cpu()
+    
+    # Ensure pred_masks is 4D
+    if pred_masks.dim() != 4:
+        raise ValueError(f"Expected 4D tensor for pred_masks, got shape {pred_masks.shape}")
+    
+    # Ensure gt_masks is right format
+    if gt_masks.dim() == 3:  # (B, H, W)
+        gt_masks = gt_masks.unsqueeze(1)  # Make (B, 1, H, W)
+    
+    B, C, H, W = pred_masks.shape
+    
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Apply sigmoid to get probabilities
+    if pred_masks.max() > 1.0 or pred_masks.min() < 0.0:
+        pred_masks = torch.sigmoid(pred_masks)
+    
+    # Loop through each batch
+    for b in range(B):
+        # Create figure with a grid layout
+        fig = plt.figure(figsize=(4 * (C + 1), 4))
+        gs = GridSpec(1, C + 1, figure=fig)
+        
+        # First, plot the ground truth mask
+        ax_gt = fig.add_subplot(gs[0, 0])
+        ax_gt.imshow(gt_masks[b, 0].numpy(), cmap='gray', vmin=0, vmax=1)
+        ax_gt.set_title("Ground Truth")
+        ax_gt.axis('off')
+        
+        # Then plot each predicted mask as an overlay on the ground truth
+        for c in range(C):
+            ax = fig.add_subplot(gs[0, c + 1])
+            
+            # Show ground truth in grayscale
+            ax.imshow(gt_masks[b, 0].numpy(), cmap='gray', vmin=0, vmax=1)
+            
+            # Overlay the predicted mask with a color map and transparency
+            ax.imshow(pred_masks[b, c].numpy(), cmap='jet', alpha=alpha, vmin=0, vmax=1)
+            
+            ax.set_title(f"Mask {c}")
+            ax.axis('off')
+        
+        # Adjust layout and save
+        plt.tight_layout()
+        save_path = os.path.join(save_dir, f"{filename}_batch{b}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        
+    print(f"Saved overlay visualizations to {save_dir}")
+
+
 
 import torch
 import torch.nn as nn

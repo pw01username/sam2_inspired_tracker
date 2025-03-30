@@ -371,15 +371,17 @@ class SAM2Base(torch.nn.Module):
         )
 
         # Upsample instance IDs to the same size as high_res_masks
-        high_res_instance_ids = F.interpolate(
-            instance_embeddings,
-            size=(self.image_size, self.image_size),
-            mode="nearest",  # Use nearest neighbor to preserve instance ID values
-        )
+        high_res_instance_ids = None
+        if instance_embeddings != None:
+            high_res_instance_ids = F.interpolate(
+                instance_embeddings,
+                size=(self.image_size, self.image_size),
+                mode="nearest",  # Use nearest neighbor to preserve instance ID values
+            )
         
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
-
+            print("object_score_logits shape", object_score_logits.shape, " low_res_multimasks shape", low_res_multimasks.shape)
             # Mask used for spatial memories is always a *hard* choice between obj and no obj,
             # consistent with the actual mask prediction
             low_res_multimasks = torch.where(
@@ -398,18 +400,20 @@ class SAM2Base(torch.nn.Module):
             align_corners=False,
         )
 
-        sam_output_token = sam_output_tokens[:, 0]
-        if multimask_output:
-            # take the best mask prediction (with the highest IoU estimation)
-            best_iou_inds = torch.argmax(ious, dim=-1)
-            batch_inds = torch.arange(B, device=device)
-            low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            if sam_output_tokens.size(1) > 1:
-                sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
-        else:
-            low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
+        # sam_output_token = sam_output_tokens[:, 0]
+        # if multimask_output:
+        #     # take the best mask prediction (with the highest IoU estimation)
+        #     best_iou_inds = torch.argmax(ious, dim=-1)
+        #     batch_inds = torch.arange(B, device=device)
+        #     low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+        #     high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+        #     if sam_output_tokens.size(1) > 1:
+        #         sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+        # else:
+        #     low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
+        low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
+        
         # Extract object pointer from the SAM output token (with occlusion handling)
         # obj_ptr = self.obj_ptr_proj(sam_output_token)
         # if self.pred_obj_scores:
@@ -475,7 +479,7 @@ class SAM2Base(torch.nn.Module):
         if self.pred_obj_scores:
             if self.fixed_no_obj_ptr:
                 obj_ptrs = lambda_is_obj_appearing * obj_ptrs
-            obj_ptrs = obj_ptrs + (1 - lambda_is_obj_appearing) * self.no_obj_ptrs
+            obj_ptrs = obj_ptrs + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
         return (
             low_res_masks,
@@ -630,7 +634,7 @@ class SAM2Base(torch.nn.Module):
                             if self.use_signed_tpos_enc_to_obj_ptrs
                             else abs(frame_idx - t)
                         ),
-                        out["obj_ptr"],
+                        out["obj_ptrs"],
                     )
                     for t, out in ptr_cond_outputs.items()
                 ]
@@ -643,7 +647,9 @@ class SAM2Base(torch.nn.Module):
                         t, unselected_cond_outputs.get(t, None)
                     )
                     if out is not None:
-                        pos_and_ptrs.append((t_diff, out["obj_ptr"]))
+                        pos_and_ptrs.append((t_diff, out["obj_ptrs"]))
+                
+                
                 # If we have at least one object pointer, add them to the across attention
                 if len(pos_and_ptrs) > 0:
                     pos_list, ptrs_list = zip(*pos_and_ptrs)
@@ -767,6 +773,7 @@ class SAM2Base(torch.nn.Module):
         num_frames,
         track_in_reverse,
         prev_sam_mask_logits,
+        num_objects=None,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -814,6 +821,7 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
+                num_objects=num_objects
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
@@ -1130,7 +1138,7 @@ class SAM2Base(torch.nn.Module):
             _,
             low_res_masks,
             high_res_masks,
-            obj_ptr,
+            obj_ptrs,
             object_score_logits,
             high_res_instance_ids,  # NEW: Extract instance IDs from final outputs
         ) = sam_outputs
@@ -1138,7 +1146,8 @@ class SAM2Base(torch.nn.Module):
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
         current_out["pred_instance_ids"] = high_res_instance_ids  # NEW: Store instance IDs
-        current_out["obj_ptr"] = obj_ptr
+        print("obj ptrs from sam outputs: ", obj_ptrs)
+        current_out["obj_ptrs"] = obj_ptrs
         if not self.training:
             # Only add this in inference (to avoid unused param in activation checkpointing;
             # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
