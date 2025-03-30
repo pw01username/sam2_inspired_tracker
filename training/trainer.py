@@ -431,7 +431,7 @@ class Trainer:
         )
 
         self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.loss.load_state_dict(checkpoint["loss"], strict=True)
+        self.loss.load_state_dict(checkpoint["loss"], strict=False)
         self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"]
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed")
@@ -453,7 +453,6 @@ class Trainer:
         model: nn.Module,
         phase: str,
     ):
-
         outputs = model(batch)
         targets = batch.masks
         batch_size = len(batch.img_batch)
@@ -993,7 +992,7 @@ class Trainer:
         self.logger = Logger(self.logging_conf)
 
         self.model = instantiate(self.model_conf, _convert_="all")
-        print_model_summary(self.model)
+        #print_model_summary(self.model)
 
         self.loss = None
         if self.loss_conf:

@@ -65,6 +65,79 @@ class PromptEncoder(nn.Module):
         )
         self.no_mask_embed = nn.Embedding(1, embed_dim)
 
+        # Object identity embeddings to differentiate masks
+        self.object_id_embeddings = nn.Embedding(3, embed_dim)
+        
+        # Attention mechanism to fuse multiple mask embeddings
+        self.mask_attention = nn.MultiheadAttention(
+            embed_dim, 
+            num_heads=8, 
+            batch_first=True
+        )
+        
+        # Final projection to maintain embedding dimensionality
+        self.mask_fusion = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=1),
+            LayerNorm2d(embed_dim),
+            activation(),
+        )
+
+    def _embed_multi_masks(self, masks: torch.Tensor) -> torch.Tensor:
+        """
+        Embeds multiple mask inputs and combines them into a single dense embedding.
+        
+        Args:
+            masks: Tensor of shape (B, N, H, W) where:
+                B is batch size, N is number of masks per sample,
+                H and W are mask height and width
+                
+        Returns:
+            Tensor of shape (B, embed_dim, embed_H, embed_W)
+        """
+        B, N, H, W = masks.shape
+        
+        # Process each mask individually
+        mask_embeddings = []
+        for i in range(N):
+            # Process each mask through the downscaling network
+            single_mask_embedding = self.mask_downscaling(masks[:, i:i+1, :, :])  # (B, embed_dim, embed_H, embed_W)
+            
+            # Add object identity embedding
+            object_id_embed = self.object_id_embeddings(torch.tensor([i], device=masks.device))  # (1, embed_dim)
+            object_id_embed = object_id_embed.view(1, self.embed_dim, 1, 1).expand_as(single_mask_embedding)
+            
+            # Combine spatial features with object identity
+            enhanced_embedding = single_mask_embedding + object_id_embed
+            mask_embeddings.append(enhanced_embedding)
+        
+        if not mask_embeddings:
+            # No masks provided, use the no_mask embedding
+            return self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                B, -1, self.image_embedding_size[0], self.image_embedding_size[1]
+            )
+        
+        # Stack all embeddings
+        stacked_embeddings = torch.stack(mask_embeddings, dim=1)  # (B, N, embed_dim, h, w)
+        B, N, C, H, W = stacked_embeddings.shape
+        
+        # Method 1: Spatial-aware attention (applying attention across masks at each spatial location)
+        # Reshape to (B*H*W, N, C) - treating each spatial location separately
+        reshaped_emb = stacked_embeddings.permute(0, 3, 4, 1, 2).reshape(B*H*W, N, C)
+        
+        # Apply attention across the mask dimension for each spatial location
+        attn_output, _ = self.mask_attention(reshaped_emb, reshaped_emb, reshaped_emb)
+        
+        # Reshape back: (B*H*W, N, C) -> (B, H, W, N, C) -> (B, N, C, H, W)
+        attn_output = attn_output.reshape(B, H, W, N, C).permute(0, 3, 4, 1, 2)
+        
+        # Combine masks (weighted sum across mask dimension)
+        fused_embedding = torch.sum(attn_output, dim=1)  # (B, C, H, W)
+        
+        # Final projection to ensure proper embedding
+        final_embedding = self.mask_fusion(fused_embedding)
+        
+        return final_embedding
+
     def get_dense_pe(self) -> torch.Tensor:
         """
         Returns the positional encoding used to encode point prompts,
@@ -193,7 +266,9 @@ class PromptEncoder(nn.Module):
             sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
         if masks is not None:
-            dense_embeddings = self._embed_masks(masks)
+            print("masks in prompt enc", masks.shape)
+            dense_embeddings = self._embed_multi_masks(masks)
+            print("dense_embeddings", dense_embeddings.shape)
         else:
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]

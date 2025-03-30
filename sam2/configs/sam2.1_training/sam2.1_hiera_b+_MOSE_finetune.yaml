@@ -1,21 +1,21 @@
 # @package _global_
 
 scratch:
-  resolution: 1024
+  resolution: 512 #1024
   train_batch_size: 1
   num_train_workers: 10
   num_frames: 8
   max_num_objects: 3
   base_lr: 5.0e-6
-  vision_lr: 3.0e-06
+  vision_lr: 3.0e-05 #3.0e-06
   phases_per_epoch: 1
-  num_epochs: 40
+  num_epochs: 500
 
 dataset:
   # PATHS to Dataset
-  img_folder: null # PATH to MOSE JPEGImages folder
-  gt_folder: null  # PATH to MOSE Annotations folder
-  file_list_txt: training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  img_folder: /davis/DAVIS/JPEGImages_overfit
+  gt_folder: /davis/DAVIS/Annotations_overfit
+  file_list_txt: null
   multiplier: 2
 
 # Video transforms
@@ -178,14 +178,14 @@ trainer:
 
     ####### Training specific params #######
     # box/point input and corrections
-    prob_to_use_pt_input_for_train: 0.5
+    prob_to_use_pt_input_for_train: 0.0
     prob_to_use_pt_input_for_eval: 0.0
-    prob_to_use_box_input_for_train: 0.5  # 0.5*0.5 = 0.25 prob to use box instead of points
+    prob_to_use_box_input_for_train: 0.0  # 0.5*0.5 = 0.25 prob to use box instead of points
     prob_to_use_box_input_for_eval: 0.0
-    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
-    num_frames_to_correct_for_train: 2  # iteratively sample on random 1~2 frames (always include the first frame)
-    num_frames_to_correct_for_eval: 1  # only iteratively sample on first frame
-    rand_frames_to_correct_for_train: True  # random #init-cond-frame ~ 2
+    prob_to_sample_from_gt_for_train: 0.0  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    num_frames_to_correct_for_train: 0.0  # iteratively sample on random 1~2 frames (always include the first frame)
+    num_frames_to_correct_for_eval: 0.0  # only iteratively sample on first frame
+    rand_frames_to_correct_for_train: False  # random #init-cond-frame ~ 2
     add_all_frames_to_correct_as_cond: True  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
     # maximum 2 initial conditioning frames
     num_init_cond_frames_for_train: 2
@@ -300,10 +300,10 @@ trainer:
     tensorboard_writer:
       _target_: training.utils.logger.make_tensorboard_logger
       log_dir:  ${launcher.experiment_log_dir}/tensorboard
-      flush_secs: 120
+      flush_secs: 3
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
-    log_freq: 10
+    log_freq: 1
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
@@ -312,9 +312,17 @@ trainer:
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
-      strict: True
-      ignore_unexpected_keys: null
-      ignore_missing_keys: null
+      strict: False
+      #ignore_unexpected_keys: null
+      #ignore_missing_keys: null
+      ignore_unexpected_keys:
+        - "sam_mask_decoder.output_hypernetworks_mlps.3.*"  # Ignore all keys in hypernetwork MLP 3
+      ignore_missing_keys:
+        - "sam_prompt_encoder.object_id_embeddings.*"  # Ignore object ID embeddings
+        - "sam_prompt_encoder.mask_attention.*"        # Ignore mask attention
+        - "sam_prompt_encoder.mask_fusion.*"           # Ignore mask fusion
+        - "sam_mask_decoder.mask_tokens.*"             # Ignore mask tokens
+        - "sam_mask_decoder.iou_prediction_head.layers.2.*"  # Ignore additional IOU layer
 
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels

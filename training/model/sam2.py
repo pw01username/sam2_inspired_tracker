@@ -108,6 +108,7 @@ class SAM2Train(SAM2Base):
         if self.training or not self.forward_backbone_per_frame_for_eval:
             # precompute image features on all frames before tracking
             backbone_out = self.forward_image(input.flat_img_batch)
+            print(input.flat_img_batch.shape, "-----------------", torch.equal(input.flat_img_batch[:, 0], input.flat_img_batch[:, 1]))
         else:
             # defer image feature computation on a frame until it's being tracked
             backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}
@@ -160,6 +161,7 @@ class SAM2Train(SAM2Base):
         }
         # gt_masks_per_frame = input.masks.unsqueeze(2) # [T,B,1,H_im,W_im] keep everything in tensor form
         backbone_out["gt_masks_per_frame"] = gt_masks_per_frame
+
         num_frames = input.num_frames
         backbone_out["num_frames"] = num_frames
 
@@ -393,6 +395,9 @@ class SAM2Train(SAM2Base):
             object_score_logits,
         ) = sam_outputs
 
+        #print("mask output sam2 train high_res_masks", high_res_masks.shape) 
+        #print("mask output sam2 train: high_res_multimasks", high_res_multimasks.shape)
+
         current_out["multistep_pred_masks"] = low_res_masks
         current_out["multistep_pred_masks_high_res"] = high_res_masks
         current_out["multistep_pred_multimasks"] = [low_res_multimasks]
@@ -402,30 +407,30 @@ class SAM2Train(SAM2Base):
         current_out["multistep_object_score_logits"] = [object_score_logits]
 
         # Optionally, sample correction points iteratively to correct the mask
-        if frame_idx in frames_to_add_correction_pt:
-            point_inputs, final_sam_outputs = self._iter_correct_pt_sampling(
-                is_init_cond_frame,
-                point_inputs,
-                gt_masks,
-                high_res_features,
-                pix_feat,
-                low_res_multimasks,
-                high_res_multimasks,
-                ious,
-                low_res_masks,
-                high_res_masks,
-                object_score_logits,
-                current_out,
-            )
-            (
-                _,
-                _,
-                _,
-                low_res_masks,
-                high_res_masks,
-                obj_ptr,
-                object_score_logits,
-            ) = final_sam_outputs
+        # if frame_idx in frames_to_add_correction_pt:
+        #     point_inputs, final_sam_outputs = self._iter_correct_pt_sampling(
+        #         is_init_cond_frame,
+        #         point_inputs,
+        #         gt_masks,
+        #         high_res_features,
+        #         pix_feat,
+        #         low_res_multimasks,
+        #         high_res_multimasks,
+        #         ious,
+        #         low_res_masks,
+        #         high_res_masks,
+        #         object_score_logits,
+        #         current_out,
+        #     )
+        #     (
+        #         _,
+        #         _,
+        #         _,
+        #         low_res_masks,
+        #         high_res_masks,
+        #         obj_ptr,
+        #         object_score_logits,
+        #     ) = final_sam_outputs
 
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks

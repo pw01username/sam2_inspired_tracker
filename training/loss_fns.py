@@ -7,6 +7,7 @@
 from collections import defaultdict
 from typing import Dict, List
 
+import os
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -16,6 +17,7 @@ from training.trainer import CORE_LOSS_KEY
 
 from training.utils.distributed import get_world_size, is_dist_avail_and_initialized
 
+from training.utils.visualize import visualize_frame, quick_visualize_mask
 
 def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
     """
@@ -164,6 +166,9 @@ class MultiStepMultiMasksAndIous(nn.Module):
         self.iou_use_l1_loss = iou_use_l1_loss
         self.pred_obj_scores = pred_obj_scores
 
+        # Viz
+        self.iteration = 0
+
     def forward(self, outs_batch: List[Dict], targets_batch: torch.Tensor):
         assert len(outs_batch) == len(targets_batch)
         num_objects = torch.tensor(
@@ -179,6 +184,40 @@ class MultiStepMultiMasksAndIous(nn.Module):
             for k, v in cur_losses.items():
                 losses[k] += v
 
+        # Visualize masks
+        if True:
+            # Save visualization only on the main process in distributed training
+            if not is_dist_avail_and_initialized() or torch.distributed.get_rank() == 0:
+                # Create a base directory for this iteration
+                base_save_dir = os.path.join('mask_drawings', f"iter_{self.iteration}")
+                os.makedirs(base_save_dir, exist_ok=True)
+                
+                # Process each batch item (frame)
+                for batch_idx in range(len(outs_batch)):
+                    #print("batch length: ", len(targets_batch))
+
+                    if batch_idx < len(outs_batch):
+                        # Create a directory for this specific frame
+                        frame_save_dir = os.path.join(base_save_dir, f"frame_{batch_idx}")
+                        os.makedirs(frame_save_dir, exist_ok=True)
+                        
+                        # Get the data for this frame
+                        outs = outs_batch[batch_idx]
+                        targets = targets_batch[batch_idx]
+                        #print(f"Batch shape, targets:", len(outs["multistep_pred_multimasks_high_res"]), outs["multistep_pred_multimasks_high_res"][0].shape, ", preds: ", targets.shape)
+                        
+                        # Visualize this frame
+                        visualize_frame(
+                            outs,
+                            targets,
+                            self.iteration,
+                            frame_save_dir,
+                            batch_idx
+                        )
+                        
+                        #print(f"Visualization saved for frame {batch_idx} at iteration {self.iteration}")
+                
+        self.iteration += 1
         return losses
 
     def _forward(self, outputs: Dict, targets: torch.Tensor, num_objects):
@@ -200,7 +239,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         src_masks_list = outputs["multistep_pred_multimasks_high_res"]
         ious_list = outputs["multistep_pred_ious"]
         object_score_logits_list = outputs["multistep_object_score_logits"]
-
+        #print("len src and iou masks", len(src_masks_list), len(ious_list), src_masks_list[0].shape, ious_list[0].shape)
         assert len(src_masks_list) == len(ious_list)
         assert len(object_score_logits_list) == len(ious_list)
 
@@ -218,7 +257,21 @@ class MultiStepMultiMasksAndIous(nn.Module):
     def _update_losses(
         self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
     ):
+        print("src_masks", src_masks.shape)
+        quick_visualize_mask(src_masks[0, 0], "src predicted mask 00.png")
+        #quick_visualize_mask(src_masks[1, 0], "src predicted mask 10.png")
+        loss_as_one = sigmoid_focal_loss(
+            src_masks[:, 0:1],
+            target_masks,
+            num_objects,
+            alpha=self.focal_alpha,
+            gamma=self.focal_gamma,
+            loss_on_multimask=True,
+        )
+
+
         target_masks = target_masks.expand_as(src_masks)
+        
         # get focal, dice and iou loss on all output masks in a prediction step
         loss_multimask = sigmoid_focal_loss(
             src_masks,
@@ -228,6 +281,10 @@ class MultiStepMultiMasksAndIous(nn.Module):
             gamma=self.focal_gamma,
             loss_on_multimask=True,
         )
+
+        print("src masks shape: ", src_masks.shape, ". loss as first: ", loss_as_one.shape, 
+        ". loss as expanded targets: ", loss_multimask.shape, ". averages:", loss_as_one.nanmean(), loss_multimask.nanmean())
+
         loss_multidice = dice_loss(
             src_masks, target_masks, num_objects, loss_on_multimask=True
         )

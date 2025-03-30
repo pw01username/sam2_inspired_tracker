@@ -82,7 +82,7 @@ def build_sam2(
         hydra_overrides_extra = hydra_overrides_extra.copy()
         hydra_overrides_extra += [
             # dynamically fall back to multi-mask if the single mask is not stable
-            "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=false",
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta=0.05",
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
         ]
@@ -120,7 +120,7 @@ def build_sam2_video_predictor(
         hydra_overrides_extra = hydra_overrides_extra.copy()
         hydra_overrides_extra += [
             # dynamically fall back to multi-mask if the single mask is not stable
-            "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=false",
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta=0.05",
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
             # the sigmoid mask logits on interacted frames with clicks in the memory encoder so that the encoded masks are exactly as what users see from clicking

@@ -166,6 +166,7 @@ def collate_fn(
     frame_orig_size = torch.stack(
         [torch.stack(id, dim=0) for id in step_t_frame_orig_size], dim=0
     )
+    
     return BatchedVideoDatapoint(
         img_batch=img_batch,
         obj_to_frame_idx=obj_to_frame_idx,

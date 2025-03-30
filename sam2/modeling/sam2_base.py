@@ -15,6 +15,8 @@ from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 
+from training.utils.visualize import quick_visualize_mask
+
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
 
@@ -221,7 +223,7 @@ class SAM2Base(torch.nn.Module):
             mask_in_chans=16,
         )
         self.sam_mask_decoder = MaskDecoder(
-            num_multimask_outputs=3,
+            num_multimask_outputs=2,
             transformer=TwoWayTransformer(
                 depth=2,
                 embedding_dim=self.sam_prompt_embed_dim,
@@ -358,7 +360,6 @@ class SAM2Base(torch.nn.Module):
         )
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
-
             # Mask used for spatial memories is always a *hard* choice between obj and no obj,
             # consistent with the actual mask prediction
             low_res_multimasks = torch.where(
@@ -366,6 +367,7 @@ class SAM2Base(torch.nn.Module):
                 low_res_multimasks,
                 NO_OBJ_SCORE,
             )
+
 
         # convert masks from possibly bfloat16 (or float16) to float32
         # (older PyTorch versions before 2.1 don't support `interpolate` on bf16)
@@ -388,6 +390,9 @@ class SAM2Base(torch.nn.Module):
                 sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
         else:
             low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
+
+        # OVERRIDE to give out all masks from decoder
+        low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
         # Extract object pointer from the SAM output token (with occlusion handling)
         obj_ptr = self.obj_ptr_proj(sam_output_token)
@@ -708,6 +713,11 @@ class SAM2Base(torch.nn.Module):
             mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
         if self.sigmoid_bias_for_mem_enc != 0.0:
             mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
+        
+        #print("mask for mem shape", mask_for_mem.shape, torch.equal(mask_for_mem[0], mask_for_mem[1]))
+        #quick_visualize_mask(mask_for_mem[0, 0], "maskmem00.png")
+        #quick_visualize_mask(mask_for_mem[1, 0], "maskmem10.png")
+
         maskmem_out = self.memory_encoder(
             pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
         )

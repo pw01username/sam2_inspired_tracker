@@ -18,7 +18,7 @@ class MaskDecoder(nn.Module):
         *,
         transformer_dim: int,
         transformer: nn.Module,
-        num_multimask_outputs: int = 3,
+        num_multimask_outputs: int = 10,
         activation: Type[nn.Module] = nn.GELU,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
@@ -29,7 +29,7 @@ class MaskDecoder(nn.Module):
         dynamic_multimask_stability_thresh=0.98,
         pred_obj_scores: bool = False,
         pred_obj_scores_mlp: bool = False,
-        use_multimask_token_for_obj_ptr: bool = False,
+        use_multimask_token_for_obj_ptr: bool = True, #False,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -143,24 +143,25 @@ class MaskDecoder(nn.Module):
         )
 
         # Select the correct mask or masks for output
-        if multimask_output:
-            masks = masks[:, 1:, :, :]
-            iou_pred = iou_pred[:, 1:]
-        elif self.dynamic_multimask_via_stability and not self.training:
-            masks, iou_pred = self._dynamic_multimask_via_stability(masks, iou_pred)
-        else:
-            masks = masks[:, 0:1, :, :]
-            iou_pred = iou_pred[:, 0:1]
+        # if multimask_output:
+        #     masks = masks[:, 1:, :, :]
+        #     iou_pred = iou_pred[:, 1:]
+        # elif self.dynamic_multimask_via_stability and not self.training:
+        #     masks, iou_pred = self._dynamic_multimask_via_stability(masks, iou_pred)
+        # else:
+        #     masks = masks[:, 0:1, :, :]
+        #     iou_pred = iou_pred[:, 0:1]
 
-        if multimask_output and self.use_multimask_token_for_obj_ptr:
-            sam_tokens_out = mask_tokens_out[:, 1:]  # [b, 3, c] shape
-        else:
-            # Take the mask output token. Here we *always* use the token for single mask output.
-            # At test time, even if we track after 1-click (and using multimask_output=True),
-            # we still take the single mask token here. The rationale is that we always track
-            # after multiple clicks during training, so the past tokens seen during training
-            # are always the single mask token (and we'll let it be the object-memory token).
-            sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
+        # if multimask_output and self.use_multimask_token_for_obj_ptr:
+        #     sam_tokens_out = mask_tokens_out[:, 1:]  # [b, 3, c] shape
+        # else:
+        #     # Take the mask output token. Here we *always* use the token for single mask output.
+        #     # At test time, even if we track after 1-click (and using multimask_output=True),
+        #     # we still take the single mask token here. The rationale is that we always track
+        #     # after multiple clicks during training, so the past tokens seen during training
+        #     # are always the single mask token (and we'll let it be the object-memory token).
+        #     sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
+        sam_tokens_out = mask_tokens_out
 
         # Prepare output
         return masks, iou_pred, sam_tokens_out, object_score_logits
@@ -241,7 +242,7 @@ class MaskDecoder(nn.Module):
         else:
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
-
+        
         return masks, iou_pred, mask_tokens_out, object_score_logits
 
     def _get_stability_scores(self, mask_logits):

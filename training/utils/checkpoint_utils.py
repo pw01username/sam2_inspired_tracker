@@ -330,7 +330,7 @@ def check_load_state_dict_errors(
 def load_state_dict_into_model(
     state_dict: Dict,
     model: nn.Module,
-    strict: bool = True,
+    strict: bool = False,
     ignore_missing_keys: List[str] = None,
     ignore_unexpected_keys: List[str] = None,
     checkpoint_kernels: List[Callable] = None,
@@ -349,7 +349,78 @@ def load_state_dict_into_model(
     if checkpoint_kernels is not None:
         for f in checkpoint_kernels:
             state_dict = f(state_dict=state_dict)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+    # Get current model state
+    model_dict = model.state_dict()
+    
+    # First attempt to load state dict and catch errors
+    try:
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        print(f"State dict loaded successfully with {len(missing_keys)} missing keys and {len(unexpected_keys)} unexpected keys.")
+    except RuntimeError as e:
+        print(f"Encountered shape mismatch errors, handling with random initialization for mismatched shapes...")
+        
+        # Find keys with shape mismatches
+        filtered_state_dict = {}
+        shape_mismatch_keys = []
+        
+        for key, checkpoint_tensor in state_dict.items():
+            if key in model_dict:
+                if checkpoint_tensor.shape == model_dict[key].shape:
+                    filtered_state_dict[key] = checkpoint_tensor
+                else:
+                    shape_mismatch_keys.append(key)
+            else:
+                # Keep unexpected keys as-is
+                filtered_state_dict[key] = checkpoint_tensor
+        
+        # Print shape mismatch information
+        if shape_mismatch_keys:
+            print(f"Found {len(shape_mismatch_keys)} keys with shape mismatches:")
+            for key in shape_mismatch_keys:
+                print(f"  {key}: checkpoint shape {state_dict[key].shape}, model shape {model_dict[key].shape}")
+        
+        # Load filtered state dict
+        missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
+        
+        # Keep track of all keys that didn't get loaded properly
+        all_problem_keys = set(missing_keys + shape_mismatch_keys)
+        print(f"Total keys requiring random initialization: {len(all_problem_keys)}")
+    finally:
+        # Randomly initialize missing keys
+        if missing_keys:
+            print(f"Randomly initializing {len(missing_keys)} missing keys:")
+            for key in missing_keys:
+                if key in model_dict:  # Safety check
+                    param = model_dict[key]
+                    
+                    # Choose initialization strategy based on parameter name and shape
+                    if 'embedding' in key:
+                        # For embedding layers
+                        nn.init.normal_(param, mean=0.0, std=0.02)
+                        print(f"  Initialized {key} with normal distribution (std=0.02)")
+                    elif 'weight' in key:
+                        if len(param.shape) >= 2:
+                            # For weights of linear and conv layers
+                            nn.init.xavier_uniform_(param)
+                            print(f"  Initialized {key} with Xavier uniform")
+                        else:
+                            # For 1D weights (unusual, but possible)
+                            nn.init.normal_(param, mean=0.0, std=0.01)
+                            print(f"  Initialized {key} with normal distribution (std=0.01)")
+                    elif 'bias' in key:
+                        # For bias terms
+                        nn.init.zeros_(param)
+                        print(f"  Initialized {key} with zeros")
+                    else:
+                        # For other parameters
+                        nn.init.normal_(param, mean=0.0, std=0.01)
+                        print(f"  Initialized {key} with normal distribution (std=0.01)")
+                    
+                    # Update the state dict with the newly initialized parameter
+                    state_dict[key] = param
+    
+
 
     check_load_state_dict_errors(
         missing_keys,

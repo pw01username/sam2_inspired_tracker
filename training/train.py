@@ -127,7 +127,7 @@ def main(args) -> None:
             os.getcwd(), "sam2_logs", args.config
         )
     print("###################### Train App Config ####################")
-    print(OmegaConf.to_yaml(cfg))
+    #print(OmegaConf.to_yaml(cfg))
     print("############################################################")
 
     add_pythonpath_to_sys_path()
@@ -221,7 +221,7 @@ def main(args) -> None:
                 )
 
         print("###################### SLURM Config ####################")
-        print(job_kwargs)
+        #print(job_kwargs)
         print("##########################################")
         executor.update_parameters(**job_kwargs)
 
