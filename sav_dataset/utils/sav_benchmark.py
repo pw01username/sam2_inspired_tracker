@@ -316,7 +316,7 @@ class Evaluator:
 def benchmark(
     gt_roots,
     mask_roots,
-    strict=True,
+    strict=False,
     num_processes=None,
     *,
     verbose=True,

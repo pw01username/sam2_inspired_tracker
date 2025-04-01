@@ -109,7 +109,11 @@ class SAM2Base(torch.nn.Module):
             # A conv layer to downsample the mask prompt to stride 4 (the same stride as
             # low-res SAM mask logits) and to change its scales from 0~1 to SAM logit scale,
             # so that it can be fed into the SAM mask decoder to generate a pointer.
-            self.mask_downsample = torch.nn.Conv2d(1, 1, kernel_size=4, stride=4)
+            
+            # this supports original SAM2 with only 1 mask input per batch
+            #self.mask_downsample = torch.nn.Conv2d(1, 1, kernel_size=4, stride=4)
+
+            self.mask_downsample = torch.nn.Conv2d(3, 3, kernel_size=4, stride=4)
         self.add_tpos_enc_to_obj_ptrs = add_tpos_enc_to_obj_ptrs
         if proj_tpos_enc_in_obj_ptrs:
             assert add_tpos_enc_to_obj_ptrs  # these options need to be used together
@@ -169,7 +173,7 @@ class SAM2Base(torch.nn.Module):
         self.fixed_no_obj_ptr = fixed_no_obj_ptr
         self.soft_no_obj_ptr = soft_no_obj_ptr
         if self.fixed_no_obj_ptr:
-            assert self.pred_obj_scores
+            # DEBUG REMOVING TO ALLOW THE OPTION TO MATTER assert self.pred_obj_scores
             assert self.use_obj_ptrs_in_encoder
         if self.pred_obj_scores and self.use_obj_ptrs_in_encoder:
             self.no_obj_ptr = torch.nn.Parameter(torch.zeros(1, self.hidden_dim))
@@ -323,7 +327,7 @@ class SAM2Base(torch.nn.Module):
         if mask_inputs is not None:
             # If mask_inputs is provided, downsize it into low-res mask input if needed
             # and feed it as a dense mask prompt into the SAM mask encoder
-            assert len(mask_inputs.shape) == 4 and mask_inputs.shape[:2] == (B, 1)
+            # WE ALLOW THIS TO BE FALSE BECAUSE WE ARE NOT DOING ONE SEPARATE PREDICTION PER GT MASK ANYMORE -> assert len(mask_inputs.shape) == 4 and mask_inputs.shape[:2] == (B, 1)
             if mask_inputs.shape[-2:] != self.sam_prompt_encoder.mask_input_size:
                 sam_mask_prompt = F.interpolate(
                     mask_inputs.float(),
@@ -338,6 +342,10 @@ class SAM2Base(torch.nn.Module):
             # Otherwise, simply feed None (and SAM's prompt encoder will add
             # a learned `no_mask_embed` to indicate no mask input in this case).
             sam_mask_prompt = None
+        if sam_mask_prompt != None:
+            print("sam_mask_prompt ", sam_mask_prompt.shape)
+        if backbone_features is not None and sam_mask_prompt is not None:
+            print("in sam2base sam mask prompt shape:", sam_mask_prompt.shape, ". backbone feature shape: ", backbone_features.shape)
 
         sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
             points=(sam_point_coords, sam_point_labels),
@@ -359,11 +367,15 @@ class SAM2Base(torch.nn.Module):
             high_res_features=high_res_features,
         )
         if self.pred_obj_scores:
+            #print("object_score_logits", object_score_logits.shape, low_res_multimasks.shape)
             is_obj_appearing = object_score_logits > 0
+            is_obj_appearing = is_obj_appearing[:, :, None, None]  # Shape becomes [1, 3, 1, 1]
+            
             # Mask used for spatial memories is always a *hard* choice between obj and no obj,
             # consistent with the actual mask prediction
             low_res_multimasks = torch.where(
-                is_obj_appearing[:, None, None],
+                #is_obj_appearing[:, None, None],
+                is_obj_appearing,
                 low_res_multimasks,
                 NO_OBJ_SCORE,
             )
@@ -393,9 +405,11 @@ class SAM2Base(torch.nn.Module):
 
         # OVERRIDE to give out all masks from decoder
         low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
+        #print("low and high res", low_res_masks.shape, high_res_masks.shape, "--------------------------------")
 
         # Extract object pointer from the SAM output token (with occlusion handling)
         obj_ptr = self.obj_ptr_proj(sam_output_token)
+        print("_________________________________________________", sam_output_token.shape, obj_ptr.shape)
         if self.pred_obj_scores:
             # Allow *soft* no obj ptr, unlike for masks
             if self.soft_no_obj_ptr:
@@ -406,6 +420,10 @@ class SAM2Base(torch.nn.Module):
             if self.fixed_no_obj_ptr:
                 obj_ptr = lambda_is_obj_appearing * obj_ptr
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
+        
+        # Take just obj appearing logits from first mask as we only memory encode first mask and obj ptr for now anyways as well.abs
+        obj_ptr = obj_ptr[:, 0:1]
+        print("_________________________________________________", sam_output_token.shape, obj_ptr.shape)
 
         return (
             low_res_multimasks,
@@ -512,6 +530,7 @@ class SAM2Base(torch.nn.Module):
     ):
         """Fuse the current frame's visual feature map with previous memory."""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
+        print("BATCH SIZE IN PREPARE MEM COND FEATURES", B)
         C = self.hidden_dim
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         device = current_vision_feats[-1].device
@@ -578,6 +597,7 @@ class SAM2Base(torch.nn.Module):
                 # "maskmem_features" might have been offloaded to CPU in demo use cases,
                 # so we load it back to GPU (it's a no-op if it's already on GPU).
                 feats = prev["maskmem_features"].to(device, non_blocking=True)
+                print("feats shape", feats.shape)
                 to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
                 # Spatial positional encoding (it might have been offloaded to CPU in eval)
                 maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
@@ -623,11 +643,17 @@ class SAM2Base(torch.nn.Module):
                     )
                     if out is not None:
                         pos_and_ptrs.append((t_diff, out["obj_ptr"]))
+
+                if out is not None:
+                    print(out["obj_ptr"].shape, "<-------------- obj ptr", len(pos_and_ptrs))
+                print("--------------------", len(pos_and_ptrs))
+
                 # If we have at least one object pointer, add them to the across attention
                 if len(pos_and_ptrs) > 0:
                     pos_list, ptrs_list = zip(*pos_and_ptrs)
                     # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
                     obj_ptrs = torch.stack(ptrs_list, dim=0)
+                    print("obj ptrs shape", obj_ptrs.shape)
                     # a temporal positional embedding based on how far each object pointer is from
                     # the current frame (sine embedding normalized by the max pointer num).
                     if self.add_tpos_enc_to_obj_ptrs:
@@ -669,6 +695,11 @@ class SAM2Base(torch.nn.Module):
         memory = torch.cat(to_cat_memory, dim=0)
         memory_pos_embed = torch.cat(to_cat_memory_pos_embed, dim=0)
 
+        for m in to_cat_memory:
+            print("to_cat_memory:", m.shape)
+        print(len(current_vision_feats), current_vision_feats[0].shape, num_obj_ptr_tokens)
+        print(memory.shape, memory_pos_embed.shape)
+
         pix_feat_with_mem = self.memory_attention(
             curr=current_vision_feats,
             curr_pos=current_vision_pos_embeds,
@@ -694,6 +725,8 @@ class SAM2Base(torch.nn.Module):
         H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
         # top-level feature, (HW)BC => BCHW
         pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
+        print("batch size in encode new memory", B, "pix feat shape", pix_feat.shape, ". pred masks: ", pred_masks_high_res.shape)
+
         if self.non_overlap_masks_for_mem_enc and not self.training:
             # optionally, apply non-overlapping constraints to the masks (it's applied
             # in the batch dimension and should only be used during eval, where all
@@ -708,13 +741,14 @@ class SAM2Base(torch.nn.Module):
         else:
             # apply sigmoid on the raw mask logits to turn them into range (0, 1)
             mask_for_mem = torch.sigmoid(pred_masks_high_res)
+        
         # apply scale and bias terms to the sigmoid probabilities
         if self.sigmoid_scale_for_mem_enc != 1.0:
             mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
         if self.sigmoid_bias_for_mem_enc != 0.0:
             mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
         
-        #print("mask for mem shape", mask_for_mem.shape, torch.equal(mask_for_mem[0], mask_for_mem[1]))
+        print("mask for mem shape", mask_for_mem.shape)
         #quick_visualize_mask(mask_for_mem[0, 0], "maskmem00.png")
         #quick_visualize_mask(mask_for_mem[1, 0], "maskmem10.png")
 
@@ -722,13 +756,17 @@ class SAM2Base(torch.nn.Module):
             pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
         )
         maskmem_features = maskmem_out["vision_features"]
+        print("maskmem_features shape", maskmem_features.shape)
         maskmem_pos_enc = maskmem_out["vision_pos_enc"]
         # add a no-object embedding to the spatial memory to indicate that the frame
         # is predicted to be occluded (i.e. no object is appearing in the frame)
         if self.no_obj_embed_spatial is not None:
-            is_obj_appearing = (object_score_logits > 0).float()
+            # Option 1: Use only the first score if we want to use just one prediction
+            is_obj_appearing = (object_score_logits > 0).float()[:, 0:1]  # shape: [1, 1]
+            is_obj_appearing = is_obj_appearing[:, :, None, None]  # Shape becomes [1, 1, 1, 1]
+            
             maskmem_features += (
-                1 - is_obj_appearing[..., None, None]
+                1 - is_obj_appearing
             ) * self.no_obj_embed_spatial[..., None, None].expand(
                 *maskmem_features.shape
             )
@@ -786,6 +824,7 @@ class SAM2Base(torch.nn.Module):
                 assert point_inputs is not None and mask_inputs is None
                 mask_inputs = prev_sam_mask_logits
             multimask_output = self._use_multimask(is_init_cond_frame, point_inputs)
+            print("high_res_features", len(high_res_features), high_res_features[0].shape)
             sam_outputs = self._forward_sam_heads(
                 backbone_features=pix_feat,
                 point_inputs=point_inputs,

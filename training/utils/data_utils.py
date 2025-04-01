@@ -15,6 +15,8 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 
+from training.utils.visualize import visualize_frame, quick_visualize_mask, visualize_4d_tensor, quick_visualize_rgb
+
 from PIL import Image as PILImage
 from tensordict import tensorclass
 
@@ -124,6 +126,7 @@ def collate_fn(
     for video in batch:
         img_batch += [torch.stack([frame.data for frame in video.frames], dim=0)]
 
+    quick_visualize_rgb(*video.frames[0].data[0:3], "video frame.png")
     img_batch = torch.stack(img_batch, dim=0).permute((1, 0, 2, 3, 4))
     T = img_batch.shape[0]
     # Prepare data structures for sequential processing. Per-frame processing but batched across videos.

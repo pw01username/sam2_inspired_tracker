@@ -12,12 +12,12 @@ import torch
 import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
-
+import numpy as np
 from training.trainer import CORE_LOSS_KEY
 
 from training.utils.distributed import get_world_size, is_dist_avail_and_initialized
 
-from training.utils.visualize import visualize_frame, quick_visualize_mask
+from training.utils.visualize import visualize_frame, quick_visualize_mask, visualize_4d_tensor
 
 def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
     """
@@ -115,6 +115,14 @@ def iou_loss(
     area_i = torch.sum(pred_mask & gt_mask, dim=-1).float()
     area_u = torch.sum(pred_mask | gt_mask, dim=-1).float()
     actual_ious = area_i / torch.clamp(area_u, min=1.0)
+
+    print(f"DEBUG - pred_ious shape: {pred_ious.shape}, actual_ious shape: {actual_ious.shape}")
+    
+    # Expand pred_ious to match actual_ious if needed
+    if pred_ious.shape[1] != actual_ious.shape[1]:
+        print(f"Expanding pred_ious from {pred_ious.shape} to match actual_ious {actual_ious.shape}")
+        pred_ious = pred_ious.expand(-1, actual_ious.shape[1])
+        print(f"New pred_ious shape: {pred_ious.shape}")
 
     if use_l1_loss:
         loss = F.l1_loss(pred_ious, actual_ious, reduction="none")
@@ -233,9 +241,18 @@ class MultiStepMultiMasksAndIous(nn.Module):
         with the lowest focal+dice loss between predicted mask and ground-truth.
         If `supervise_all_iou` is True, we backpropagate ious losses for all predicted masks.
         """
-
-        target_masks = targets.unsqueeze(1).float()
-        assert target_masks.dim() == 4  # [N, 1, H, W]
+        # original sam2 does this, but we need to unsqueeze on 0 dim instead
+        #target_masks = targets.unsqueeze(1).float()
+        #assert target_masks.dim() == 4  # [N, 1, H, W]
+        
+        if targets.dim() == 3:
+            # Add batch dimension if not present
+            target_masks = targets.unsqueeze(0).float()
+        else:
+            # If targets already have batch dimension [B, N, H, W]
+            target_masks = targets.float()
+        assert target_masks.dim() == 4  # [B, N, H, W]
+        
         src_masks_list = outputs["multistep_pred_multimasks_high_res"]
         ious_list = outputs["multistep_pred_ious"]
         object_score_logits_list = outputs["multistep_object_score_logits"]
@@ -252,16 +269,25 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 losses, src_masks, target_masks, ious, num_objects, object_score_logits
             )
         losses[CORE_LOSS_KEY] = self.reduce_loss(losses)
+        
         return losses
 
     def _update_losses(
         self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
     ):
-        print("src_masks", src_masks.shape)
-        quick_visualize_mask(src_masks[0, 0], "src predicted mask 00.png")
+        print("src_masks", src_masks.shape, ". target masks", target_masks.shape)
+        # if src_masks.shape[1] > 1: # print difference on first and last mask predicted
+        #     print("first and last prediction equal?", torch.equal(src_masks[0, 0], src_masks[0, 2]))
+        #     diff = src_masks.detach().cpu()[0, 0] - src_masks.detach().cpu()[0, 2]
+        #     quick_visualize_mask(np.abs(diff), f"DIFFERENCE.png")
+        #     quick_visualize_mask(src_masks.detach().cpu()[0, 0], "first.png")
+        #     quick_visualize_mask(src_masks.detach().cpu()[0, 2], "sec.png")
+        #     print("diff: ", diff)
+        visualize_4d_tensor(src_masks, f"src_predicted_mask_{self.iteration}.png")
+        
         #quick_visualize_mask(src_masks[1, 0], "src predicted mask 10.png")
         loss_as_one = sigmoid_focal_loss(
-            src_masks[:, 0:1],
+            src_masks,
             target_masks,
             num_objects,
             alpha=self.focal_alpha,
@@ -271,6 +297,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
 
 
         target_masks = target_masks.expand_as(src_masks)
+        print("t mask after exp", target_masks.shape)
         
         # get focal, dice and iou loss on all output masks in a prediction step
         loss_multimask = sigmoid_focal_loss(
@@ -299,11 +326,12 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 device=loss_multimask.device,
             )
         else:
-            target_obj = torch.any((target_masks[:, 0] > 0).flatten(1), dim=-1)[
+            target_obj = torch.any((target_masks[:, :3] > 0).flatten(1), dim=-1)[
                 ..., None
             ].float()
+            print("tar", target_obj.shape, object_score_logits.shape)
             loss_class = sigmoid_focal_loss(
-                object_score_logits,
+                object_score_logits[:, 0:1],
                 target_obj,
                 num_objects,
                 alpha=self.focal_alpha_obj_score,
@@ -321,31 +349,41 @@ class MultiStepMultiMasksAndIous(nn.Module):
         assert loss_multimask.dim() == 2
         assert loss_multidice.dim() == 2
         assert loss_multiiou.dim() == 2
-        if loss_multimask.size(1) > 1:
-            # take the mask indices with the smallest focal + dice loss for back propagation
-            loss_combo = (
-                loss_multimask * self.weight_dict["loss_mask"]
-                + loss_multidice * self.weight_dict["loss_dice"]
-            )
-            best_loss_inds = torch.argmin(loss_combo, dim=-1)
-            batch_inds = torch.arange(loss_combo.size(0), device=loss_combo.device)
-            loss_mask = loss_multimask[batch_inds, best_loss_inds].unsqueeze(1)
-            loss_dice = loss_multidice[batch_inds, best_loss_inds].unsqueeze(1)
-            # calculate the iou prediction and slot losses only in the index
-            # with the minimum loss for each mask (to be consistent w/ SAM)
-            if self.supervise_all_iou:
-                loss_iou = loss_multiiou.mean(dim=-1).unsqueeze(1)
-            else:
-                loss_iou = loss_multiiou[batch_inds, best_loss_inds].unsqueeze(1)
-        else:
-            loss_mask = loss_multimask
-            loss_dice = loss_multidice
-            loss_iou = loss_multiiou
+        # Original code selected best of multimasks, we predict different objects in each multimask channel now.
+        # if loss_multimask.size(1) > 1:
+        #     # take the mask indices with the smallest focal + dice loss for back propagation
+        #     loss_combo = (
+        #         loss_multimask * self.weight_dict["loss_mask"]
+        #         + loss_multidice * self.weight_dict["loss_dice"]
+        #     )
+        #     best_loss_inds = torch.argmin(loss_combo, dim=-1)
+        #     batch_inds = torch.arange(loss_combo.size(0), device=loss_combo.device)
+        #     loss_mask = loss_multimask[batch_inds, best_loss_inds].unsqueeze(1)
+        #     loss_dice = loss_multidice[batch_inds, best_loss_inds].unsqueeze(1)
+        #     # calculate the iou prediction and slot losses only in the index
+        #     # with the minimum loss for each mask (to be consistent w/ SAM)
+        #     if self.supervise_all_iou:
+        #         loss_iou = loss_multiiou.mean(dim=-1).unsqueeze(1)
+        #     else:
+        #         loss_iou = loss_multiiou[batch_inds, best_loss_inds].unsqueeze(1)
+        # else:
+        #     loss_mask = loss_multimask
+        #     loss_dice = loss_multidice
+        #     loss_iou = loss_multiiou
+        
+        # Therefore select the multimask loss as loss
+        loss_mask = loss_multimask
+        loss_dice = loss_multidice
+        loss_iou = loss_multiiou
 
         # backprop focal, dice and iou loss only if obj present
-        loss_mask = loss_mask * target_obj
-        loss_dice = loss_dice * target_obj
-        loss_iou = loss_iou * target_obj
+        # loss_mask = loss_mask * target_obj
+        # loss_dice = loss_dice * target_obj
+        # loss_iou = loss_iou * target_obj
+
+        loss_mask = loss_mask * target_obj.unsqueeze(-1) if target_obj.dim() < loss_mask.dim() else loss_mask * target_obj
+        loss_dice = loss_dice * target_obj.unsqueeze(-1) if target_obj.dim() < loss_dice.dim() else loss_dice * target_obj
+        loss_iou = loss_iou * target_obj.unsqueeze(-1) if target_obj.dim() < loss_iou.dim() else loss_iou * target_obj
 
         # sum over batch dimension (note that the losses are already divided by num_objects)
         losses["loss_mask"] += loss_mask.sum()

@@ -97,9 +97,16 @@ class MaskDecoder(nn.Module):
             sigmoid_output=iou_prediction_use_sigmoid,
         )
         if self.pred_obj_scores:
-            self.pred_obj_score_head = nn.Linear(transformer_dim, 1)
+            # for original:
+            # self.pred_obj_score_head = nn.Linear(transformer_dim, 1)
+            # if pred_obj_scores_mlp:
+            #     self.pred_obj_score_head = MLP(transformer_dim, transformer_dim, 1, 3)
+
+            # for multi obj
             if pred_obj_scores_mlp:
-                self.pred_obj_score_head = MLP(transformer_dim, transformer_dim, 1, 3)
+                self.pred_obj_score_head = MLP(transformer_dim, transformer_dim, self.num_mask_tokens, 3)
+            else:
+                self.pred_obj_score_head = nn.Linear(transformer_dim, self.num_mask_tokens)
 
         # When outputting a single mask, optionally we can dynamically fall back to the best
         # multimask output token if the single mask output token gives low stability scores.
@@ -212,6 +219,7 @@ class MaskDecoder(nn.Module):
 
         # Run the transformer
         hs, src = self.transformer(src, pos_src, tokens)
+        #print("hs shape, s", hs.shape, s)
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
 

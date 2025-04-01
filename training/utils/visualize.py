@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
+from matplotlib.gridspec import GridSpec
 
 # Only modify the visualize_frame function to iterate through all predictions
 def visualize_frame(
@@ -147,6 +148,185 @@ def visualize_frame(
         print(f"Error in visualize_frame for frame {frame_idx}: {e}")
         import traceback
         traceback.print_exc()
+
+
+def visualize_4d_tensor(tensor, filepath, cmap='gray', figsize=None, title=None, 
+                       add_colorbar=False, normalize=True):
+    """
+    Visualize a 4D tensor as a grid of 2D visualizations.
+    
+    Args:
+        tensor: A 4D tensor with shape [dim0, dim1, height, width]
+              dim0 will be arranged as rows, dim1 as columns in the grid
+        filepath: Path to save the visualization
+        cmap: Colormap to use (default: 'gray')
+        figsize: Custom figure size as (width, height) in inches
+        title: Optional title for the plot
+        add_colorbar: Whether to add a colorbar to each subplot
+        normalize: Whether to normalize each subplot individually (default: True)
+    """
+    # Convert tensor to numpy if it's a PyTorch tensor
+    if torch.is_tensor(tensor):
+        tensor_numpy = tensor.detach().cpu().numpy()
+    else:
+        tensor_numpy = tensor
+    
+    # Check that input has 4 dimensions
+    if len(tensor_numpy.shape) != 4:
+        raise ValueError(f"Expected 4D tensor, got shape {tensor_numpy.shape}")
+    
+    dim0, dim1, height, width = tensor_numpy.shape
+    
+    # Calculate figure size if not provided
+    if figsize is None:
+        # Calculate size based on grid dimensions with some fixed aspect ratio
+        base_size = 3
+        figsize = (base_size * dim1, base_size * dim0)
+    
+    # Create figure and gridspec
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(dim0, dim1, figure=fig)
+    
+    # Add overall title if provided
+    if title:
+        fig.suptitle(title, fontsize=16)
+    
+    # Create subplots for each element in the grid
+    for i in range(dim0):
+        for j in range(dim1):
+            # Get the 2D grid at position [i, j]
+            grid = tensor_numpy[i, j]
+            
+            # Create subplot
+            ax = fig.add_subplot(gs[i, j])
+            
+            # Normalize if requested
+            if normalize:
+                vmin, vmax = grid.min(), grid.max()
+            else:
+                vmin, vmax = None, None
+            
+            # Display the grid
+            im = ax.imshow(grid, cmap=cmap, vmin=vmin, vmax=vmax)
+            
+            # Remove axis ticks
+            ax.set_xticks([])
+            ax.set_yticks([])
+            
+            # Add row/column indicators
+            if j == 0:
+                ax.set_ylabel(f"Row {i}")
+            if i == 0:
+                ax.set_title(f"Col {j}")
+            
+            # Add colorbar if requested
+            if add_colorbar:
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    
+    # Adjust layout
+    plt.tight_layout()
+    if title:
+        plt.subplots_adjust(top=0.9)
+    
+    # Save and close
+    try:
+        import os
+        
+        # Check if filepath is empty or None
+        if not filepath:
+            filepath = "tensor_visualization.png"
+            print(f"Filepath was empty, using default: {filepath}")
+        
+        # Get the directory part of the path
+        dirpath = os.path.dirname(filepath)
+        
+        # If dirpath is not empty, create the directories
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        
+        # Check if filepath is a directory
+        if os.path.isdir(filepath):
+            # If it is, append a filename
+            filepath = os.path.join(filepath, "tensor_visualization.png")
+            print(f"Filepath was a directory, saving to {filepath} instead")
+        
+        # Add extension if missing
+        if not os.path.splitext(filepath)[1]:
+            filepath += ".png"
+            print(f"Added missing extension: {filepath}")
+        
+        plt.savefig(filepath, bbox_inches='tight')
+        print(f"Successfully saved visualization to {filepath}")
+    except Exception as e:
+        print(f"Error saving visualization: {e}")
+        # Fallback to current directory with a timestamp
+        import time
+        fallback_path = f"tensor_viz_{int(time.time())}.png"
+        try:
+            plt.savefig(fallback_path, bbox_inches='tight')
+            print(f"Saved to fallback path instead: {fallback_path}")
+        except:
+            print(f"Could not save to fallback path either.")
+    finally:
+        plt.close()
+
+def quick_visualize_rgb(r_tensor, g_tensor, b_tensor, filepath, normalize=True):
+    """
+    Create and save an RGB image from three separate channel tensors.
+    
+    Args:
+        r_tensor: Red channel tensor with shape [1, H, W] or [H, W]
+        g_tensor: Green channel tensor with shape [1, H, W] or [H, W]
+        b_tensor: Blue channel tensor with shape [1, H, W] or [H, W]
+        filepath: Path to save the output image
+        normalize: Whether to normalize each channel to [0, 1] range
+    """
+    import torch
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Convert tensors to numpy if they're PyTorch tensors
+    def process_channel(tensor):
+        if torch.is_tensor(tensor):
+            tensor = tensor.detach().cpu().numpy()
+        
+        # Handle different dimensions
+        if len(tensor.shape) > 2:
+            if tensor.shape[0] == 1:
+                tensor = tensor[0]  # Get the single channel
+            else:
+                tensor = tensor[0]  # Use the first channel
+                
+        # Normalize if requested
+        if normalize:
+            if tensor.max() > tensor.min():  # Avoid division by zero
+                tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())
+                
+        return tensor
+    
+    # Process each channel
+    r = process_channel(r_tensor)
+    g = process_channel(g_tensor)
+    b = process_channel(b_tensor)
+    
+    # Ensure all channels have the same shape
+    assert r.shape == g.shape == b.shape, "All channels must have the same shape"
+    
+    # Stack channels to create RGB
+    rgb_image = np.stack([r, g, b], axis=2)
+    
+    # Clip values to be in valid range [0, 1]
+    rgb_image = np.clip(rgb_image, 0, 1)
+    
+    # Create figure
+    plt.figure(figsize=(8, 8))
+    plt.imshow(rgb_image)
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # Save and close
+    plt.savefig(filepath, bbox_inches='tight', pad_inches=0)
+    plt.close()
 
 def quick_visualize_mask(mask_tensor, filepath):
     # Convert tensor to numpy if it's a PyTorch tensor

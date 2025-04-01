@@ -21,6 +21,7 @@ from sam2.utils.misc import concat_points
 
 from training.utils.data_utils import BatchedVideoDatapoint
 
+from training.utils.visualize import visualize_frame, quick_visualize_mask, visualize_4d_tensor, quick_visualize_rgb
 
 class SAM2Train(SAM2Base):
     def __init__(
@@ -108,13 +109,17 @@ class SAM2Train(SAM2Base):
         if self.training or not self.forward_backbone_per_frame_for_eval:
             # precompute image features on all frames before tracking
             backbone_out = self.forward_image(input.flat_img_batch)
-            print(input.flat_img_batch.shape, "-----------------", torch.equal(input.flat_img_batch[:, 0], input.flat_img_batch[:, 1]))
+            #print(input.flat_img_batch.shape, "-----------------", torch.equal(input.flat_img_batch[:, 0], input.flat_img_batch[:, 1]))
+            #visualize_4d_tensor(input.flat_img_batch, "img.png")
+            #quick_visualize_rgb(*input.flat_img_batch[0], "video_frame.png")
         else:
             # defer image feature computation on a frame until it's being tracked
             backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}
         backbone_out = self.prepare_prompt_inputs(backbone_out, input)
-        previous_stages_out = self.forward_tracking(backbone_out, input)
 
+        #print("backbone vision_features: ", backbone_out["vision_features"].shape)
+        previous_stages_out = self.forward_tracking(backbone_out, input)
+        #print("backbone vision_features: ", backbone_out["vision_features"].shape)
         return previous_stages_out
 
     def _prepare_backbone_features_per_frame(self, img_batch, img_ids):
@@ -276,12 +281,14 @@ class SAM2Train(SAM2Base):
         if img_feats_already_computed:
             # Prepare the backbone features
             # - vision_feats and vision_pos_embeds are in (HW)BC format
+            print("vision fts before prepare backbone", backbone_out["vision_features"].shape)
             (
                 _,
                 vision_feats,
                 vision_pos_embeds,
                 feat_sizes,
             ) = self._prepare_backbone_features(backbone_out)
+            print("vision fts after prepare backbone", len(vision_feats), vision_feats[0].shape)
 
         # Starting the stage loop
         num_frames = backbone_out["num_frames"]
@@ -298,6 +305,10 @@ class SAM2Train(SAM2Base):
             # Get the image features for the current frames
             # img_ids = input.find_inputs[stage_id].img_ids
             img_ids = input.flat_obj_to_img_idx[stage_id]
+
+            # TO NOT DUPLICATE FEATURES IN MASK DIM:
+            img_ids = torch.unique(img_ids)
+
             if img_feats_already_computed:
                 # Retrieve image features according to img_ids (if they are already computed).
                 current_vision_feats = [x[:, img_ids] for x in vision_feats]
@@ -314,6 +325,14 @@ class SAM2Train(SAM2Base):
                     input.flat_img_batch, img_ids
                 )
 
+            mask_inputs = backbone_out["mask_inputs_per_frame"].get(stage_id, None)
+            if mask_inputs != None:
+                mask_inputs = mask_inputs.permute(1, 0, 2, 3)
+            
+            gt_masks = backbone_out["gt_masks_per_frame"].get(stage_id, None)
+            if gt_masks != None:
+                gt_masks = gt_masks.permute(1, 0, 2, 3)
+            
             # Get output masks based on this frame's prompts and previous memory
             current_out = self.track_step(
                 frame_idx=stage_id,
@@ -322,8 +341,8 @@ class SAM2Train(SAM2Base):
                 current_vision_pos_embeds=current_vision_pos_embeds,
                 feat_sizes=feat_sizes,
                 point_inputs=backbone_out["point_inputs_per_frame"].get(stage_id, None),
-                mask_inputs=backbone_out["mask_inputs_per_frame"].get(stage_id, None),
-                gt_masks=backbone_out["gt_masks_per_frame"].get(stage_id, None),
+                mask_inputs=mask_inputs,
+                gt_masks=gt_masks,
                 frames_to_add_correction_pt=frames_to_add_correction_pt,
                 output_dict=output_dict,
                 num_frames=num_frames,
@@ -436,7 +455,7 @@ class SAM2Train(SAM2Base):
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
         current_out["obj_ptr"] = obj_ptr
-
+        print("LOW REST MASKS SAM2TRAIN------obj_ptr", low_res_masks.shape, obj_ptr.shape)
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)
         self._encode_memory_in_output(

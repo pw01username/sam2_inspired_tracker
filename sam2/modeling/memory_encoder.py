@@ -163,7 +163,8 @@ class MemoryEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if masks.shape[1] > 1:
             print("masks shape in mem encoder: ", masks.shape,". Taking just first mask to encode.")
-            masks = masks[:, 0:1]
+            masks = masks[0:1, 0:1]
+            print("masks shape became: ", masks.shape)
 
         ## Process masks
         # sigmoid, so that less domain shift from gt masks which are bool
