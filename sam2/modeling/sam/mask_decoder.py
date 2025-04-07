@@ -11,6 +11,7 @@ from torch import nn
 
 from sam2.modeling.sam2_utils import LayerNorm2d, MLP
 
+from training.utils.visualize import visualize_frame, quick_visualize_mask, visualize_4d_tensor
 
 class MaskDecoder(nn.Module):
     def __init__(
@@ -114,6 +115,9 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_stability_delta = dynamic_multimask_stability_delta
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
 
+
+        self.inferece_num = 0
+
     def forward(
         self,
         image_embeddings: torch.Tensor,
@@ -170,6 +174,9 @@ class MaskDecoder(nn.Module):
         #     sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
         sam_tokens_out = mask_tokens_out
 
+        #visualize_4d_tensor(masks.float(), f"loss_viz/mask_decoder_masks_iter_{0}.png")
+        #self.inferece_num += 1
+        
         # Prepare output
         return masks, iou_pred, sam_tokens_out, object_score_logits
 

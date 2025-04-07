@@ -235,7 +235,7 @@ def visualize_4d_tensor(tensor, filepath, cmap='gray', figsize=None, title=None,
         # Check if filepath is empty or None
         if not filepath:
             filepath = "tensor_visualization.png"
-            print(f"Filepath was empty, using default: {filepath}")
+            #print(f"Filepath was empty, using default: {filepath}")
         
         # Get the directory part of the path
         dirpath = os.path.dirname(filepath)
@@ -248,15 +248,15 @@ def visualize_4d_tensor(tensor, filepath, cmap='gray', figsize=None, title=None,
         if os.path.isdir(filepath):
             # If it is, append a filename
             filepath = os.path.join(filepath, "tensor_visualization.png")
-            print(f"Filepath was a directory, saving to {filepath} instead")
+            #print(f"Filepath was a directory, saving to {filepath} instead")
         
         # Add extension if missing
         if not os.path.splitext(filepath)[1]:
             filepath += ".png"
-            print(f"Added missing extension: {filepath}")
+            #print(f"Added missing extension: {filepath}")
         
         plt.savefig(filepath, bbox_inches='tight')
-        print(f"Successfully saved visualization to {filepath}")
+        #print(f"Successfully saved visualization to {filepath}")
     except Exception as e:
         print(f"Error saving visualization: {e}")
         # Fallback to current directory with a timestamp

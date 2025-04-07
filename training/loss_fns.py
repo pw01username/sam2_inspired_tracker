@@ -50,6 +50,16 @@ def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
         return loss / num_objects
     return loss.sum() / num_objects
 
+def diversity_loss(predictions, eps=1e-5):
+    """Penalize similarity between different mask channels"""
+    # predictions shape: [B, N, H, W] where N is number of mask channels
+    norm_preds = F.normalize(predictions.flatten(2), p=2, dim=2)  # Normalize spatial dimensions
+    cosine_sim = torch.matmul(norm_preds, norm_preds.transpose(1, 2))  # [B, N, N]
+    # Zero out diagonal (self-similarity)
+    mask = torch.eye(cosine_sim.size(1), device=cosine_sim.device).unsqueeze(0).expand_as(cosine_sim)
+    cosine_sim = cosine_sim * (1 - mask)
+    return cosine_sim.sum(dim=(1,2)) / (predictions.size(1) * (predictions.size(1) - 1) + eps)
+
 
 def sigmoid_focal_loss(
     inputs,
@@ -77,6 +87,8 @@ def sigmoid_focal_loss(
         focal loss tensor
     """
     prob = inputs.sigmoid()
+    visualize_4d_tensor(prob.float(), "prob_sigmoid.png")
+
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
     loss = ce_loss * ((1 - p_t) ** gamma)
@@ -87,8 +99,18 @@ def sigmoid_focal_loss(
 
     if loss_on_multimask:
         # loss is [N, M, H, W] where M corresponds to multiple predicted masks
-        assert loss.dim() == 4
-        return loss.flatten(2).mean(-1) / num_objects  # average over spatial dims
+        #assert loss.dim() == 4
+        #return loss.flatten(2).mean(-1) / num_objects  # average over spatial dims
+
+        # For multi-object segmentation, we compute loss per object (channel)
+        # and return loss for each object separately
+        # Average over spatial dimensions but keep object dimension
+        # loss is [B, N, H, W] -> [B, N]
+        diversity_weight = 0.5
+        per_object_loss = loss.flatten(2).mean(-1) / num_objects
+        diversity_penalty = diversity_loss(prob) * diversity_weight
+        return per_object_loss + diversity_penalty
+
     return loss.mean(1).sum() / num_objects
 
 
@@ -116,13 +138,13 @@ def iou_loss(
     area_u = torch.sum(pred_mask | gt_mask, dim=-1).float()
     actual_ious = area_i / torch.clamp(area_u, min=1.0)
 
-    print(f"DEBUG - pred_ious shape: {pred_ious.shape}, actual_ious shape: {actual_ious.shape}")
+    #print(f"DEBUG - pred_ious shape: {pred_ious.shape}, actual_ious shape: {actual_ious.shape}")
     
     # Expand pred_ious to match actual_ious if needed
     if pred_ious.shape[1] != actual_ious.shape[1]:
         print(f"Expanding pred_ious from {pred_ious.shape} to match actual_ious {actual_ious.shape}")
         pred_ious = pred_ious.expand(-1, actual_ious.shape[1])
-        print(f"New pred_ious shape: {pred_ious.shape}")
+        #print(f"New pred_ious shape: {pred_ious.shape}")
 
     if use_l1_loss:
         loss = F.l1_loss(pred_ious, actual_ious, reduction="none")
@@ -193,7 +215,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 losses[k] += v
 
         # Visualize masks
-        if True:
+        if False:
             # Save visualization only on the main process in distributed training
             if not is_dist_avail_and_initialized() or torch.distributed.get_rank() == 0:
                 # Create a base directory for this iteration
@@ -212,18 +234,20 @@ class MultiStepMultiMasksAndIous(nn.Module):
                         # Get the data for this frame
                         outs = outs_batch[batch_idx]
                         targets = targets_batch[batch_idx]
+
+                        #visualize_4d_tensor(outs, f"outs_{self.iteration}.png")
+                        #visualize_4d_tensor(targets, f"targets_{self.iteration}.png")
+
                         #print(f"Batch shape, targets:", len(outs["multistep_pred_multimasks_high_res"]), outs["multistep_pred_multimasks_high_res"][0].shape, ", preds: ", targets.shape)
                         
                         # Visualize this frame
-                        visualize_frame(
-                            outs,
-                            targets,
-                            self.iteration,
-                            frame_save_dir,
-                            batch_idx
-                        )
-                        
-                        #print(f"Visualization saved for frame {batch_idx} at iteration {self.iteration}")
+                        # visualize_frame(
+                        #     outs,
+                        #     targets,
+                        #     self.iteration,
+                        #     frame_save_dir,
+                        #     batch_idx
+                        # )
                 
         self.iteration += 1
         return losses
@@ -275,29 +299,11 @@ class MultiStepMultiMasksAndIous(nn.Module):
     def _update_losses(
         self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
     ):
-        print("src_masks", src_masks.shape, ". target masks", target_masks.shape)
-        # if src_masks.shape[1] > 1: # print difference on first and last mask predicted
-        #     print("first and last prediction equal?", torch.equal(src_masks[0, 0], src_masks[0, 2]))
-        #     diff = src_masks.detach().cpu()[0, 0] - src_masks.detach().cpu()[0, 2]
-        #     quick_visualize_mask(np.abs(diff), f"DIFFERENCE.png")
-        #     quick_visualize_mask(src_masks.detach().cpu()[0, 0], "first.png")
-        #     quick_visualize_mask(src_masks.detach().cpu()[0, 2], "sec.png")
-        #     print("diff: ", diff)
-        visualize_4d_tensor(src_masks, f"src_predicted_mask_{self.iteration}.png")
-        
-        #quick_visualize_mask(src_masks[1, 0], "src predicted mask 10.png")
-        loss_as_one = sigmoid_focal_loss(
-            src_masks,
-            target_masks,
-            num_objects,
-            alpha=self.focal_alpha,
-            gamma=self.focal_gamma,
-            loss_on_multimask=True,
-        )
+        visualize_4d_tensor(src_masks, f"loss_viz/src_predicted_mask_{0}.png")
+        visualize_4d_tensor(target_masks, f"loss_viz/target_masks_{0}.png")
 
-
-        target_masks = target_masks.expand_as(src_masks)
-        print("t mask after exp", target_masks.shape)
+        #target_masks = target_masks.expand_as(src_masks)
+        #print("target mask after exp", target_masks.shape)
         
         # get focal, dice and iou loss on all output masks in a prediction step
         loss_multimask = sigmoid_focal_loss(
@@ -309,13 +315,15 @@ class MultiStepMultiMasksAndIous(nn.Module):
             loss_on_multimask=True,
         )
 
-        print("src masks shape: ", src_masks.shape, ". loss as first: ", loss_as_one.shape, 
-        ". loss as expanded targets: ", loss_multimask.shape, ". averages:", loss_as_one.nanmean(), loss_multimask.nanmean())
+        print("sigmoid_focal_loss: ", loss_multimask)
 
+        obj_presence = torch.any(target_masks > 0, dim=(2,3)).float()
+        
         loss_multidice = dice_loss(
             src_masks, target_masks, num_objects, loss_on_multimask=True
         )
-        if not self.pred_obj_scores:
+
+        if not self.pred_obj_scores or 1 == 1:
             loss_class = torch.tensor(
                 0.0, dtype=loss_multimask.dtype, device=loss_multimask.device
             )
@@ -326,17 +334,25 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 device=loss_multimask.device,
             )
         else:
-            target_obj = torch.any((target_masks[:, :3] > 0).flatten(1), dim=-1)[
-                ..., None
-            ].float()
-            print("tar", target_obj.shape, object_score_logits.shape)
             loss_class = sigmoid_focal_loss(
-                object_score_logits[:, 0:1],
-                target_obj,
+                object_score_logits,
+                obj_presence,
                 num_objects,
                 alpha=self.focal_alpha_obj_score,
                 gamma=self.focal_gamma_obj_score,
             )
+            
+            # target_obj = torch.any((target_masks[:, :3] > 0).flatten(1), dim=-1)[
+            #     ..., None
+            # ].float()
+            # print("tar", target_obj.shape, object_score_logits.shape)
+            # loss_class = sigmoid_focal_loss(
+            #     object_score_logits[:, 0:1],
+            #     target_obj,
+            #     num_objects,
+            #     alpha=self.focal_alpha_obj_score,
+            #     gamma=self.focal_gamma_obj_score,
+            # )
 
         loss_multiiou = iou_loss(
             src_masks,
@@ -381,9 +397,9 @@ class MultiStepMultiMasksAndIous(nn.Module):
         # loss_dice = loss_dice * target_obj
         # loss_iou = loss_iou * target_obj
 
-        loss_mask = loss_mask * target_obj.unsqueeze(-1) if target_obj.dim() < loss_mask.dim() else loss_mask * target_obj
-        loss_dice = loss_dice * target_obj.unsqueeze(-1) if target_obj.dim() < loss_dice.dim() else loss_dice * target_obj
-        loss_iou = loss_iou * target_obj.unsqueeze(-1) if target_obj.dim() < loss_iou.dim() else loss_iou * target_obj
+        #loss_mask = loss_mask * target_obj.unsqueeze(-1) if target_obj.dim() < loss_mask.dim() else loss_mask * target_obj
+        #loss_dice = loss_dice * target_obj.unsqueeze(-1) if target_obj.dim() < loss_dice.dim() else loss_dice * target_obj
+        #loss_iou = loss_iou * target_obj.unsqueeze(-1) if target_obj.dim() < loss_iou.dim() else loss_iou * target_obj
 
         # sum over batch dimension (note that the losses are already divided by num_objects)
         losses["loss_mask"] += loss_mask.sum()
@@ -400,3 +416,40 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 reduced_loss += losses[loss_key] * weight
 
         return reduced_loss
+
+
+def test_diversity_loss():
+    # Case 1: Identical masks - should have high loss
+    identical_masks = torch.ones(1, 3, 16, 16)  # Batch=1, Channels=3, 16x16 masks
+    loss_identical = diversity_loss(identical_masks)
+    
+    # Case 2: Different masks - should have low loss
+    different_masks = torch.zeros(1, 3, 16, 16)
+    different_masks[0, 0, :8, :8] = 1  # Top-left object in channel 0
+    different_masks[0, 1, :8, 8:] = 1  # Top-right object in channel 1
+    different_masks[0, 2, 8:, :8] = 1  # Bottom-left object in channel 2
+    loss_different = diversity_loss(different_masks)
+    
+    # Case 3: Partially overlapping masks - should have medium loss
+    overlap_masks = torch.zeros(1, 3, 16, 16)
+    overlap_masks[0, 0, :10, :10] = 1  # Object in channel 0
+    overlap_masks[0, 1, 6:16, 6:16] = 1  # Object in channel 1 (overlaps with channel 0)
+    overlap_masks[0, 2, 4:12, 4:12] = 1  # Object in channel 2 (overlaps with both)
+    loss_overlap = diversity_loss(overlap_masks)
+    
+    print(f"Loss for identical masks: {loss_identical.item():.4f}")
+    print(f"Loss for different masks: {loss_different.item():.4f}")
+    print(f"Loss for overlapping masks: {loss_overlap.item():.4f}")
+    
+    return loss_identical, loss_different, loss_overlap
+
+if __name__ == "__main__":
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    
+    # Run the test
+    loss_identical, loss_different, loss_overlap = test_diversity_loss()
+    
+    # Validate results
+    assert loss_identical > loss_overlap > loss_different, "Loss ordering doesn't match expectations!"
+    print("Test passed! Loss correctly penalizes similarity between mask channels.")

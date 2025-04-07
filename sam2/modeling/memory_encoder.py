@@ -13,6 +13,8 @@ import torch.nn.functional as F
 
 from sam2.modeling.sam2_utils import DropPath, get_clones, LayerNorm2d
 
+from training.utils.visualize import visualize_frame, quick_visualize_mask, visualize_4d_tensor
+
 
 class MaskDownSampler(nn.Module):
     """
@@ -134,7 +136,6 @@ class Fuser(nn.Module):
             x = layer(x)
         return x
 
-
 class MemoryEncoder(nn.Module):
     def __init__(
         self,
@@ -155,29 +156,127 @@ class MemoryEncoder(nn.Module):
         if out_dim != in_dim:
             self.out_proj = nn.Conv2d(in_dim, out_dim, kernel_size=1)
 
+        
+        # new stuff for multi mask emb fusing
+        self.embed_dim = in_dim
+
+        # Object identity embeddings to differentiate masks
+        self.object_id_embeddings = nn.Embedding(3, self.embed_dim * 2)  # Double dimension
+        self.object_proj = nn.Linear(self.embed_dim * 2, self.embed_dim)  # Project back down
+
+        # Attention mechanism to fuse multiple mask embeddings
+        self.mask_attention = nn.MultiheadAttention(
+            self.embed_dim, 
+            num_heads=8, 
+            batch_first=True
+        )
+        
+        # Final projection to maintain embedding dimensionality
+        self.mask_fusion = nn.Sequential(
+            nn.Conv2d(self.embed_dim, self.embed_dim, kernel_size=1),
+            LayerNorm2d(self.embed_dim),
+            nn.GELU(),
+        )
+
+        self.no_mask_embed = nn.Embedding(1, self.embed_dim)
+
+    def _embed_multi_masks(self, masks: torch.Tensor) -> torch.Tensor:
+        """
+        Embeds multiple mask inputs and combines them into a single dense embedding
+        per batch element.
+        
+        Args:
+            masks: Tensor of shape (B, N, H, W) where:
+                B is batch size
+                N is number of masks per sample (typically 1)
+                H and W are mask height and width
+                    
+        Returns:
+            Tensor of shape (B, embed_dim, embed_H, embed_W) - one embedding per batch
+        """
+        B, N, H, W = masks.shape
+        
+        # Process each mask in the batch independently
+        batch_embeddings = []
+        for b in range(B):
+            # Process the N masks for this batch element
+            mask_embeddings = []
+            for n in range(N):
+                # Process through the downscaling network - shape (1, 1, H, W)
+                single_mask = masks[b:b+1, n:n+1]
+                single_mask_embedding = self.mask_downsampler(single_mask)  # (1, embed_dim, embed_H, embed_W)
+                
+                # Add object identity embedding
+                object_id_embed = self.object_id_embeddings(torch.tensor([min(n, 2)], device=masks.device))
+                object_id_embed = self.object_proj(object_id_embed)  # Project down to embed dim shape again
+                object_id_embed = object_id_embed.view(1, self.embed_dim, 1, 1).expand_as(single_mask_embedding)
+                
+                # Combine spatial features with object identity
+                enhanced_embedding = single_mask_embedding + object_id_embed
+                mask_embeddings.append(enhanced_embedding)
+            
+            if not mask_embeddings:
+                # No masks for this batch, use the no_mask embedding
+                batch_embedding = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                    1, -1, self.image_embedding_size[0], self.image_embedding_size[1]
+                )
+            elif len(mask_embeddings) == 1:
+                # Only one mask for this batch, no need for attention mechanism
+                batch_embedding = mask_embeddings[0]
+            else:
+                # Multiple masks for this batch, use attention to fuse them
+                # Stack along a new dimension - each element is (1, embed_dim, h, w)
+                stacked_embeddings = torch.stack(mask_embeddings, dim=1)  # (1, N, embed_dim, h, w)
+                
+                C = self.embed_dim
+                H_emb, W_emb = stacked_embeddings.shape[-2], stacked_embeddings.shape[-1]
+                
+                # Reshape for attention: (1, N, C, H, W) -> (1*H*W, N, C)
+                reshaped_emb = stacked_embeddings.permute(0, 3, 4, 1, 2).reshape(H_emb*W_emb, N, C)
+                
+                # Apply attention across the mask dimension for each spatial location
+                attn_output, _ = self.mask_attention(reshaped_emb, reshaped_emb, reshaped_emb)
+                
+                # Reshape back and sum across mask dimension
+                attn_output = attn_output.reshape(1, H_emb, W_emb, N, C).permute(0, 4, 3, 1, 2)  # (1, C, N, H, W)
+                fused_embedding = torch.sum(attn_output, dim=2)  # (1, C, H, W)
+                
+                # Final projection to ensure proper embedding
+                batch_embedding = self.mask_fusion(fused_embedding)
+            
+            batch_embeddings.append(batch_embedding)
+        
+        # Concatenate the batch embeddings
+        return torch.cat(batch_embeddings, dim=0)
+
     def forward(
         self,
         pix_feat: torch.Tensor,
         masks: torch.Tensor,
         skip_mask_sigmoid: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if masks.shape[1] > 1:
-            print("masks shape in mem encoder: ", masks.shape,". Taking just first mask to encode.")
-            masks = masks[0:1, 0:1]
-            print("masks shape became: ", masks.shape)
-
-        ## Process masks
         # sigmoid, so that less domain shift from gt masks which are bool
         if not skip_mask_sigmoid:
             masks = F.sigmoid(masks)
-        masks = self.mask_downsampler(masks)
+        
+        #masks = self.mask_downsampler(masks)
+        
+        # Use the prompt encoder's multi-mask embedding functionality
+        # This will handle the attention fusion between masks
+        mask_features = self._embed_multi_masks(masks)
+
+        visualize_4d_tensor(masks.float(), f"masks_memenc/masks memory encoder.png")
+        reshaped = mask_features.squeeze(0).reshape(16, 16, 32, 32)
+
+        visualize_4d_tensor(reshaped, f"masks_memenc/mask_ft_embeds.png")
+
 
         ## Fuse pix_feats and downsampled masks
         # in case the visual features are on CPU, cast them to CUDA
         pix_feat = pix_feat.to(masks.device)
 
         x = self.pix_feat_proj(pix_feat)
-        x = x + masks
+        x = x + mask_features #masks
         x = self.fuser(x)
         x = self.out_proj(x)
 

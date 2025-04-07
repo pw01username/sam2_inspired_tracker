@@ -13,6 +13,7 @@ from sam2.modeling.position_encoding import PositionEmbeddingRandom
 
 from sam2.modeling.sam2_utils import LayerNorm2d
 
+from training.utils.visualize import visualize_frame, quick_visualize_mask, visualize_4d_tensor
 
 class PromptEncoder(nn.Module):
     def __init__(
@@ -278,9 +279,8 @@ class PromptEncoder(nn.Module):
             sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
         if masks is not None:
-            #print("masks in prompt enc", masks.shape)
+            visualize_4d_tensor(masks.float(), "prompt encoder.png")
             dense_embeddings = self._embed_multi_masks(masks)
-            #print("dense_embeddings", dense_embeddings.shape)
         else:
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]

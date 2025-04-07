@@ -3,11 +3,11 @@
 scratch:
   resolution: 512 #1024
   train_batch_size: 1
-  num_train_workers: 10
+  num_train_workers: 24 #10
   num_frames: 8
   max_num_objects: 3
-  base_lr: 5.0e-6
-  vision_lr: 3.0e-05 #3.0e-06
+  base_lr: 5.0e-3 #5.0e-6
+  vision_lr: 3.0e-04 #3.0e-06
   phases_per_epoch: 1
   num_epochs: 500
 
@@ -16,7 +16,7 @@ dataset:
   img_folder: /davis/DAVIS/JPEGImages_overfit
   gt_folder: /davis/DAVIS/Annotations_overfit
   file_list_txt: null
-  multiplier: 2
+  multiplier: 10 #2
 
 # Video transforms
 vos:
@@ -164,7 +164,7 @@ trainer:
     use_signed_tpos_enc_to_obj_ptrs: true
     only_obj_ptrs_in_the_past_for_eval: true
     # object occlusion prediction
-    pred_obj_scores: true
+    pred_obj_scores: false #true
     pred_obj_scores_mlp: true
     fixed_no_obj_ptr: true
     # multimask tracking settings
@@ -282,15 +282,15 @@ trainer:
     all:
       _target_: training.loss_fns.MultiStepMultiMasksAndIous
       weight_dict:
-        loss_mask: 20
+        loss_mask: 30 #20
         loss_dice: 1
         loss_iou: 1
         loss_class: 1
       supervise_all_iou: true
       iou_use_l1_loss: true
-      pred_obj_scores: true
-      focal_gamma_obj_score: 0.0
-      focal_alpha_obj_score: -1.0
+      pred_obj_scores: false #true
+      focal_gamma_obj_score: 3 #0.0
+      focal_alpha_obj_score: 0.75 #-1.0
 
   distributed:
     backend: nccl
@@ -316,6 +316,8 @@ trainer:
       #ignore_unexpected_keys: null
       #ignore_missing_keys: null
       ignore_unexpected_keys:
+        - "*"
+        - "no_obj_ptr"
         - "sam_mask_decoder.output_hypernetworks_mlps.3.*"  # Ignore all keys in hypernetwork MLP 3
       ignore_missing_keys:
         - "sam_prompt_encoder.object_id_embeddings.*"  # Ignore object ID embeddings
