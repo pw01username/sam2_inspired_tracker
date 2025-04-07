@@ -362,7 +362,7 @@ class SAM2Train(SAM2Base):
         all_frame_outputs = [all_frame_outputs[t] for t in range(num_frames)]
         # Make DDP happy with activation checkpointing by removing unused keys
         all_frame_outputs = [
-            {k: v for k, v in d.items() if k != "obj_ptr"} for d in all_frame_outputs
+            {k: v for k, v in d.items() if k != "obj_ptrs"} for d in all_frame_outputs
         ]
 
         return all_frame_outputs
@@ -406,7 +406,7 @@ class SAM2Train(SAM2Base):
             ious,
             low_res_masks,
             high_res_masks,
-            obj_ptr,
+            obj_ptrs,
             object_score_logits,
         ) = sam_outputs
         #print("object_score_logits.sssssssssshape", object_score_logits.shape)
@@ -448,7 +448,7 @@ class SAM2Train(SAM2Base):
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
-        current_out["obj_ptr"] = obj_ptr
+        current_out["obj_ptrs"] = obj_ptrs
         
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)

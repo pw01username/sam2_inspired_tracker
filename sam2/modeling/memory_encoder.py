@@ -266,9 +266,9 @@ class MemoryEncoder(nn.Module):
         mask_features = self._embed_multi_masks(masks)
 
         visualize_4d_tensor(masks.float(), f"masks_memenc/masks memory encoder.png")
-        reshaped = mask_features.squeeze(0).reshape(16, 16, 32, 32)
+        #reshaped = mask_features.squeeze(0).reshape(16, 16, 32, 32)
 
-        visualize_4d_tensor(reshaped, f"masks_memenc/mask_ft_embeds.png")
+        #visualize_4d_tensor(reshaped, f"masks_memenc/mask_ft_embeds.png")
 
 
         ## Fuse pix_feats and downsampled masks
@@ -279,6 +279,8 @@ class MemoryEncoder(nn.Module):
         x = x + mask_features #masks
         x = self.fuser(x)
         x = self.out_proj(x)
+
+        visualize_4d_tensor(x.float(), f"masks_memenc/vision features memory encoder.png")
 
         pos = self.position_encoding(x).to(x.dtype)
 

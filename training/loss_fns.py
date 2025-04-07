@@ -50,16 +50,68 @@ def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
         return loss / num_objects
     return loss.sum() / num_objects
 
-def diversity_loss(predictions, eps=1e-5):
-    """Penalize similarity between different mask channels"""
-    # predictions shape: [B, N, H, W] where N is number of mask channels
-    norm_preds = F.normalize(predictions.flatten(2), p=2, dim=2)  # Normalize spatial dimensions
-    cosine_sim = torch.matmul(norm_preds, norm_preds.transpose(1, 2))  # [B, N, N]
-    # Zero out diagonal (self-similarity)
-    mask = torch.eye(cosine_sim.size(1), device=cosine_sim.device).unsqueeze(0).expand_as(cosine_sim)
-    cosine_sim = cosine_sim * (1 - mask)
-    return cosine_sim.sum(dim=(1,2)) / (predictions.size(1) * (predictions.size(1) - 1) + eps)
-
+def diversity_loss(predictions, targets, threshold=0.5, eps=1e-5):
+    """
+    Penalize similarity between different mask channels only for predicted objects
+    within target regions.
+    
+    Args:
+        predictions: tensor of shape [B, N, H, W] - predicted logits or probabilities
+        targets: tensor of shape [B, N, H, W] - ground truth masks
+        threshold: probability threshold to consider a pixel as foreground
+        eps: small value to avoid division by zero
+    
+    Returns:
+        loss tensor of shape [B]
+    """
+    # Convert logits to probabilities if needed
+    if predictions.max() > 1.0 or predictions.min() < 0.0:
+        probs = torch.sigmoid(predictions)
+    else:
+        probs = predictions
+        
+    B, N, H, W = probs.shape
+    
+    # Flatten spatial dimensions
+    probs_flat = probs.view(B, N, -1)  # [B, N, H*W]
+    targets_flat = targets.view(B, N, -1)  # [B, N, H*W]
+    
+    # Create target regions mask - pixels where any target channel has an object
+    target_regions = (targets_flat > 0.5).any(dim=1, keepdim=True)  # [B, 1, H*W]
+    
+    # Calculate overlap only for pixels where at least one channel predicts an object
+    # AND where there's at least one target object
+    cosine_sim_matrix = torch.zeros(B, N, N, device=probs.device)
+    
+    for b in range(B):
+        for i in range(N):
+            for j in range(i+1, N):  # Only calculate upper triangle (symmetric matrix)
+                # Only consider pixels where either channel predicts an object
+                # AND are within target regions
+                pred_pixels = ((probs_flat[b, i] > threshold) | (probs_flat[b, j] > threshold))
+                active_pixels = pred_pixels & target_regions[b, 0]
+                
+                # Skip if no active pixels
+                if not active_pixels.any():
+                    continue
+                
+                # Calculate intersection over regions where either predicts an object
+                intersection = (probs_flat[b, i] * probs_flat[b, j] * active_pixels).sum()
+                union = ((probs_flat[b, i] + probs_flat[b, j]) * active_pixels).sum() - intersection + eps
+                
+                # IoU-like metric between these two channels
+                overlap = intersection / union
+                
+                cosine_sim_matrix[b, i, j] = overlap
+                cosine_sim_matrix[b, j, i] = overlap  # Symmetric
+    
+    # Sum the upper triangle of the matrix (excluding diagonal)
+    mask = torch.triu(torch.ones(N, N, device=probs.device), diagonal=1)
+    channel_overlaps = (cosine_sim_matrix * mask.unsqueeze(0)).sum(dim=(1, 2))
+    
+    # Normalize by number of channel pairs
+    num_pairs = (N * (N - 1)) / 2
+    return channel_overlaps / (num_pairs + eps)
 
 def sigmoid_focal_loss(
     inputs,
@@ -106,13 +158,29 @@ def sigmoid_focal_loss(
         # and return loss for each object separately
         # Average over spatial dimensions but keep object dimension
         # loss is [B, N, H, W] -> [B, N]
-        diversity_weight = 0.5
-        per_object_loss = loss.flatten(2).mean(-1) / num_objects
-        diversity_penalty = diversity_loss(prob) * diversity_weight
-        return per_object_loss + diversity_penalty
+        div_loss = diversity_loss(inputs, targets)
+        diversity_weight = 0.001
+        print("----", loss.flatten(2).shape, loss.flatten(2).mean(-1).shape)
+        visualize_4d_tensor(loss.float(), "loss.png")
+        visualize_4d_tensor(ce_loss.float(), "loss_ce.png")
+        visualize_4d_tensor((1-p_t).float(), "p_t.png")
+
+        # Average over spatial dimensions but keep batch dimension
+        focal_loss_term = loss.flatten(2).mean(-1) / num_objects
+        
+        # Add diversity penalty (already at batch level)
+        return focal_loss_term + diversity_weight * div_loss
 
     return loss.mean(1).sum() / num_objects
 
+def debug_gradients(tensor, name):
+    """Helper function to debug gradient flow"""
+    if isinstance(tensor, torch.Tensor):
+        print(f"{name}: requires_grad={tensor.requires_grad}, has_grad_fn={tensor.grad_fn is not None}")
+        if tensor.grad_fn is not None:
+            print(f"  grad_fn type: {type(tensor.grad_fn).__name__}")
+    else:
+        print(f"{name} is not a tensor: {type(tensor)}")
 
 def iou_loss(
     inputs, targets, pred_ious, num_objects, loss_on_multimask=False, use_l1_loss=False
@@ -299,12 +367,74 @@ class MultiStepMultiMasksAndIous(nn.Module):
     def _update_losses(
         self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
     ):
+        debug_gradients(src_masks, "src_masks")
+        debug_gradients(target_masks, "target_masks")
+        debug_gradients(ious, "ious")
+        
         visualize_4d_tensor(src_masks, f"loss_viz/src_predicted_mask_{0}.png")
         visualize_4d_tensor(target_masks, f"loss_viz/target_masks_{0}.png")
 
-        #target_masks = target_masks.expand_as(src_masks)
-        #print("target mask after exp", target_masks.shape)
+        B, N, H, W = src_masks.shape  # Batch size, number of predicted masks, height, width
+        M = target_masks.shape[1]     # Number of ground truth masks
+        #print("batch: ", B, target_masks.shape)
+
+        # Convert logits to probabilities for IoU calculation
+        src_probs = torch.sigmoid(src_masks)
         
+        # Compute IoU between all pred and target masks for this batch item
+        iou_matrix = torch.zeros((N, M), device=src_masks.device)
+        
+        # Calculate IoU matrix
+        for n in range(N):
+            for m in range(M):
+                pred_mask = src_probs[:, n] > 0  # Binarize prediction
+                gt_mask = target_masks[:, m] > 0  # Binarize ground truth
+                
+                # Calculate intersection and union
+                intersection = (pred_mask & gt_mask).sum()
+                union = (pred_mask | gt_mask).sum()
+                
+                if union > 0:
+                    iou_matrix[n, m] = intersection.float() / union.float()
+        
+        # Get optimal matching using greedy approach
+        # This rearranges target_masks to match order of src_masks
+        matched_indices = []
+        matched_gt_indices = list(range(M))
+        
+        for n in range(N):
+            if not matched_gt_indices:
+                break
+                
+            # Find best match among remaining ground truth masks
+            best_iou = -1
+            best_m = -1
+            best_m_idx = -1
+            
+            for idx, m in enumerate(matched_gt_indices):
+                if iou_matrix[n, m] > best_iou:
+                    best_iou = iou_matrix[n, m]
+                    best_m = m
+                    best_m_idx = idx
+            
+            # Only match if IoU is above threshold
+            if best_iou > 0:
+                matched_indices.append((n, best_m))
+                # Remove this ground truth mask from available matches
+                matched_gt_indices.pop(best_m_idx)
+        
+        # Create new rearranged target masks based on matching
+        rearranged_targets = torch.zeros_like(target_masks)
+        
+        # For each matched pair, put the target mask in the corresponding prediction slot
+        for pred_idx, gt_idx in matched_indices:
+            rearranged_targets[0, pred_idx] = target_masks[0, gt_idx]
+
+        target_masks = rearranged_targets
+        #visualize_4d_tensor(target_masks2, f"loss_viz/target_masks_retarget{0}.png")
+        #print("matched_indices", matched_indices)
+        # -------- 
+
         # get focal, dice and iou loss on all output masks in a prediction step
         loss_multimask = sigmoid_focal_loss(
             src_masks,
@@ -315,7 +445,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
             loss_on_multimask=True,
         )
 
-        print("sigmoid_focal_loss: ", loss_multimask)
+        #print("sigmoid_focal_loss: ", loss_multimask)
 
         obj_presence = torch.any(target_masks > 0, dim=(2,3)).float()
         
@@ -362,6 +492,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
             loss_on_multimask=True,
             use_l1_loss=self.iou_use_l1_loss,
         )
+
         assert loss_multimask.dim() == 2
         assert loss_multidice.dim() == 2
         assert loss_multiiou.dim() == 2
@@ -416,40 +547,3 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 reduced_loss += losses[loss_key] * weight
 
         return reduced_loss
-
-
-def test_diversity_loss():
-    # Case 1: Identical masks - should have high loss
-    identical_masks = torch.ones(1, 3, 16, 16)  # Batch=1, Channels=3, 16x16 masks
-    loss_identical = diversity_loss(identical_masks)
-    
-    # Case 2: Different masks - should have low loss
-    different_masks = torch.zeros(1, 3, 16, 16)
-    different_masks[0, 0, :8, :8] = 1  # Top-left object in channel 0
-    different_masks[0, 1, :8, 8:] = 1  # Top-right object in channel 1
-    different_masks[0, 2, 8:, :8] = 1  # Bottom-left object in channel 2
-    loss_different = diversity_loss(different_masks)
-    
-    # Case 3: Partially overlapping masks - should have medium loss
-    overlap_masks = torch.zeros(1, 3, 16, 16)
-    overlap_masks[0, 0, :10, :10] = 1  # Object in channel 0
-    overlap_masks[0, 1, 6:16, 6:16] = 1  # Object in channel 1 (overlaps with channel 0)
-    overlap_masks[0, 2, 4:12, 4:12] = 1  # Object in channel 2 (overlaps with both)
-    loss_overlap = diversity_loss(overlap_masks)
-    
-    print(f"Loss for identical masks: {loss_identical.item():.4f}")
-    print(f"Loss for different masks: {loss_different.item():.4f}")
-    print(f"Loss for overlapping masks: {loss_overlap.item():.4f}")
-    
-    return loss_identical, loss_different, loss_overlap
-
-if __name__ == "__main__":
-    # Set random seed for reproducibility
-    torch.manual_seed(42)
-    
-    # Run the test
-    loss_identical, loss_different, loss_overlap = test_diversity_loss()
-    
-    # Validate results
-    assert loss_identical > loss_overlap > loss_different, "Loss ordering doesn't match expectations!"
-    print("Test passed! Loss correctly penalizes similarity between mask channels.")

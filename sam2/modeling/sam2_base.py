@@ -431,7 +431,7 @@ class SAM2Base(torch.nn.Module):
         #     # Add no_obj_ptr for objects not appearing
         #     obj_ptrs = obj_ptrs + (1 - lambda_is_obj_appearing.unsqueeze(-1)) * self.no_obj_ptr
         
-        #print("--------------------------->>>>", obj_ptrs.shape, sam_output_tokens.shape)
+        #print("--------------------------->>>>", obj_ptrs.shape, sam_output_tokens.shape, sam_output_tokens)
         #print("_________________________________________________", sam_output_token.shape, obj_ptr.shape)
 
         return (
@@ -659,7 +659,7 @@ class SAM2Base(torch.nn.Module):
                             if self.use_signed_tpos_enc_to_obj_ptrs
                             else abs(frame_idx - t)
                         ),
-                        out["obj_ptr"],
+                        out["obj_ptrs"],
                     )
                     for t, out in ptr_cond_outputs.items()
                 ]
@@ -672,7 +672,7 @@ class SAM2Base(torch.nn.Module):
                         t, unselected_cond_outputs.get(t, None)
                     )
                     if out is not None:
-                        pos_and_ptrs.append((t_diff, out["obj_ptr"]))
+                        pos_and_ptrs.append((t_diff, out["obj_ptrs"]))
 
                 # If we have at least one object pointer, add them to the across attention
                 if len(pos_and_ptrs) > 0:
@@ -698,7 +698,8 @@ class SAM2Base(torch.nn.Module):
                     # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
                     obj_ptrs = torch.stack(ptrs_list, dim=0)
 
-                    #print("obj ptrs shape", obj_ptrs.shape)
+                    print("obj ptrs shape", obj_ptrs.shape, torch.equal(obj_ptrs[0, :, 0], obj_ptrs[0, :, 1]))
+
                     # a temporal positional embedding based on how far each object pointer is from
                     # the current frame (sine embedding normalized by the max pointer num).
                     if self.add_tpos_enc_to_obj_ptrs:
@@ -729,8 +730,8 @@ class SAM2Base(torch.nn.Module):
                             # Create padding tensor filled with zeros
                             padding = torch.zeros(
                                 padding_needed, 
-                                obj_pos.shape[1], 
-                                obj_pos.shape[2], 
+                                obj_pos.shape[1],
+                                obj_pos.shape[2],
                                 device=obj_pos.device,
                                 dtype=obj_pos.dtype
                             )
@@ -830,16 +831,16 @@ class SAM2Base(torch.nn.Module):
 
         # add a no-object embedding to the spatial memory to indicate that the frame
         # is predicted to be occluded (i.e. no object is appearing in the frame)
-        if self.no_obj_embed_spatial is not None:
-            # Option 1: Use only the first score if we want to use just one prediction
-            is_obj_appearing = (object_score_logits > 0).float()[:, 0:1]  # shape: [1, 1]
-            is_obj_appearing = is_obj_appearing.view(-1, 1, 1, 1)  # Shape becomes [1, 1, 1, 1]
+        # if self.no_obj_embed_spatial is not None:
+        #     # Option 1: Use only the first score if we want to use just one prediction
+        #     is_obj_appearing = (object_score_logits > 0).float()[:, 0:1]  # shape: [1, 1]
+        #     is_obj_appearing = is_obj_appearing.view(-1, 1, 1, 1)  # Shape becomes [1, 1, 1, 1]
             
-            maskmem_features += (
-                1 - is_obj_appearing
-            ) * self.no_obj_embed_spatial[..., None, None].expand(
-                *maskmem_features.shape
-            )
+        #     maskmem_features += (
+        #         1 - is_obj_appearing
+        #     ) * self.no_obj_embed_spatial[..., None, None].expand(
+        #         *maskmem_features.shape
+        #     )
 
         return maskmem_features, maskmem_pos_enc
 
@@ -971,13 +972,13 @@ class SAM2Base(torch.nn.Module):
             _,
             low_res_masks,
             high_res_masks,
-            obj_ptr,
+            obj_ptrs,
             object_score_logits,
         ) = sam_outputs
 
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
-        current_out["obj_ptr"] = obj_ptr
+        current_out["obj_ptrs"] = obj_ptrs
         if not self.training:
             # Only add this in inference (to avoid unused param in activation checkpointing;
             # it's mainly used in the demo to encode spatial memories w/ consolidated masks)

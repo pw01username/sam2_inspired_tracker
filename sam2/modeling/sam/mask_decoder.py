@@ -226,9 +226,11 @@ class MaskDecoder(nn.Module):
 
         # Run the transformer
         hs, src = self.transformer(src, pos_src, tokens)
-        #print("hs shape, s", hs.shape, s)
+        
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
+
+        print("hs shape, s", hs.shape, s, mask_tokens_out.shape, torch.equal(mask_tokens_out[0, 0], mask_tokens_out[0, 1]))
 
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)

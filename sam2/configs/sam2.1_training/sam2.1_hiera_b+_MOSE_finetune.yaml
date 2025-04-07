@@ -3,11 +3,11 @@
 scratch:
   resolution: 512 #1024
   train_batch_size: 1
-  num_train_workers: 24 #10
-  num_frames: 8
+  num_train_workers: 32 #10
+  num_frames: 2 #8
   max_num_objects: 3
-  base_lr: 5.0e-3 #5.0e-6
-  vision_lr: 3.0e-04 #3.0e-06
+  base_lr: 3.0e-3 #5.0e-6
+  vision_lr: 3.0e-05 #3.0e-06
   phases_per_epoch: 1
   num_epochs: 500
 
@@ -282,15 +282,15 @@ trainer:
     all:
       _target_: training.loss_fns.MultiStepMultiMasksAndIous
       weight_dict:
-        loss_mask: 30 #20
-        loss_dice: 1
-        loss_iou: 1
-        loss_class: 1
+        loss_mask: 1 #20
+        loss_dice: 0 #1
+        loss_iou: 0 #1
+        loss_class: 0 #1
       supervise_all_iou: true
       iou_use_l1_loss: true
       pred_obj_scores: false #true
-      focal_gamma_obj_score: 3 #0.0
-      focal_alpha_obj_score: 0.75 #-1.0
+      focal_gamma_obj_score: 2 #0.0
+      focal_alpha_obj_score: 0.95 #0.3 #-1.0
 
   distributed:
     backend: nccl
