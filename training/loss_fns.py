@@ -139,7 +139,9 @@ def sigmoid_focal_loss(
         focal loss tensor
     """
     prob = inputs.sigmoid()
-    visualize_4d_tensor(prob.float(), "prob_sigmoid.png")
+    
+    if prob.dim() == 4:
+        visualize_4d_tensor(prob.float(), "prob_sigmoid.png")
 
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
@@ -367,6 +369,160 @@ class MultiStepMultiMasksAndIous(nn.Module):
     def _update_losses(
         self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
     ):
+        """
+        Updated version with proper mask assignment and IoU handling
+        """
+        debug_gradients(src_masks, "src_masks")
+        debug_gradients(target_masks, "target_masks")
+        debug_gradients(ious, "ious")
+        
+        # Save visualizations for debugging if needed
+        #visualize_4d_tensor(src_masks, f"loss_viz/src_predicted_mask_{0}.png")
+        #visualize_4d_tensor(target_masks, f"loss_viz/target_masks_{0}.png")
+
+        B, N, H, W = src_masks.shape  # Batch size, number of predicted masks, height, width
+        M = target_masks.shape[1]     # Number of ground truth masks
+        
+        # Step 1: Calculate IoU matrix between predicted and target masks
+        # Convert logits to probabilities for IoU calculation
+        src_probs = torch.sigmoid(src_masks)
+        
+        # Compute IoU between all pred and target masks
+        iou_matrix = torch.zeros((B, N, M), device=src_masks.device)
+        
+        for b in range(B):
+            for n in range(N):
+                for m in range(M):
+                    # Binarize masks for IoU calculation
+                    pred_mask = src_probs[b, n] > 0.5  # Use 0.5 threshold for consistency
+                    gt_mask = target_masks[b, m] > 0.5
+                    
+                    # Skip if either mask is empty
+                    if not pred_mask.any() or not gt_mask.any():
+                        continue
+                    
+                    # Calculate intersection and union
+                    intersection = (pred_mask & gt_mask).sum().float()
+                    union = (pred_mask | gt_mask).sum().float()
+                    
+                    if union > 0:
+                        iou_matrix[b, n, m] = intersection / union
+        
+        # Step 2: Perform optimal assignment (greedy approach for simplicity)
+        matched_pairs = []
+        for b in range(B):
+            # For each batch item
+            matched_indices = []
+            available_targets = list(range(M))
+            
+            for n in range(N):
+                if not available_targets:
+                    break
+                    
+                # Find best match among remaining targets
+                best_iou = -1
+                best_m = -1
+                best_m_idx = -1
+                
+                for idx, m in enumerate(available_targets):
+                    if iou_matrix[b, n, m] > best_iou:
+                        best_iou = iou_matrix[b, n, m]
+                        best_m = m
+                        best_m_idx = idx
+                
+                # Only match if IoU is above threshold (can be adjusted)
+                if best_iou > 0.1:  # Minimum IoU threshold
+                    matched_indices.append((n, best_m))
+                    # Remove this ground truth from available matches
+                    available_targets.pop(best_m_idx)
+            
+            matched_pairs.append(matched_indices)
+        
+        # Step 3: Create rearranged target masks based on matching
+        rearranged_targets = torch.zeros_like(target_masks)
+        
+        for b in range(B):
+            # For each matched pair in this batch item
+            for pred_idx, gt_idx in matched_pairs[b]:
+                rearranged_targets[b, pred_idx] = target_masks[b, gt_idx]
+        
+        # Step 4: Update predicted IoUs to match actual calculated IoUs
+        # actual_ious = torch.zeros_like(ious)
+        # for b in range(B):
+        #     for n in range(N):
+        #         # Default to 0 IoU
+        #         actual_ious[b, n] = 0.0
+                
+        #         # If this prediction is matched to a target, use the calculated IoU
+        #         for pred_idx, gt_idx in matched_pairs[b]:
+        #             if pred_idx == n:
+        #                 actual_ious[b, n] = iou_matrix[b, n, gt_idx]
+        
+        # Optional: Uncomment this line to use actual IoUs instead of predicted IoUs
+        # In training, we want to keep the predicted IoUs to learn, but for testing it helps
+        # ious = actual_ious
+        
+        # Step 5: Calculate losses with rearranged_targets
+        # Object presence masks - 1 where there's a target object, 0 otherwise
+        obj_presence = torch.any(rearranged_targets > 0.5, dim=(2,3)).float()
+        
+        # Calculate focal loss on all output masks
+        loss_multimask = sigmoid_focal_loss(
+            src_masks,
+            rearranged_targets,
+            num_objects,
+            alpha=self.focal_alpha,
+            gamma=self.focal_gamma,
+            loss_on_multimask=True,
+        )
+        
+        # Calculate dice loss
+        loss_multidice = dice_loss(
+            src_masks, rearranged_targets, num_objects, loss_on_multimask=True
+        )
+        
+        # Calculate object score loss if enabled
+        if not self.pred_obj_scores:
+            loss_class = torch.tensor(
+                0.0, dtype=loss_multimask.dtype, device=loss_multimask.device
+            )
+        else:
+            loss_class = sigmoid_focal_loss(
+                object_score_logits,
+                obj_presence,
+                num_objects,
+                alpha=self.focal_alpha_obj_score,
+                gamma=self.focal_gamma_obj_score,
+            )
+        
+        # Calculate IoU loss
+        loss_multiiou = iou_loss(
+            src_masks,
+            rearranged_targets,
+            ious,
+            num_objects,
+            loss_on_multimask=True,
+            use_l1_loss=self.iou_use_l1_loss,
+        )
+
+        assert loss_multimask.dim() == 2
+        assert loss_multidice.dim() == 2
+        assert loss_multiiou.dim() == 2
+        
+        # Apply loss for each mask channel
+        loss_mask = loss_multimask
+        loss_dice = loss_multidice
+        loss_iou = loss_multiiou
+        
+        # Sum over batch dimension
+        losses["loss_mask"] += loss_mask.sum()
+        losses["loss_dice"] += loss_dice.sum()
+        losses["loss_iou"] += loss_iou.sum()
+        losses["loss_class"] += loss_class
+
+    def _update_losses_original(
+        self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
+    ):
         debug_gradients(src_masks, "src_masks")
         debug_gradients(target_masks, "target_masks")
         debug_gradients(ious, "ious")
@@ -547,3 +703,184 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 reduced_loss += losses[loss_key] * weight
 
         return reduced_loss
+
+
+
+def test_multi_object_loss():
+    """
+    Test the loss function with proper multi-object segmentation setup
+    """
+    import torch
+    import matplotlib.pyplot as plt
+    import os
+    
+    # Create output directory
+    os.makedirs("loss_test_multi", exist_ok=True)
+    
+    # Set up device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Testing multi-object loss on device: {device}")
+    
+    # Parameters
+    batch_size = 1
+    num_objects = 3  # Multiple objects
+    height, width = 64, 64  # Image dimensions
+    
+    # Initialize loss weights
+    weight_dict = {
+        "loss_mask": 20.0,
+        "loss_dice": 1.0,
+        "loss_iou": 1.0,
+        "loss_class": 1.0
+    }
+    
+    # Create loss function
+    criterion = MultiStepMultiMasksAndIous(
+        weight_dict=weight_dict,
+        focal_alpha=0.25,
+        focal_gamma=2,
+        supervise_all_iou=True,
+        iou_use_l1_loss=False,
+        pred_obj_scores=True
+    )
+    
+    print("\n===== TEST 1: IDENTICAL MASKS (SHOULD BE NEAR-ZERO LOSS) =====")
+    
+    # Create ground truth binary masks with three distinct objects
+    gt_masks = torch.zeros((batch_size, num_objects, height, width), device=device)
+    
+    # Add distinct shapes to each mask
+    for i in range(num_objects):
+        center_y = height // 2
+        center_x = width // 2 + (i - 1) * (width // 4)  # Distribute horizontally
+        radius = min(height, width) // 6
+        
+        y_indices, x_indices = torch.meshgrid(
+            torch.arange(height, device=device),
+            torch.arange(width, device=device)
+        )
+        
+        # Create a circle for each object
+        dist_squared = (y_indices - center_y) ** 2 + (x_indices - center_x) ** 2
+        gt_masks[:, i] = (dist_squared < radius ** 2).float()
+    
+    # Visualize ground truth masks
+    plt.figure(figsize=(12, 4))
+    for i in range(num_objects):
+        plt.subplot(1, num_objects, i+1)
+        plt.imshow(gt_masks[0, i].cpu().numpy())
+        plt.title(f"GT Mask {i}")
+    plt.savefig("loss_test_multi/gt_masks.png")
+    plt.close()
+    
+    # Convert binary GT masks to proper logits (Fix #1)
+    binary_to_logits = lambda x: torch.where(x > 0.5, 
+                                           torch.tensor(10.0, device=x.device), 
+                                           torch.tensor(-10.0, device=x.device))
+    
+    pred_masks = binary_to_logits(gt_masks.clone())
+    
+    # Calculate actual IoUs for prediction-target pairs (Fix #2)
+    actual_ious = torch.zeros((batch_size, num_objects), device=device)
+    
+    for b in range(batch_size):
+        for i in range(num_objects):
+            # For identical masks, IoU should be 1.0
+            actual_ious[b, i] = 1.0
+    
+    # Create object score logits (high positive for true objects)
+    obj_scores = torch.ones((batch_size, num_objects), device=device) * 10.0
+    
+    # Structure outputs
+    outputs = {
+        "multistep_pred_multimasks_high_res": [pred_masks],
+        "multistep_pred_ious": [actual_ious],  # Use actual calculated IoUs
+        "multistep_object_score_logits": [obj_scores]
+    }
+    
+    # Calculate loss
+    losses = criterion([outputs], gt_masks)
+    
+    # Print loss components
+    print("Loss components for identical masks:")
+    for k, v in losses.items():
+        print(f"{k}: {v.item()}")
+    
+    print("\n===== TEST 2: SHUFFLED MASKS (SHOULD MATCH THEM CORRECTLY) =====")
+    
+    # Use the same GT masks but shuffle the order in predictions
+    shuffled_indices = [2, 0, 1]  # Example permutation
+    shuffled_masks = torch.zeros_like(gt_masks)
+    
+    for i, idx in enumerate(shuffled_indices):
+        shuffled_masks[:, i] = gt_masks[:, idx]
+    
+    # Convert shuffled masks to logits
+    pred_masks = binary_to_logits(shuffled_masks)
+    
+    # Create outputs with shuffled masks
+    outputs = {
+        "multistep_pred_multimasks_high_res": [pred_masks],
+        "multistep_pred_ious": [torch.ones((batch_size, num_objects), device=device)],  # All 1.0 initially
+        "multistep_object_score_logits": [obj_scores]
+    }
+    
+    # Calculate loss
+    losses = criterion([outputs], gt_masks)
+    
+    # Print loss components
+    print("Loss components for shuffled masks:")
+    for k, v in losses.items():
+        print(f"{k}: {v.item()}")
+    
+    print("\n===== TEST 3: SLIGHTLY PERTURBED MASKS (SMALL BUT NON-ZERO LOSS) =====")
+    
+    # Create slightly perturbed versions of the GT masks
+    perturbed_masks = torch.zeros_like(gt_masks)
+    
+    for i in range(num_objects):
+        center_y = height // 2
+        center_x = width // 2 + (i - 1) * (width // 4)
+        radius = min(height, width) // 6
+        
+        # Add small offset to create perturbation
+        offset_y = 2 if i % 2 == 0 else -2
+        offset_x = 2 if i % 2 == 1 else -2
+        
+        y_indices, x_indices = torch.meshgrid(
+            torch.arange(height, device=device),
+            torch.arange(width, device=device)
+        )
+        
+        # Create slightly shifted circle
+        dist_squared = (y_indices - center_y - offset_y) ** 2 + (x_indices - center_x - offset_x) ** 2
+        perturbed_masks[:, i] = (dist_squared < radius ** 2).float()
+    
+    # Convert perturbed masks to logits
+    pred_masks = binary_to_logits(perturbed_masks)
+    
+    # Create outputs with perturbed masks
+    outputs = {
+        "multistep_pred_multimasks_high_res": [pred_masks],
+        "multistep_pred_ious": [torch.ones((batch_size, num_objects), device=device) * 0.8],  # Estimated IoUs
+        "multistep_object_score_logits": [obj_scores]
+    }
+    
+    # Calculate loss
+    losses = criterion([outputs], gt_masks)
+    
+    # Print loss components
+    print("Loss components for perturbed masks:")
+    for k, v in losses.items():
+        print(f"{k}: {v.item()}")
+    
+    print("\n===== SUMMARY =====")
+    print("For proper multi-object mask segmentation loss calculation:")
+    print("1. Convert binary masks to logits (0->-10, 1->10) before passing to loss function")
+    print("2. Ensure the loss function correctly matches predictions with targets")
+    print("3. Consider updating predicted IoUs to match calculated IoUs during evaluation")
+    print("4. The +1 terms in dice_loss cause a small residual loss even with perfect matches")
+
+if __name__ == "__main__":
+    # Run the multi-object test
+    test_multi_object_loss()
