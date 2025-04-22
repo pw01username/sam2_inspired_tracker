@@ -38,7 +38,7 @@ class MaskDownSampler(nn.Module):
         num_layers = int(math.log2(total_stride) // math.log2(stride))
         assert stride**num_layers == total_stride
         self.encoder = nn.Sequential()
-        mask_in_chans, mask_out_chans = 1, 1
+        mask_in_chans, mask_out_chans = 3, 1
         for _ in range(num_layers):
             mask_out_chans = mask_in_chans * (stride**2)
             self.encoder.append(
@@ -54,7 +54,11 @@ class MaskDownSampler(nn.Module):
             self.encoder.append(activation())
             mask_in_chans = mask_out_chans
 
-        self.encoder.append(nn.Conv2d(mask_out_chans, embed_dim, kernel_size=1))
+        self.encoder.append(nn.Conv2d(mask_out_chans, mask_out_chans // 3, kernel_size=1))  # 768 -> 256
+        self.encoder.append(LayerNorm2d(mask_out_chans // 3))
+        self.encoder.append(activation())
+        
+        self.encoder.append(nn.Conv2d(mask_out_chans // 3, embed_dim, kernel_size=1))
 
     def forward(self, x):
         return self.encoder(x)
@@ -259,28 +263,24 @@ class MemoryEncoder(nn.Module):
         if not skip_mask_sigmoid:
             masks = F.sigmoid(masks)
         
-        #masks = self.mask_downsampler(masks)
+        #visualize_4d_tensor(masks.float(), f"masks_memenc/masks memory encoder.png")
+        masks = self.mask_downsampler(masks)
         
         # Use the prompt encoder's multi-mask embedding functionality
         # This will handle the attention fusion between masks
-        mask_features = self._embed_multi_masks(masks)
-
-        visualize_4d_tensor(masks.float(), f"masks_memenc/masks memory encoder.png")
-        #reshaped = mask_features.squeeze(0).reshape(16, 16, 32, 32)
-
-        #visualize_4d_tensor(reshaped, f"masks_memenc/mask_ft_embeds.png")
-
+        #mask_features = self._embed_multi_masks(masks)
+        #visualize_4d_tensor(masks.float(), "MASKS.png")
 
         ## Fuse pix_feats and downsampled masks
         # in case the visual features are on CPU, cast them to CUDA
         pix_feat = pix_feat.to(masks.device)
 
         x = self.pix_feat_proj(pix_feat)
-        x = x + mask_features #masks
+        x = x + masks #mask_features
         x = self.fuser(x)
         x = self.out_proj(x)
 
-        visualize_4d_tensor(x.float(), f"masks_memenc/vision features memory encoder.png")
+        #visualize_4d_tensor(x.float(), f"masks_memenc/vision features memory encoder.png")
 
         pos = self.position_encoding(x).to(x.dtype)
 

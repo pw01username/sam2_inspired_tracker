@@ -75,6 +75,8 @@ class RandomUniformSampler(VOSSampler):
             visible_object_ids,
             min(len(visible_object_ids), self.max_num_objects),
         )
+        #object_ids = [1, 2, 3] #visible_object_ids # OVERRIDEN TO ALLOW OVERFITTING ON SAME OBJECT IN SAME DECODER OUT MASK SLOT
+
         return SampledFramesAndObjects(frames=frames, object_ids=object_ids)
 
 

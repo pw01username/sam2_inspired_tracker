@@ -13,13 +13,117 @@ from sam2.modeling.sam2_utils import LayerNorm2d, MLP
 
 from training.utils.visualize import visualize_frame, quick_visualize_mask, visualize_4d_tensor
 
+class MaskTokenCommunication(nn.Module):
+    """
+    Module for inter-object communication between mask tokens.
+    Allows mask tokens to attend to each other and develop awareness
+    of other potential objects in the scene.
+    """
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        # Add an MLP after attention for more complex relationships
+        self.mlp = MLP(dim, dim * 2, dim, 2)
+        
+    def forward(self, x):
+        # x shape: [batch_size, num_tokens, dim]
+        normed_x = self.norm(x)
+        attended_x, _ = self.attention(normed_x, normed_x, normed_x)
+        return x + self.mlp(attended_x)
+
+class MaskCompetition(nn.Module):
+    """
+    Module that creates competition between masks to reduce overlap.
+    Makes mask outputs compete for spatial regions through a softmax-like mechanism.
+    """
+    def __init__(self, temperature=1.0):
+        super().__init__()
+        self.temperature = temperature
+        
+    def forward(self, masks):
+        # masks shape: [batch_size, num_masks, height, width]
+        # Apply softmax across the mask dimension to create competition
+        # Higher temperature makes the competition softer
+        masks_exp = torch.exp(masks / self.temperature)
+        masks_sum = masks_exp.sum(dim=1, keepdim=True)
+        normalized_masks = masks_exp / (masks_sum + 1e-6)
+        return normalized_masks
+
+class PromptMaskCrossAttention(nn.Module):
+    """
+    Module for cross-attention between mask tokens and individual mask prompts.
+    This helps each mask token focus on the correct object from the input prompts.
+    """
+    def __init__(self, embed_dim, num_heads=8):
+        super().__init__()
+        self.norm_tokens = nn.LayerNorm(embed_dim)
+        self.norm_prompts = nn.LayerNorm(embed_dim)
+        
+        # Cross-attention from mask tokens to prompts
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim, num_heads, batch_first=True
+        )
+        
+        # MLP for processing the attended output
+        self.mlp = MLP(embed_dim, embed_dim * 2, embed_dim, 2)
+        
+    def forward(self, mask_tokens, prompt_embeddings):
+        """
+        Arguments:
+            mask_tokens: [batch_size, num_masks, embed_dim]
+            prompt_embeddings: list of [batch_size, embed_dim, h, w] tensors
+        
+        Returns:
+            Updated mask tokens with prompt information
+        """
+        B, N, C = mask_tokens.shape
+        
+        # Normalize the mask tokens - this doesn't modify the original
+        normed_tokens = self.norm_tokens(mask_tokens)
+        
+        # Track accumulated updates for all tokens
+        accumulated_updates = torch.zeros_like(mask_tokens)
+        
+        # Process each prompt embedding (one per object)
+        for i, prompt_emb in enumerate(prompt_embeddings):
+            if i >= N:  # Skip if we have more prompts than mask tokens
+                break
+                
+            # Reshape spatial prompt embedding to sequence format for attention
+            # Convert from [B, C, h, w] to [B, h*w, C]
+            flattened_prompt = prompt_emb.flatten(2).permute(0, 2, 1)
+            normed_prompt = self.norm_prompts(flattened_prompt)
+            
+            # Get the corresponding mask token for this prompt
+            # We only need the i-th token since each token corresponds to one prompt
+            token_query = normed_tokens[:, i:i+1]  # Shape: [B, 1, C]
+            
+            # Apply cross-attention: token attends to all spatial locations in the prompt
+            attended_output, _ = self.cross_attention(
+                token_query,     # Query: single token [B, 1, C]
+                normed_prompt,   # Key: all spatial locations [B, h*w, C]
+                normed_prompt    # Value: all spatial locations [B, h*w, C]
+            )
+            
+            # Store the update for this specific token
+            accumulated_updates[:, i:i+1] = attended_output
+        
+        # Apply the accumulated updates
+        updated_tokens = mask_tokens + accumulated_updates
+        
+        # Apply the MLP to further process the tokens
+        final_tokens = updated_tokens + self.mlp(updated_tokens)
+        
+        return final_tokens
+
 class MaskDecoder(nn.Module):
     def __init__(
         self,
         *,
         transformer_dim: int,
         transformer: nn.Module,
-        num_multimask_outputs: int = 10,
+        num_multimask_outputs: int,
         activation: Type[nn.Module] = nn.GELU,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
@@ -83,6 +187,13 @@ class MaskDecoder(nn.Module):
                 transformer_dim, transformer_dim // 4, kernel_size=1, stride=1
             )
 
+        # shared_output_hypernetwork = MLP(
+        #     transformer_dim, 
+        #     transformer_dim, 
+        #     transformer_dim // 8 * self.num_mask_tokens, 
+        #     3
+        # )
+
         self.output_hypernetworks_mlps = nn.ModuleList(
             [
                 MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
@@ -116,7 +227,14 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
 
 
-        self.inferece_num = 0
+        # Add cross-attention between mask tokens and mask prompts
+        self.prompt_mask_attention = PromptMaskCrossAttention(transformer_dim)
+
+        # Add inter-object communication module
+        self.mask_token_communication = MaskTokenCommunication(transformer_dim)
+        
+        # Add mask competition module
+        self.mask_competition = MaskCompetition(temperature=0.5)
 
     def forward(
         self,
@@ -127,6 +245,7 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        individual_mask_embeddings: Optional[List[torch.Tensor]] = None,  # New parameter for explicit prompt attention
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -151,6 +270,7 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             repeat_image=repeat_image,
             high_res_features=high_res_features,
+            individual_mask_embeddings=individual_mask_embeddings,
         )
 
         # Select the correct mask or masks for output
@@ -175,7 +295,6 @@ class MaskDecoder(nn.Module):
         sam_tokens_out = mask_tokens_out
 
         #visualize_4d_tensor(masks.float(), f"loss_viz/mask_decoder_masks_iter_{0}.png")
-        #self.inferece_num += 1
         
         # Prepare output
         return masks, iou_pred, sam_tokens_out, object_score_logits
@@ -188,6 +307,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        individual_mask_embeddings: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -217,7 +337,8 @@ class MaskDecoder(nn.Module):
         else:
             assert image_embeddings.shape[0] == tokens.shape[0]
             src = image_embeddings
-        src = src + dense_prompt_embeddings
+        src = src #+ dense_prompt_embeddings
+        #visualize_4d_tensor(src.float(), "masks_memenc/mask decoder src.png")
         assert (
             image_pe.size(0) == 1
         ), "image_pe should have size 1 in batch dim (from `get_dense_pe()`)"
@@ -230,7 +351,19 @@ class MaskDecoder(nn.Module):
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
 
-        print("hs shape, s", hs.shape, s, mask_tokens_out.shape, torch.equal(mask_tokens_out[0, 0], mask_tokens_out[0, 1]))
+        # Apply cross-attention between mask tokens and individual mask prompts
+        # This helps each mask token focus on its corresponding prompt
+        if individual_mask_embeddings is not None and len(individual_mask_embeddings) > 0:
+            mask_tokens_out = self.prompt_mask_attention(
+                mask_tokens_out, individual_mask_embeddings
+            )
+
+        # Apply inter-object communication to the mask tokens
+        # This allows each mask token to be aware of other mask tokens
+        # and helps ensure better separation between objects
+        mask_tokens_out = self.mask_token_communication(mask_tokens_out)
+
+        #print("hs shape, s", hs.shape, s, mask_tokens_out.shape, torch.equal(mask_tokens_out[0, 0], mask_tokens_out[0, 1]))
 
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
@@ -250,6 +383,10 @@ class MaskDecoder(nn.Module):
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding.shape
         masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+
+        # Apply mask competition to reduce overlap between masks
+        if not self.training:
+            masks = self.mask_competition(masks)
 
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)

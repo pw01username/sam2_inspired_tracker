@@ -1,22 +1,22 @@
 # @package _global_
 
 scratch:
-  resolution: 512 #1024
+  resolution: 1024 #1024
   train_batch_size: 1
-  num_train_workers: 32 #10
+  num_train_workers: 30 #10
   num_frames: 2 #8
   max_num_objects: 3
-  base_lr: 3.0e-3 #5.0e-6
-  vision_lr: 3.0e-05 #3.0e-06
+  base_lr: 5.0e-5 #5.0e-6
+  vision_lr: 3.0e-5
   phases_per_epoch: 1
   num_epochs: 500
 
 dataset:
   # PATHS to Dataset
-  img_folder: /davis/DAVIS/JPEGImages_overfit
-  gt_folder: /davis/DAVIS/Annotations_overfit
+  img_folder: /home/pat/davis/DAVIS/JPEGImages_overfit
+  gt_folder: /home/pat/davis/DAVIS/Annotations_overfit
   file_list_txt: null
-  multiplier: 10 #2
+  multiplier: 1 #2
 
 # Video transforms
 vos:
@@ -92,7 +92,7 @@ trainer:
         _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
         activation: relu
         dim_feedforward: 2048
-        dropout: 0.1
+        dropout: 0 #0.08
         pos_enc_at_attn: false
         self_attention:
           _target_: sam2.modeling.sam.transformer.RoPEAttention
@@ -101,7 +101,7 @@ trainer:
           embedding_dim: 256
           num_heads: 1
           downsample_rate: 1
-          dropout: 0.1
+          dropout: 0 #0.08
         d_model: 256
         pos_enc_at_cross_attn_keys: true
         pos_enc_at_cross_attn_queries: false
@@ -113,7 +113,7 @@ trainer:
           embedding_dim: 256
           num_heads: 1
           downsample_rate: 1
-          dropout: 0.1
+          dropout: 0 #0.08
           kv_in_dim: 64
       num_layers: 4
 
@@ -188,13 +188,10 @@ trainer:
     rand_frames_to_correct_for_train: False  # random #init-cond-frame ~ 2
     add_all_frames_to_correct_as_cond: True  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
     # maximum 2 initial conditioning frames
-    num_init_cond_frames_for_train: 2
-    rand_init_cond_frames_for_train: True  # random 1~2
+    num_init_cond_frames_for_train: 1 #2
+    rand_init_cond_frames_for_train: False # True  # random 1~2
     num_correction_pt_per_frame: 7
     use_act_ckpt_iterative_pt_sampling: false
-    
-
-    
     num_init_cond_frames_for_eval: 1  # only mask on the first frame
     forward_backbone_per_frame_for_eval: True
     
@@ -243,13 +240,13 @@ trainer:
 
     gradient_clip:
       _target_: training.optimizer.GradientClipper
-      max_norm: 0.1
+      max_norm: 5 #0.1
       norm_type: 2
 
     param_group_modifiers:
       - _target_: training.optimizer.layer_decay_param_modifier
         _partial_: True
-        layer_decay_value: 0.9
+        layer_decay_value: 0 #0.9
         apply_to: 'image_encoder.trunk'
         overrides:
           - pattern: '*pos_embed*'
@@ -270,7 +267,7 @@ trainer:
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 0.1
+            value: 0 #0.1
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.0
@@ -282,15 +279,13 @@ trainer:
     all:
       _target_: training.loss_fns.MultiStepMultiMasksAndIous
       weight_dict:
-        loss_mask: 1 #20
-        loss_dice: 0 #1
+        loss_mask: 20
+        loss_dice: 0.01 #1
         loss_iou: 0 #1
         loss_class: 0 #1
       supervise_all_iou: true
       iou_use_l1_loss: true
       pred_obj_scores: false #true
-      focal_gamma_obj_score: 2 #0.0
-      focal_alpha_obj_score: 0.95 #0.3 #-1.0
 
   distributed:
     backend: nccl
@@ -317,14 +312,8 @@ trainer:
       #ignore_missing_keys: null
       ignore_unexpected_keys:
         - "*"
-        - "no_obj_ptr"
-        - "sam_mask_decoder.output_hypernetworks_mlps.3.*"  # Ignore all keys in hypernetwork MLP 3
       ignore_missing_keys:
-        - "sam_prompt_encoder.object_id_embeddings.*"  # Ignore object ID embeddings
-        - "sam_prompt_encoder.mask_attention.*"        # Ignore mask attention
-        - "sam_prompt_encoder.mask_fusion.*"           # Ignore mask fusion
-        - "sam_mask_decoder.mask_tokens.*"             # Ignore mask tokens
-        - "sam_mask_decoder.iou_prediction_head.layers.2.*"  # Ignore additional IOU layer
+        - "*"
 
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels

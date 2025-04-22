@@ -785,14 +785,6 @@ class Trainer:
                         self.model, rank=self.distributed_rank, where=self.where
                     )
 
-                # DEBUG TO TEST FIXING ERROR
-                for name, param in self.model.named_parameters():
-                    if param.requires_grad and param.grad is not None:
-                        if param.grad.shape != param.shape:
-                            print(f"Shape mismatch for {name}: param {param.shape}, grad {param.grad.shape}")
-                            # Optional: Fix the shape mismatch by reshaping the gradient
-                            param.grad = param.grad.view(param.shape)   
-
                 # Optimizer step: the scaler will make sure gradients are not
                 # applied if the gradients are infinite
                 self.scaler.step(self.optim.optimizer)

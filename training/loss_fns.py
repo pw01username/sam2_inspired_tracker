@@ -7,6 +7,8 @@
 from collections import defaultdict
 from typing import Dict, List
 
+import math
+
 import os
 import torch
 import torch.distributed
@@ -50,7 +52,7 @@ def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
         return loss / num_objects
     return loss.sum() / num_objects
 
-def diversity_loss(predictions, targets, threshold=0.5, eps=1e-5):
+def diversity_loss(predictions, targets, threshold=0, eps=1e-5):
     """
     Penalize similarity between different mask channels only for predicted objects
     within target regions.
@@ -77,7 +79,7 @@ def diversity_loss(predictions, targets, threshold=0.5, eps=1e-5):
     targets_flat = targets.view(B, N, -1)  # [B, N, H*W]
     
     # Create target regions mask - pixels where any target channel has an object
-    target_regions = (targets_flat > 0.5).any(dim=1, keepdim=True)  # [B, 1, H*W]
+    target_regions = (targets_flat > 0).any(dim=1, keepdim=True)  # [B, 1, H*W]
     
     # Calculate overlap only for pixels where at least one channel predicts an object
     # AND where there's at least one target object
@@ -139,9 +141,6 @@ def sigmoid_focal_loss(
         focal loss tensor
     """
     prob = inputs.sigmoid()
-    
-    if prob.dim() == 4:
-        visualize_4d_tensor(prob.float(), "prob_sigmoid.png")
 
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
@@ -152,37 +151,58 @@ def sigmoid_focal_loss(
         loss = alpha_t * loss
 
     if loss_on_multimask:
-        # loss is [N, M, H, W] where M corresponds to multiple predicted masks
-        #assert loss.dim() == 4
-        #return loss.flatten(2).mean(-1) / num_objects  # average over spatial dims
-
-        # For multi-object segmentation, we compute loss per object (channel)
-        # and return loss for each object separately
-        # Average over spatial dimensions but keep object dimension
+        # Average over spatial dimensions but keep mask/object dimension N
         # loss is [B, N, H, W] -> [B, N]
-        div_loss = diversity_loss(inputs, targets)
-        diversity_weight = 0.001
-        print("----", loss.flatten(2).shape, loss.flatten(2).mean(-1).shape)
-        visualize_4d_tensor(loss.float(), "loss.png")
-        visualize_4d_tensor(ce_loss.float(), "loss_ce.png")
-        visualize_4d_tensor((1-p_t).float(), "p_t.png")
+        div_loss = diversity_loss(prob, targets)
+        diversity_weight = 0.1
+        
+        visualize_4d_tensor(
+            torch.cat([inputs.float(), prob, targets.float(), loss.float(), ce_loss.float(), ((1 - p_t) ** gamma).float()]), "loss_viz/inputs_prob_targets_loss_ce_pt.png", add_colorbar=True)
 
         # Average over spatial dimensions but keep batch dimension
         focal_loss_term = loss.flatten(2).mean(-1) / num_objects
         
+
+        # Create clones with gradients for visualization
+        inputs_with_grad = inputs.clone().detach().requires_grad_(True)
+        
+        # Recompute losses with the cloned inputs
+        prob_vis = inputs_with_grad.sigmoid()
+        ce_loss_vis = F.binary_cross_entropy_with_logits(inputs_with_grad, targets, reduction="none")
+        p_t_vis = prob_vis * targets + (1 - prob_vis) * (1 - targets)
+        loss_vis = ce_loss_vis * ((1 - p_t_vis) ** gamma)
+        if alpha >= 0:
+            alpha_t_vis = alpha * targets + (1 - alpha) * (1 - targets)
+            loss_vis = alpha_t_vis * loss_vis
+            
+        # Compute focal loss term
+        focal_loss_term_vis = loss_vis.flatten(2).mean(-1) / num_objects
+        
+        # Compute diversity loss
+        div_loss_vis = diversity_loss(prob_vis, targets)
+        
+        # Get gradients for visualization
+        focal_loss_term_vis.sum().backward(retain_graph=True)
+        if inputs_with_grad.grad is not None:  # Add this check
+            focal_only_grads = inputs_with_grad.grad.clone()
+            inputs_with_grad.grad.zero_()
+            
+            # Get diversity loss gradients
+            (diversity_weight * div_loss_vis).sum().backward()
+            diversity_only_grads = inputs_with_grad.grad.clone()
+            
+            # Visualize both gradient components
+            visualize_4d_tensor(
+                torch.cat([prob, targets.float(), focal_only_grads, diversity_only_grads]),
+                "loss_viz/focal_vs_diversity_grads.png",
+                add_colorbar=True
+            )
+
+
         # Add diversity penalty (already at batch level)
-        return focal_loss_term + diversity_weight * div_loss
+        return focal_loss_term + (diversity_weight * div_loss)
 
     return loss.mean(1).sum() / num_objects
-
-def debug_gradients(tensor, name):
-    """Helper function to debug gradient flow"""
-    if isinstance(tensor, torch.Tensor):
-        print(f"{name}: requires_grad={tensor.requires_grad}, has_grad_fn={tensor.grad_fn is not None}")
-        if tensor.grad_fn is not None:
-            print(f"  grad_fn type: {type(tensor.grad_fn).__name__}")
-    else:
-        print(f"{name} is not a tensor: {type(tensor)}")
 
 def iou_loss(
     inputs, targets, pred_ious, num_objects, loss_on_multimask=False, use_l1_loss=False
@@ -372,10 +392,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         """
         Updated version with proper mask assignment and IoU handling
         """
-        debug_gradients(src_masks, "src_masks")
-        debug_gradients(target_masks, "target_masks")
-        debug_gradients(ious, "ious")
-        
+
         # Save visualizations for debugging if needed
         #visualize_4d_tensor(src_masks, f"loss_viz/src_predicted_mask_{0}.png")
         #visualize_4d_tensor(target_masks, f"loss_viz/target_masks_{0}.png")
@@ -383,69 +400,103 @@ class MultiStepMultiMasksAndIous(nn.Module):
         B, N, H, W = src_masks.shape  # Batch size, number of predicted masks, height, width
         M = target_masks.shape[1]     # Number of ground truth masks
         
-        # Step 1: Calculate IoU matrix between predicted and target masks
-        # Convert logits to probabilities for IoU calculation
-        src_probs = torch.sigmoid(src_masks)
+        # # Step 1: Calculate IoU matrix between predicted and target masks
+        # # Convert logits to probabilities for IoU calculation
+        # src_probs = torch.sigmoid(src_masks)
+
+        # # Compute IoU between all pred and target masks
+        # iou_matrix = torch.zeros((B, N, M), device=src_masks.device)
         
-        # Compute IoU between all pred and target masks
-        iou_matrix = torch.zeros((B, N, M), device=src_masks.device)
+        # for b in range(B):
+        #     for n in range(N):
+        #         for m in range(M):
+        #             # Binarize masks for IoU calculation
+        #             pred_mask = src_probs[b, n] > 0  # Use 0.5 threshold for consistency
+        #             gt_mask = target_masks[b, m] > 0
+                    
+        #             # Skip if either mask is empty
+        #             if not pred_mask.any() or not gt_mask.any():
+        #                 continue
+                    
+        #             # Calculate intersection and union
+        #             intersection = (pred_mask & gt_mask).sum().float()
+        #             union = (pred_mask | gt_mask).sum().float()
+                    
+        #             if union > 0:
+        #                 iou_matrix[b, n, m] = intersection / union
         
-        for b in range(B):
-            for n in range(N):
-                for m in range(M):
-                    # Binarize masks for IoU calculation
-                    pred_mask = src_probs[b, n] > 0.5  # Use 0.5 threshold for consistency
-                    gt_mask = target_masks[b, m] > 0.5
-                    
-                    # Skip if either mask is empty
-                    if not pred_mask.any() or not gt_mask.any():
-                        continue
-                    
-                    # Calculate intersection and union
-                    intersection = (pred_mask & gt_mask).sum().float()
-                    union = (pred_mask | gt_mask).sum().float()
-                    
-                    if union > 0:
-                        iou_matrix[b, n, m] = intersection / union
-        
-        # Step 2: Perform optimal assignment (greedy approach for simplicity)
-        matched_pairs = []
-        for b in range(B):
-            # For each batch item
-            matched_indices = []
-            available_targets = list(range(M))
+        # # Step 2: Perform optimal assignment (greedy approach for simplicity)
+        # matched_pairs = []
+        # for b in range(B):
+        #     # For each batch item
+        #     matched_indices = []
+        #     available_targets = list(range(M))
             
-            for n in range(N):
-                if not available_targets:
-                    break
-                    
-                # Find best match among remaining targets
-                best_iou = -1
-                best_m = -1
-                best_m_idx = -1
-                
-                for idx, m in enumerate(available_targets):
-                    if iou_matrix[b, n, m] > best_iou:
-                        best_iou = iou_matrix[b, n, m]
-                        best_m = m
-                        best_m_idx = idx
-                
-                # Only match if IoU is above threshold (can be adjusted)
-                if best_iou > 0.1:  # Minimum IoU threshold
-                    matched_indices.append((n, best_m))
-                    # Remove this ground truth from available matches
-                    available_targets.pop(best_m_idx)
+        #     # Sort predictions by their best possible IoU with any ground truth
+        #     # This helps make the greedy approach more effective
+        #     pred_to_best_iou = []
+        #     for n in range(N):
+        #         best_iou_for_pred = max([iou_matrix[b, n, m] for m in available_targets]) if available_targets else -1
+        #         pred_to_best_iou.append((n, best_iou_for_pred))
             
-            matched_pairs.append(matched_indices)
+        #     # Sort predictions by their best possible IoU (descending)
+        #     sorted_preds = sorted(pred_to_best_iou, key=lambda x: x[1], reverse=True)
+            
+        #     # Match predictions to ground truths in order of best IoU
+        #     for n, _ in sorted_preds:
+        #         if not available_targets:
+        #             break
+                    
+        #         # Find best match among remaining targets
+        #         best_iou = -1
+        #         best_m = -1
+        #         best_m_idx = -1
+        #         for idx, m in enumerate(available_targets):
+        #             if iou_matrix[b, n, m] > best_iou:
+        #                 best_iou = iou_matrix[b, n, m]
+        #                 best_m = m
+        #                 best_m_idx = idx
+                        
+        #         # Only match if IoU is above threshold
+        #         if best_iou > 0.1:  # Minimum IoU threshold
+        #             matched_indices.append((n, best_m))
+        #             # Remove this ground truth from available matches
+        #             available_targets.pop(best_m_idx)
+            
+        #     matched_pairs.append(matched_indices)
         
-        # Step 3: Create rearranged target masks based on matching
-        rearranged_targets = torch.zeros_like(target_masks)
-        
-        for b in range(B):
-            # For each matched pair in this batch item
-            for pred_idx, gt_idx in matched_pairs[b]:
-                rearranged_targets[b, pred_idx] = target_masks[b, gt_idx]
-        
+        # # Step 3: Create rearranged target masks based on matching
+        # rearranged_targets = torch.zeros_like(target_masks)  # Initialize with zeros
+        rearranged_targets = target_masks
+        # import random
+        # for b in range(B):
+        #     # Get the matched pairs for this batch
+        #     matched_indices = matched_pairs[b]
+            
+        #     # Track which predictions and ground truths have been matched
+        #     matched_preds = [pair[0] for pair in matched_indices]
+        #     matched_gts = [pair[1] for pair in matched_indices]
+            
+        #     # Find unmatched predictions and ground truths
+        #     unmatched_preds = [p for p in range(N) if p not in matched_preds]
+        #     unmatched_gts = [g for g in range(M) if g not in matched_gts]
+            
+        #     # First, assign the confident matches we already found
+        #     for pred_idx, gt_idx in matched_indices:
+        #         rearranged_targets[b, pred_idx] = target_masks[b, gt_idx]
+            
+        #     # If we have unmatched predictions and unmatched ground truths,
+        #     # randomly assign them to ensure 1-to-1 matching
+        #     if unmatched_preds and unmatched_gts:
+        #         # If sizes don't match, we'll use as many as we can
+        #         random.shuffle(unmatched_gts)  # Randomize the order
+                
+        #         for i, pred_idx in enumerate(unmatched_preds):
+        #             if i < len(unmatched_gts):
+        #                 # Assign this prediction to a random unmatched ground truth
+        #                 gt_idx = unmatched_gts[i]
+        #                 rearranged_targets[b, pred_idx] = target_masks[b, gt_idx]
+
         # Step 4: Update predicted IoUs to match actual calculated IoUs
         # actual_ious = torch.zeros_like(ious)
         # for b in range(B):
@@ -513,7 +564,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         loss_mask = loss_multimask
         loss_dice = loss_multidice
         loss_iou = loss_multiiou
-        
+
         # Sum over batch dimension
         losses["loss_mask"] += loss_mask.sum()
         losses["loss_dice"] += loss_dice.sum()
@@ -527,8 +578,8 @@ class MultiStepMultiMasksAndIous(nn.Module):
         debug_gradients(target_masks, "target_masks")
         debug_gradients(ious, "ious")
         
-        visualize_4d_tensor(src_masks, f"loss_viz/src_predicted_mask_{0}.png")
-        visualize_4d_tensor(target_masks, f"loss_viz/target_masks_{0}.png")
+        #visualize_4d_tensor(src_masks, f"loss_viz/src_predicted_mask_{0}.png")
+        #visualize_4d_tensor(target_masks, f"loss_viz/target_masks_{0}.png")
 
         B, N, H, W = src_masks.shape  # Batch size, number of predicted masks, height, width
         M = target_masks.shape[1]     # Number of ground truth masks
@@ -703,184 +754,3 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 reduced_loss += losses[loss_key] * weight
 
         return reduced_loss
-
-
-
-def test_multi_object_loss():
-    """
-    Test the loss function with proper multi-object segmentation setup
-    """
-    import torch
-    import matplotlib.pyplot as plt
-    import os
-    
-    # Create output directory
-    os.makedirs("loss_test_multi", exist_ok=True)
-    
-    # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Testing multi-object loss on device: {device}")
-    
-    # Parameters
-    batch_size = 1
-    num_objects = 3  # Multiple objects
-    height, width = 64, 64  # Image dimensions
-    
-    # Initialize loss weights
-    weight_dict = {
-        "loss_mask": 20.0,
-        "loss_dice": 1.0,
-        "loss_iou": 1.0,
-        "loss_class": 1.0
-    }
-    
-    # Create loss function
-    criterion = MultiStepMultiMasksAndIous(
-        weight_dict=weight_dict,
-        focal_alpha=0.25,
-        focal_gamma=2,
-        supervise_all_iou=True,
-        iou_use_l1_loss=False,
-        pred_obj_scores=True
-    )
-    
-    print("\n===== TEST 1: IDENTICAL MASKS (SHOULD BE NEAR-ZERO LOSS) =====")
-    
-    # Create ground truth binary masks with three distinct objects
-    gt_masks = torch.zeros((batch_size, num_objects, height, width), device=device)
-    
-    # Add distinct shapes to each mask
-    for i in range(num_objects):
-        center_y = height // 2
-        center_x = width // 2 + (i - 1) * (width // 4)  # Distribute horizontally
-        radius = min(height, width) // 6
-        
-        y_indices, x_indices = torch.meshgrid(
-            torch.arange(height, device=device),
-            torch.arange(width, device=device)
-        )
-        
-        # Create a circle for each object
-        dist_squared = (y_indices - center_y) ** 2 + (x_indices - center_x) ** 2
-        gt_masks[:, i] = (dist_squared < radius ** 2).float()
-    
-    # Visualize ground truth masks
-    plt.figure(figsize=(12, 4))
-    for i in range(num_objects):
-        plt.subplot(1, num_objects, i+1)
-        plt.imshow(gt_masks[0, i].cpu().numpy())
-        plt.title(f"GT Mask {i}")
-    plt.savefig("loss_test_multi/gt_masks.png")
-    plt.close()
-    
-    # Convert binary GT masks to proper logits (Fix #1)
-    binary_to_logits = lambda x: torch.where(x > 0.5, 
-                                           torch.tensor(10.0, device=x.device), 
-                                           torch.tensor(-10.0, device=x.device))
-    
-    pred_masks = binary_to_logits(gt_masks.clone())
-    
-    # Calculate actual IoUs for prediction-target pairs (Fix #2)
-    actual_ious = torch.zeros((batch_size, num_objects), device=device)
-    
-    for b in range(batch_size):
-        for i in range(num_objects):
-            # For identical masks, IoU should be 1.0
-            actual_ious[b, i] = 1.0
-    
-    # Create object score logits (high positive for true objects)
-    obj_scores = torch.ones((batch_size, num_objects), device=device) * 10.0
-    
-    # Structure outputs
-    outputs = {
-        "multistep_pred_multimasks_high_res": [pred_masks],
-        "multistep_pred_ious": [actual_ious],  # Use actual calculated IoUs
-        "multistep_object_score_logits": [obj_scores]
-    }
-    
-    # Calculate loss
-    losses = criterion([outputs], gt_masks)
-    
-    # Print loss components
-    print("Loss components for identical masks:")
-    for k, v in losses.items():
-        print(f"{k}: {v.item()}")
-    
-    print("\n===== TEST 2: SHUFFLED MASKS (SHOULD MATCH THEM CORRECTLY) =====")
-    
-    # Use the same GT masks but shuffle the order in predictions
-    shuffled_indices = [2, 0, 1]  # Example permutation
-    shuffled_masks = torch.zeros_like(gt_masks)
-    
-    for i, idx in enumerate(shuffled_indices):
-        shuffled_masks[:, i] = gt_masks[:, idx]
-    
-    # Convert shuffled masks to logits
-    pred_masks = binary_to_logits(shuffled_masks)
-    
-    # Create outputs with shuffled masks
-    outputs = {
-        "multistep_pred_multimasks_high_res": [pred_masks],
-        "multistep_pred_ious": [torch.ones((batch_size, num_objects), device=device)],  # All 1.0 initially
-        "multistep_object_score_logits": [obj_scores]
-    }
-    
-    # Calculate loss
-    losses = criterion([outputs], gt_masks)
-    
-    # Print loss components
-    print("Loss components for shuffled masks:")
-    for k, v in losses.items():
-        print(f"{k}: {v.item()}")
-    
-    print("\n===== TEST 3: SLIGHTLY PERTURBED MASKS (SMALL BUT NON-ZERO LOSS) =====")
-    
-    # Create slightly perturbed versions of the GT masks
-    perturbed_masks = torch.zeros_like(gt_masks)
-    
-    for i in range(num_objects):
-        center_y = height // 2
-        center_x = width // 2 + (i - 1) * (width // 4)
-        radius = min(height, width) // 6
-        
-        # Add small offset to create perturbation
-        offset_y = 2 if i % 2 == 0 else -2
-        offset_x = 2 if i % 2 == 1 else -2
-        
-        y_indices, x_indices = torch.meshgrid(
-            torch.arange(height, device=device),
-            torch.arange(width, device=device)
-        )
-        
-        # Create slightly shifted circle
-        dist_squared = (y_indices - center_y - offset_y) ** 2 + (x_indices - center_x - offset_x) ** 2
-        perturbed_masks[:, i] = (dist_squared < radius ** 2).float()
-    
-    # Convert perturbed masks to logits
-    pred_masks = binary_to_logits(perturbed_masks)
-    
-    # Create outputs with perturbed masks
-    outputs = {
-        "multistep_pred_multimasks_high_res": [pred_masks],
-        "multistep_pred_ious": [torch.ones((batch_size, num_objects), device=device) * 0.8],  # Estimated IoUs
-        "multistep_object_score_logits": [obj_scores]
-    }
-    
-    # Calculate loss
-    losses = criterion([outputs], gt_masks)
-    
-    # Print loss components
-    print("Loss components for perturbed masks:")
-    for k, v in losses.items():
-        print(f"{k}: {v.item()}")
-    
-    print("\n===== SUMMARY =====")
-    print("For proper multi-object mask segmentation loss calculation:")
-    print("1. Convert binary masks to logits (0->-10, 1->10) before passing to loss function")
-    print("2. Ensure the loss function correctly matches predictions with targets")
-    print("3. Consider updating predicted IoUs to match calculated IoUs during evaluation")
-    print("4. The +1 terms in dice_loss cause a small residual loss even with perfect matches")
-
-if __name__ == "__main__":
-    # Run the multi-object test
-    test_multi_object_loss()

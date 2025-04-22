@@ -2,8 +2,6 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from sklearn.decomposition import PCA
 from matplotlib.gridspec import GridSpec
 
 # Only modify the visualize_frame function to iterate through all predictions
@@ -24,6 +22,8 @@ def visualize_frame(
         save_dir: Directory to save visualizations
         frame_idx: Index of this frame in the batch
     """
+    return
+
     try:
         # Determine the number of channels/masks in the targets
         num_channels = 1
@@ -165,6 +165,7 @@ def visualize_4d_tensor(tensor, filepath, cmap='gray', figsize=None, title=None,
         add_colorbar: Whether to add a colorbar to each subplot
         normalize: Whether to normalize each subplot individually (default: True)
     """
+
     # Convert tensor to numpy if it's a PyTorch tensor
     if torch.is_tensor(tensor):
         tensor_numpy = tensor.detach().cpu().numpy()
@@ -281,6 +282,7 @@ def quick_visualize_rgb(r_tensor, g_tensor, b_tensor, filepath, normalize=True):
         filepath: Path to save the output image
         normalize: Whether to normalize each channel to [0, 1] range
     """
+    return
     import torch
     import matplotlib.pyplot as plt
     import numpy as np
@@ -329,6 +331,8 @@ def quick_visualize_rgb(r_tensor, g_tensor, b_tensor, filepath, normalize=True):
     plt.close()
 
 def quick_visualize_mask(mask_tensor, filepath):
+    return
+    
     # Convert tensor to numpy if it's a PyTorch tensor
     if torch.is_tensor(mask_tensor):
         mask_numpy = mask_tensor.detach().cpu().numpy()
@@ -679,13 +683,6 @@ def create_multichannel_visualization(
         import traceback
         traceback.print_exc()
 
-def visualize_masks(
-    pred_masks,
-    target_masks,
-    iteration,
-    save_dir,
-    frame_idx=0
-):
     """
     Visualize predicted masks vs ground truth.
     """

@@ -126,7 +126,7 @@ def collate_fn(
     for video in batch:
         img_batch += [torch.stack([frame.data for frame in video.frames], dim=0)]
 
-    quick_visualize_rgb(*video.frames[0].data[0:3], "video frame.png")
+    #quick_visualize_rgb(*video.frames[0].data[0:3], "video frame.png")
     img_batch = torch.stack(img_batch, dim=0).permute((1, 0, 2, 3, 4))
     T = img_batch.shape[0]
     # Prepare data structures for sequential processing. Per-frame processing but batched across videos.
@@ -162,7 +162,28 @@ def collate_fn(
         ],
         dim=0,
     )
+
+    # # Combine all masks per frame and video
+    # for t in range(T):
+    #     # Create combined masks for each frame/video pair
+    #     combined_masks = {}
+    #     for obj_idx, frame_vid_idx in enumerate(step_t_obj_to_frame_idx[t]):
+    #         frame_idx, vid_idx = frame_vid_idx.tolist()
+    #         key = (frame_idx, vid_idx)
+    #         if key not in combined_masks:
+    #             combined_masks[key] = torch.zeros_like(step_t_masks[t][obj_idx])
+    #         # Combine all masks for this frame/video
+    #         combined_masks[key] |= step_t_masks[t][obj_idx]
+        
+    #     # Replace each individual mask with the combined mask for its frame/video
+    #     for obj_idx, frame_vid_idx in enumerate(step_t_obj_to_frame_idx[t]):
+    #         frame_idx, vid_idx = frame_vid_idx.tolist()
+    #         key = (frame_idx, vid_idx)
+    #         step_t_masks[t][obj_idx] = combined_masks[key]
+
     masks = torch.stack([torch.stack(masks, dim=0) for masks in step_t_masks], dim=0)
+
+    
     objects_identifier = torch.stack(
         [torch.stack(id, dim=0) for id in step_t_objects_identifier], dim=0
     )

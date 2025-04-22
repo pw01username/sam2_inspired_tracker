@@ -248,7 +248,7 @@ class SAM2Train(SAM2Base):
                     )
 
                 point_inputs = {"point_coords": points, "point_labels": labels}
-                backbone_out["point_inputs_per_frame"][t] = point_inputs
+                backbone_out["point_inputs_per_frame"][t] = None #point_inputs
 
         # Sample frames where we will add correction clicks on the fly
         # based on the error between prediction and ground-truth masks
@@ -336,8 +336,8 @@ class SAM2Train(SAM2Base):
                 current_vision_feats=current_vision_feats,
                 current_vision_pos_embeds=current_vision_pos_embeds,
                 feat_sizes=feat_sizes,
-                point_inputs=backbone_out["point_inputs_per_frame"].get(stage_id, None),
-                mask_inputs=mask_inputs,
+                point_inputs=None, #backbone_out["point_inputs_per_frame"].get(stage_id, None),
+                mask_inputs=mask_inputs, # <------------------------------------------------------------------------ FOR TESTING OVERFITTING 1 IMAGE INPUT
                 gt_masks=gt_masks,
                 frames_to_add_correction_pt=frames_to_add_correction_pt,
                 output_dict=output_dict,

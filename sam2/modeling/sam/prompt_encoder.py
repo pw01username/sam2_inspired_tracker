@@ -85,6 +85,62 @@ class PromptEncoder(nn.Module):
 
     def _embed_multi_masks(self, masks: torch.Tensor) -> torch.Tensor:
         """
+        Simplified mask embedding function that processes multiple masks without
+        complex attention mechanisms.
+        
+        Args:
+            masks: Tensor of shape (B, N, H, W) where:
+                B is batch size
+                N is number of masks per sample
+                H and W are mask height and width
+                    
+        Returns:
+            Tensor of shape (B, embed_dim, embed_H, embed_W) - one embedding per batch
+        """
+        B, N, H, W = masks.shape
+        
+        # Process each batch independently
+        batch_embeddings = []
+        for b in range(B):
+            # If no masks for this batch, use the no_mask embedding
+            if N == 0:
+                batch_embedding = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                    1, -1, self.image_embedding_size[0], self.image_embedding_size[1]
+                )
+                batch_embeddings.append(batch_embedding)
+                continue
+
+            # Process each mask and collect embeddings
+            mask_embeddings = []
+            for n in range(N):
+                # Simple downscaling of each mask
+                single_mask = masks[b:b+1, n:n+1]  # Shape: (1, 1, H, W)
+                mask_embedding = self.mask_downscaling(single_mask)  # Shape: (1, embed_dim, embed_H, embed_W)
+                
+                # Add simple object identity (0, 1, or 2 for 3+ masks)
+                object_id = torch.tensor([min(n, 2)], device=masks.device)
+                id_embedding = self.object_id_embeddings(object_id)  # Shape: (1, embed_dim)
+                id_embedding = id_embedding.view(1, self.embed_dim, 1, 1).expand_as(mask_embedding)
+                
+                # Combine mask features with identity
+                enhanced_embedding = mask_embedding + id_embedding
+                mask_embeddings.append(enhanced_embedding)
+            
+            # Simple averaging of mask embeddings instead of attention
+            if len(mask_embeddings) == 1:
+                batch_embedding = mask_embeddings[0]
+            else:
+                # Average the embeddings
+                stacked_embeddings = torch.stack(mask_embeddings, dim=0)  # (N, 1, embed_dim, h, w)
+                batch_embedding = torch.mean(stacked_embeddings, dim=0)  # (1, embed_dim, h, w)
+            
+            batch_embeddings.append(batch_embedding)
+        
+        # Concatenate the batch embeddings
+        return torch.cat(batch_embeddings, dim=0)
+
+    def _embed_multi_masks_att(self, masks: torch.Tensor) -> torch.Tensor:
+        """
         Embeds multiple mask inputs and combines them into a single dense embedding
         per batch element.
         
@@ -278,12 +334,42 @@ class PromptEncoder(nn.Module):
             box_embeddings = self._embed_boxes(boxes)
             sparse_embeddings = torch.cat([sparse_embeddings, box_embeddings], dim=1)
 
+        # if masks is not None:
+        #     #visualize_4d_tensor(masks.float(), "masks_memenc/prompt encoder mask input.png")
+        #     dense_embeddings = self.mask_downscaling(masks) #self._embed_multi_masks(masks)
+        #     #visualize_4d_tensor(dense_embeddings.float(), "masks_memenc/prompt encoder dense_embeddings.png")
+        individual_mask_embeddings = None
         if masks is not None:
-            visualize_4d_tensor(masks.float(), "prompt encoder.png")
-            dense_embeddings = self._embed_multi_masks(masks)
+            # Process each mask in the batch, maintaining separate mask identities
+            if len(masks.shape) == 4 and masks.shape[1] > 1:  # Multi-mask format: [B, N, H, W]
+                B, N, H, W = masks.shape
+                individual_mask_embeddings = []
+                
+                # Process each mask separately and store individual embeddings
+                for n in range(N):
+                    # Get single channel masks: [B, 1, H, W]
+                    single_masks = masks[:, n:n+1]
+                    
+                    # Process through the downscaling network
+                    single_mask_emb = self.mask_downscaling(single_masks)
+                    
+                    # Add object identity embedding to differentiate this mask
+                    obj_id_emb = self.object_id_embeddings(torch.tensor([n], device=masks.device))
+                    obj_id_emb = obj_id_emb.view(1, self.embed_dim, 1, 1).expand_as(single_mask_emb)
+                    
+                    # Combine spatial features with object identity
+                    enhanced_emb = single_mask_emb + obj_id_emb
+                    individual_mask_embeddings.append(enhanced_emb)
+                
+                # For backward compatibility, also create a fused version by averaging
+                dense_embeddings = torch.mean(torch.stack(individual_mask_embeddings, dim=0), dim=0)
+                
+            else:  # Single mask or old format
+                dense_embeddings = self.mask_downscaling(masks)
+                individual_mask_embeddings = None
         else:
             dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
 
-        return sparse_embeddings, dense_embeddings
+        return sparse_embeddings, dense_embeddings, individual_mask_embeddings

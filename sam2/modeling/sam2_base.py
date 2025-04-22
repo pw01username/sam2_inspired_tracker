@@ -350,7 +350,7 @@ class SAM2Base(torch.nn.Module):
             # a learned `no_mask_embed` to indicate no mask input in this case).
             sam_mask_prompt = None
 
-        sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
+        sparse_embeddings, dense_embeddings, individual_mask_embeddings = self.sam_prompt_encoder(
             points=(sam_point_coords, sam_point_labels),
             boxes=None,
             masks=sam_mask_prompt,
@@ -368,6 +368,7 @@ class SAM2Base(torch.nn.Module):
             multimask_output=multimask_output,
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
+            individual_mask_embeddings=individual_mask_embeddings,
         )
         
         if self.pred_obj_scores:
@@ -628,6 +629,8 @@ class SAM2Base(torch.nn.Module):
                 # "maskmem_features" might have been offloaded to CPU in demo use cases,
                 # so we load it back to GPU (it's a no-op if it's already on GPU).
                 feats = prev["maskmem_features"].to(device, non_blocking=True)
+                #visualize_4d_tensor(feats.float(), "masks_memenc/from_mem.png")
+
                 to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
                 # Spatial positional encoding (it might have been offloaded to CPU in eval)
                 maskmem_enc = prev["maskmem_pos_enc"][-1].to(device)
@@ -680,20 +683,20 @@ class SAM2Base(torch.nn.Module):
                     
                     # Quickfix while multi object ptrs not implemented yet
                     # Find the max dimensions
-                    max_dim3 = max(ptr.shape[2] for ptr in ptrs_list)
+                    # max_dim3 = max(ptr.shape[1] for ptr in ptrs_list)
 
-                    # Pad each tensor to match the max dimensions
-                    padded_ptrs = []
-                    for ptr in ptrs_list:
-                        if ptr.shape[2] < max_dim3:
-                            # Create zero-padded tensor with the correct shape
-                            padded = torch.zeros(1, 1, max_dim3, ptr.shape[3], device=ptr.device, dtype=ptr.dtype)
-                            # Copy the original data
-                            padded[0, 0, :ptr.shape[2], :] = ptr[0, 0]
-                            padded_ptrs.append(padded)
-                        else:
-                            padded_ptrs.append(ptr)
-                    ptrs_list = padded_ptrs
+                    # # Pad each tensor to match the max dimensions
+                    # padded_ptrs = []
+                    # for ptr in ptrs_list:
+                    #     if ptr.shape[2] < max_dim3:
+                    #         # Create zero-padded tensor with the correct shape
+                    #         padded = torch.zeros(1, 1, max_dim3, ptr.shape[3], device=ptr.device, dtype=ptr.dtype)
+                    #         # Copy the original data
+                    #         padded[0, 0, :ptr.shape[2], :] = ptr[0, 0]
+                    #         padded_ptrs.append(padded)
+                    #     else:
+                    #         padded_ptrs.append(ptr)
+                    # ptrs_list = padded_ptrs
 
                     # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
                     obj_ptrs = torch.stack(ptrs_list, dim=0)
@@ -724,20 +727,9 @@ class SAM2Base(torch.nn.Module):
                         # Calculate how much padding we need
                         num_obj_tokens = obj_ptrs.shape[0]
                         num_pos_tokens = obj_pos.shape[0]
-                        padding_needed = num_obj_tokens - num_pos_tokens
+                        padding_needed = num_obj_tokens // num_pos_tokens
                         
-                        if padding_needed > 0:
-                            # Create padding tensor filled with zeros
-                            padding = torch.zeros(
-                                padding_needed, 
-                                obj_pos.shape[1],
-                                obj_pos.shape[2],
-                                device=obj_pos.device,
-                                dtype=obj_pos.dtype
-                            )
-                            
-                            # Concatenate the padding to the position encoding
-                            obj_pos = torch.cat([obj_pos, padding], dim=0)
+                        obj_pos = obj_pos.repeat_interleave(padding_needed, dim=0)
                             
                         #print(f"After padding: obj_ptrs shape: {obj_ptrs.shape}, obj_pos shape: {obj_pos.shape}")
                     
@@ -867,6 +859,7 @@ class SAM2Base(torch.nn.Module):
             ]
         else:
             high_res_features = None
+        
         if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
             # When use_mask_input_as_output_without_sam=True, we directly output the mask input
             # (see it as a GT mask) without using a SAM prompt encoder + mask decoder.
