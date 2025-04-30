@@ -15,6 +15,7 @@ import submitit
 import torch
 
 from hydra import compose, initialize_config_module
+from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
 
 from iopath.common.file_io import g_pathmgr
@@ -121,7 +122,9 @@ def add_pythonpath_to_sys_path():
 
 
 def main(args) -> None:
-    cfg = compose(config_name=args.config)
+    #GlobalHydra.instance().clear()
+
+    cfg = compose(config_name=args.config, overrides=["+model=sam2.1_hiera_l.yaml"])
     if cfg.launcher.experiment_log_dir is None:
         cfg.launcher.experiment_log_dir = os.path.join(
             os.getcwd(), "sam2_logs", args.config

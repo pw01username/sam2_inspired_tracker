@@ -757,6 +757,11 @@ class SAM2VideoPredictor(SAM2Base):
             feat_sizes,
         ) = self._get_image_feature(inference_state, frame_idx, batch_size)
 
+        # NEW: make img_ids same for all objects, we assume this video predictor only looks at one video at a time and then all objects must belong to same batch...
+        img_ids = torch.zeros(batch_size)
+        #print("made img ids: ", img_ids, img_ids.unique(), batch_size)
+
+
         # point and mask should not appear as input simultaneously on the same frame
         assert point_inputs is None or mask_inputs is None
         current_out = self.track_step(
@@ -772,6 +777,7 @@ class SAM2VideoPredictor(SAM2Base):
             track_in_reverse=reverse,
             run_mem_encoder=run_mem_encoder,
             prev_sam_mask_logits=prev_sam_mask_logits,
+            img_ids=img_ids
         )
 
         # optionally offload the output to CPU memory to save GPU space

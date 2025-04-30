@@ -193,6 +193,17 @@ class SAM2Base(torch.nn.Module):
                 fullgraph=True,
                 dynamic=False,
             )
+        
+        # NEW: inter-object cross-attention
+        # from sam2.modeling.sam.transformer import InterObjectCommunicationModule
+        # self.inter_object_module = InterObjectCommunicationModule(
+        #     hidden_dim=self.hidden_dim,
+        #     num_heads=3,
+        #     dim_feedforward=2048, 
+        #     num_layers=3,
+        #     dropout=0.1,
+        #     activation="gelu",
+        # )
 
     @property
     def device(self):
@@ -504,6 +515,7 @@ class SAM2Base(torch.nn.Module):
         output_dict,
         num_frames,
         track_in_reverse=False,  # tracking in reverse time order (for demo usage)
+        img_ids=None,
     ):
         """Fuse the current frame's visual feature map with previous memory."""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
@@ -670,6 +682,7 @@ class SAM2Base(torch.nn.Module):
             memory=memory,
             memory_pos=memory_pos_embed,
             num_obj_ptr_tokens=num_obj_ptr_tokens,
+            img_ids=img_ids,
         )
         # reshape the output (HW)BC => BCHW
         pix_feat_with_mem = pix_feat_with_mem.permute(1, 2, 0).view(B, C, H, W)
@@ -738,6 +751,7 @@ class SAM2Base(torch.nn.Module):
         num_frames,
         track_in_reverse,
         prev_sam_mask_logits,
+        img_ids=None,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -767,7 +781,14 @@ class SAM2Base(torch.nn.Module):
                 output_dict=output_dict,
                 num_frames=num_frames,
                 track_in_reverse=track_in_reverse,
+                img_ids=img_ids,
             )
+
+            # NEW: inter-object communication between all fused px ft + memories for all objects, before sending to mask decoder.
+            # if pix_feat.size(0) > 1:
+            #     # Apply inter-object communication if there are multiple objects
+            #     pix_feat = self.inter_object_module(pix_feat)
+
             # apply SAM-style segmentation head
             # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
             # e.g. in demo where such logits come from earlier interaction instead of correction sampling
@@ -831,6 +852,7 @@ class SAM2Base(torch.nn.Module):
         run_mem_encoder=True,
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
+        img_ids=None # NEW
     ):
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
@@ -844,6 +866,7 @@ class SAM2Base(torch.nn.Module):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
+            img_ids=img_ids
         )
 
         (
@@ -874,6 +897,67 @@ class SAM2Base(torch.nn.Module):
             high_res_masks,
             object_score_logits,
             current_out,
+        )
+
+        return current_out
+        
+        # NEW: only encode "good" frames for objects, don't store highly occluded objects which propogate the bad frame for rest of video
+        
+        b, c, h, w = low_res_masks.shape
+        
+        # Get the dtype from the input masks to maintain consistency
+        dtype = low_res_masks.dtype
+        
+        # Ensure masks are binary (exactly 0.0 or 1.0)
+        binary_masks = (low_res_masks > 0).to(dtype)
+        
+        # Flatten and remove channel dimension
+        flat_masks = binary_masks.view(b, c, -1).squeeze(1)  # Shape: [b, h*w]
+        
+        # Calculate mask areas
+        mask_areas = flat_masks.sum(dim=1)  # Shape: [b]
+        
+        # Calculate intersections matrix
+        intersections = torch.matmul(flat_masks, flat_masks.t())  # Shape: [b, b]
+        
+        # Calculate unions
+        unions = mask_areas.view(-1, 1) + mask_areas.view(1, -1) - intersections
+        
+        # Calculate IoUs with explicit dtype matching
+        ious = torch.zeros_like(intersections, dtype=dtype, device=low_res_masks.device)
+        mask = (unions > 0)
+        
+        # Convert result of division to the same dtype as ious
+        ious[mask] = (intersections[mask] / unions[mask]).to(dtype)
+        
+        # Explicitly set diagonal to exactly 1.0
+        ious.fill_diagonal_(1.0)
+
+        selected_indices, refined_masks = self.select_masks_for_memory_encoding(
+            high_res_masks, 
+            ious, 
+            object_score_logits, 
+            iou_threshold=0.7, 
+            refine_masks=True
+        )
+
+        # Use refined masks
+        current_out["pred_masks_high_res"] = refined_masks
+        
+
+        # Encode memory but override logits to be negative for occluded masks to force no_obj_emb
+        # This is a quick way to test better memory selection by supporting existing infrastructure expecting a memory for every last frames
+        occluded_indicies = [i for i in range(b) if i not in selected_indices]
+        object_score_logits[occluded_indicies, 0] = -0.1
+        
+        self._encode_memory_in_output(
+            current_vision_feats,
+            feat_sizes,
+            point_inputs,
+            run_mem_encoder,
+            high_res_masks,
+            object_score_logits,
+            current_out
         )
 
         return current_out

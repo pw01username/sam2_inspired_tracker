@@ -65,7 +65,7 @@ class SAM2Train(SAM2Base):
         # whether to forward image features per frame (as it's being tracked) during evaluation, instead of forwarding image features
         # of all frames at once. This avoids backbone OOM errors on very long videos in evaluation, but could be slightly slower.
         forward_backbone_per_frame_for_eval=False,
-        freeze_image_encoder=False,
+        freeze_image_encoder=True,
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
@@ -100,9 +100,54 @@ class SAM2Train(SAM2Base):
         # A random number generator with a fixed initial seed across GPUs
         self.rng = np.random.default_rng(seed=42)
 
+
+        # Freeze all then unfreeze mem atten
+        # for p in self.parameters():
+        #     p.requires_grad = False
+
+        for name, p in self.named_parameters():
+            if "cross_obj" in name:
+                print(f"Found parameter with inter_obj: {name}, shape: {p.shape}")
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+
         if freeze_image_encoder:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
+
+        # UNFREEZE Memory attention, mask decoder and memory encoder 
+        for p in self.memory_attention.parameters():
+            p.requires_grad = True
+        for p in self.sam_mask_decoder.parameters():
+            p.requires_grad = True
+        for p in self.memory_encoder.parameters():
+            p.requires_grad = True
+        
+
+        #     # Freeze prompt encoder, since we are just fine tuning with inter-object
+        #     for p in self.sam_prompt_encoder.parameters():
+        #         p.requires_grad = False
+
+        #     # Mask decoder
+        #     for p in self.sam_mask_decoder.parameters():
+        #         p.requires_grad = False
+
+        #     # Memory encoder
+        #     for p in self.memory_encoder.parameters():
+        #         p.requires_grad = False
+
+        #maskmem_tpos_enc: torch.Size([7, 1, 1, 64])
+        #no_mem_embed: torch.Size([1, 1, 256])
+        #no_mem_pos_enc: torch.Size([1, 1, 256])
+        #no_obj_ptr: torch.Size([1, 256])
+        #no_obj_embed_spatial: torch.Size([1, 64])
+        #mask_downsample
+        #obj_ptr_proj
+        #obj_ptr_tpos_proj
+
+            
+                
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
@@ -325,6 +370,7 @@ class SAM2Train(SAM2Base):
                 frames_to_add_correction_pt=frames_to_add_correction_pt,
                 output_dict=output_dict,
                 num_frames=num_frames,
+                img_ids=img_ids,
             )
             # Append the output, depending on whether it's a conditioning frame
             add_output_as_cond_frame = stage_id in init_cond_frames or (
@@ -366,6 +412,7 @@ class SAM2Train(SAM2Base):
         prev_sam_mask_logits=None,  # The previously predicted SAM mask logits.
         frames_to_add_correction_pt=None,
         gt_masks=None,
+        img_ids=None,
     ):
         if frames_to_add_correction_pt is None:
             frames_to_add_correction_pt = []
@@ -381,6 +428,7 @@ class SAM2Train(SAM2Base):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
+            img_ids
         )
 
         (

@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from typing import Optional
-
+import copy
 import torch
 from torch import nn, Tensor
 
@@ -43,6 +43,7 @@ class MemoryAttentionLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
+
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -92,6 +93,7 @@ class MemoryAttentionLayer(nn.Module):
         # Self-Attn, Cross-Attn
         tgt = self._forward_sa(tgt, query_pos)
         tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope)
+
         # MLP
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
@@ -116,6 +118,65 @@ class MemoryAttention(nn.Module):
         self.pos_enc_at_input = pos_enc_at_input
         self.batch_first = batch_first
 
+        # Additional modules for cross-object mixing
+        self.cross_obj_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.object_embeddings = nn.Parameter(
+            torch.zeros(10, 1, d_model)
+        )
+        nn.init.normal_(self.object_embeddings, mean=0.0, std=0.02)
+
+        self.obj_embedding_scale = nn.Parameter(torch.ones(1) * 0.1)
+
+        self.obj_embedding_proj = nn.Linear(d_model, d_model)
+
+    def _cross_object_all_full(self, batch_seq: Tensor, img_ids: Tensor) -> Tensor:
+        """
+        batch_seq: (B, seq, D).  For each image-group in B we:
+         1) select that group's G objects → (G, seq, D)
+         2) flatten to (1, G*seq, D)
+         3) self-attend → (1, G*seq, D)
+         4) reshape back to (G, seq, D)
+        and scatter into out.
+        """
+        B, seq, D = batch_seq.shape
+        device = batch_seq.device
+        out = batch_seq.clone().bfloat16()
+
+        for img_id in img_ids.unique():
+            idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
+            G = idx.numel()
+            if G <= 1:
+                continue
+
+            # 1) gather → (G, seq, D)
+            grp = batch_seq[idx]  
+
+            obj_emb = self.object_embeddings[:G, :, :].to(device)
+            obj_emb = obj_emb.expand(-1, seq, -1)
+
+            scaled_obj_emb = obj_emb * self.obj_embedding_scale
+
+            grp_with_identity = self.obj_embedding_proj(grp + scaled_obj_emb)
+
+            # 2) flatten to (1, G*seq, D)
+            flat = grp_with_identity.reshape(1, G * seq, D)
+
+            # 3) cross-object self-attend over all G*seq tokens
+            attn_flat, _ = self.cross_obj_attn(flat, flat, flat)
+
+            # 4) reshape back to (G, seq, D)
+            attn_grp = attn_flat.view(G, seq, D)
+
+            # scatter into output
+            out[idx] = attn_grp
+
+        return out
+
     def forward(
         self,
         curr: torch.Tensor,  # self-attention inputs
@@ -123,6 +184,7 @@ class MemoryAttention(nn.Module):
         curr_pos: Optional[Tensor] = None,  # pos_enc for self-attention inputs
         memory_pos: Optional[Tensor] = None,  # pos_enc for cross-attention inputs
         num_obj_ptr_tokens: int = 0,  # number of object pointer *tokens*
+        img_ids=None,
     ):
         if isinstance(curr, list):
             assert isinstance(curr_pos, list)
@@ -159,6 +221,10 @@ class MemoryAttention(nn.Module):
                 query_pos=curr_pos,
                 **kwds,
             )
+
+        # Cross-object attention
+        output = self._cross_object_all_full(output, img_ids)
+
         normed_output = self.norm(output)
 
         if self.batch_first:

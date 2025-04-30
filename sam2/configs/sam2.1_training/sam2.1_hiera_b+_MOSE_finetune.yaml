@@ -1,21 +1,22 @@
 # @package _global_
 
 scratch:
-  resolution: 1024
-  train_batch_size: 1
-  num_train_workers: 10
+  resolution: 512
+  train_batch_size: 8
+  num_train_workers: 24
   num_frames: 8
-  max_num_objects: 3
+  max_num_objects: 5
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
+  cross_obj_lr: 1e-4
   phases_per_epoch: 1
-  num_epochs: 40
+  num_epochs: 50
 
 dataset:
   # PATHS to Dataset
-  img_folder: null # PATH to MOSE JPEGImages folder
-  gt_folder: null  # PATH to MOSE Annotations folder
-  file_list_txt: training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  img_folder: /cluster/home/patricwu/Downloads/train/train/JPEGImages/ # PATH to MOSE JPEGImages folder
+  gt_folder: /cluster/home/patricwu/Downloads/train/train/Annotations/  # PATH to MOSE Annotations folder
+  file_list_txt: null # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 2
 
 # Video transforms
@@ -142,6 +143,89 @@ trainer:
             use_dwconv: True  # depth-wise convs
           num_layers: 2
 
+    # Large below:
+    # image_encoder:
+    #   _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
+    #   scalp: 1
+    #   trunk:
+    #     _target_: sam2.modeling.backbones.hieradet.Hiera
+    #     embed_dim: 144
+    #     num_heads: 2
+    #     stages: [2, 6, 36, 4]
+    #     global_att_blocks: [23, 33, 43]
+    #     window_pos_embed_bkg_spatial_size: [7, 7]
+    #     window_spec: [8, 4, 16, 8]
+    #   neck:
+    #     _target_: sam2.modeling.backbones.image_encoder.FpnNeck
+    #     position_encoding:
+    #       _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+    #       num_pos_feats: 256
+    #       normalize: true
+    #       scale: null
+    #       temperature: 10000
+    #     d_model: 256
+    #     backbone_channel_list: [1152, 576, 288, 144]
+    #     fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
+    #     fpn_interp_model: nearest
+
+    # memory_attention:
+    #   _target_: sam2.modeling.memory_attention.MemoryAttention
+    #   d_model: 256
+    #   pos_enc_at_input: true
+    #   layer:
+    #     _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
+    #     activation: relu
+    #     dim_feedforward: 2048
+    #     dropout: 0.1
+    #     pos_enc_at_attn: false
+    #     self_attention:
+    #       _target_: sam2.modeling.sam.transformer.RoPEAttention
+    #       rope_theta: 10000.0
+    #       feat_sizes: [64, 64]
+    #       embedding_dim: 256
+    #       num_heads: 1
+    #       downsample_rate: 1
+    #       dropout: 0.1
+    #     d_model: 256
+    #     pos_enc_at_cross_attn_keys: true
+    #     pos_enc_at_cross_attn_queries: false
+    #     cross_attention:
+    #       _target_: sam2.modeling.sam.transformer.RoPEAttention
+    #       rope_theta: 10000.0
+    #       feat_sizes: [64, 64]
+    #       rope_k_repeat: True
+    #       embedding_dim: 256
+    #       num_heads: 1
+    #       downsample_rate: 1
+    #       dropout: 0.1
+    #       kv_in_dim: 64
+    #   num_layers: 4
+
+    # memory_encoder:
+    #     _target_: sam2.modeling.memory_encoder.MemoryEncoder
+    #     out_dim: 64
+    #     position_encoding:
+    #       _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+    #       num_pos_feats: 64
+    #       normalize: true
+    #       scale: null
+    #       temperature: 10000
+    #     mask_downsampler:
+    #       _target_: sam2.modeling.memory_encoder.MaskDownSampler
+    #       kernel_size: 3
+    #       stride: 2
+    #       padding: 1
+    #     fuser:
+    #       _target_: sam2.modeling.memory_encoder.Fuser
+    #       layer:
+    #         _target_: sam2.modeling.memory_encoder.CXBlock
+    #         dim: 256
+    #         kernel_size: 7
+    #         padding: 3
+    #         layer_scale_init_value: 1e-6
+    #         use_dwconv: True  # depth-wise convs
+    #       num_layers: 2
+
     num_maskmem: 7
     image_size: ${scratch.resolution}
     # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
@@ -171,26 +255,26 @@ trainer:
     multimask_output_for_tracking: true
     use_multimask_token_for_obj_ptr: true
     multimask_min_pt_num: 0
-    multimask_max_pt_num: 1
+    multimask_max_pt_num: 3
     use_mlp_for_obj_ptr_proj: true
     # Compilation flag
     # compile_image_encoder: False
 
     ####### Training specific params #######
     # box/point input and corrections
-    prob_to_use_pt_input_for_train: 0.5
+    prob_to_use_pt_input_for_train: 0.0
     prob_to_use_pt_input_for_eval: 0.0
-    prob_to_use_box_input_for_train: 0.5  # 0.5*0.5 = 0.25 prob to use box instead of points
+    prob_to_use_box_input_for_train: 0  # 0.5*0.5 = 0.25 prob to use box instead of points
     prob_to_use_box_input_for_eval: 0.0
-    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
-    num_frames_to_correct_for_train: 2  # iteratively sample on random 1~2 frames (always include the first frame)
-    num_frames_to_correct_for_eval: 1  # only iteratively sample on first frame
-    rand_frames_to_correct_for_train: True  # random #init-cond-frame ~ 2
+    prob_to_sample_from_gt_for_train: 0  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    num_frames_to_correct_for_train: 0  # iteratively sample on random 1~2 frames (always include the first frame)
+    num_frames_to_correct_for_eval: 0  # only iteratively sample on first frame
+    rand_frames_to_correct_for_train: False  # random #init-cond-frame ~ 2
     add_all_frames_to_correct_as_cond: True  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
     # maximum 2 initial conditioning frames
-    num_init_cond_frames_for_train: 2
-    rand_init_cond_frames_for_train: True  # random 1~2
-    num_correction_pt_per_frame: 7
+    num_init_cond_frames_for_train: 1
+    rand_init_cond_frames_for_train: False  # random 1~2
+    num_correction_pt_per_frame: 0
     use_act_ckpt_iterative_pt_sampling: false
     
 
@@ -267,6 +351,12 @@ trainer:
             end_value: ${divide:${scratch.vision_lr},10}
           param_names:
             - 'image_encoder.*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.cross_obj_lr}
+            end_value: ${divide:${scratch.cross_obj_lr},10}
+          param_names:
+            - 'memory_attention.cross_obj*'
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
@@ -303,16 +393,16 @@ trainer:
       flush_secs: 120
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
-    log_freq: 10
+    log_freq: 35
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 0 # 0 only last checkpoint is saved.
+    save_freq: 5 # 0 only last checkpoint is saved.
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
-      strict: True
+      strict: False #True
       ignore_unexpected_keys: null
       ignore_missing_keys: null
 
