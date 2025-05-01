@@ -10,7 +10,7 @@ scratch:
   vision_lr: 3.0e-06
   cross_obj_lr: 1e-4
   phases_per_epoch: 1
-  num_epochs: 50
+  num_epochs: 80
 
 dataset:
   # PATHS to Dataset
