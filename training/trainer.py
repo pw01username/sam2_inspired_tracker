@@ -4,6 +4,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+# At the beginning of your train.py file (before the import)
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import gc
 import json
 import logging
@@ -480,6 +485,61 @@ class Trainer:
                 loss,
                 self.steps[phase],
             )
+
+        # NEW: ---- if this is the VAL phase, also compute J & F per frame/object ---
+        if phase == Phase.VAL:
+            import numpy as np, torch
+            from sav_dataset.utils.sav_benchmark import Evaluator
+            import torch
+
+            # outputs: list of length T; targets: Tensor [T, O, H, W]
+            targets_np = targets.detach().cpu().numpy()
+            all_j, all_f = [], []
+
+            for frame_idx, outs in enumerate(outputs):
+                # 1) build GT full image label map
+                gt_masks = targets_np[frame_idx]            # shape (O, H, W)
+                H, W = gt_masks.shape[1:]
+                gt_full = np.zeros((H, W), dtype=np.uint8)
+                for obj_idx in range(gt_masks.shape[0]):
+                    gt_full[gt_masks[obj_idx] > 0] = obj_idx + 1
+
+                # 2) pick best pred mask per object
+                if "multistep_pred_multimasks_high_res" in outs:
+                    multi     = outs["multistep_pred_multimasks_high_res"][-1]  # [O, M, H, W]
+                    ious      = outs["multistep_pred_ious"][-1]                 # [O, M]
+                    best_idx  = ious.argmax(dim=1)                             # [O]
+                    obj_inds  = torch.arange(multi.size(0), device=multi.device)
+                    chosen    = multi[obj_inds, best_idx]                      # [O, H, W]
+                else:
+                    pm        = outs["pred_masks"]                             # [O,1,H,W] or [O,H,W]
+                    chosen    = pm[:,0] if pm.dim() == 4 else pm               # [O, H, W]
+
+                # 3) threshold  boolean masks
+                pred_bool = (chosen > 0).cpu().numpy()                      # either (O,1,H,W) or (O,H,W)
+                if pred_bool.ndim == 4:
+                    pred_bool = pred_bool[:, 0]                             # squeeze channel
+
+                # 4) build pred full image label map
+                pred_full = np.zeros((H, W), dtype=np.uint8)
+                for obj_idx in range(pred_bool.shape[0]):
+                    pred_full[pred_bool[obj_idx]] = obj_idx + 1
+
+                # 5) official Evaluator
+                ev = Evaluator(boundary=0.008, name=None, obj_id=None)
+                ev.feed_frame(mask=pred_full, gt=gt_full)
+                iou_d, f_d = ev.conclude()
+                for oid, jv in iou_d.items():
+                    all_j.append(jv)
+                    all_f.append(f_d[oid])
+
+            # 6) average and inject into step_losses
+            mean_j  = float(np.mean(all_j))
+            mean_f  = float(np.mean(all_f))
+            step_losses["Val_J"]  = torch.tensor(mean_j,  device=self.device)
+            step_losses["Val_F"]  = torch.tensor(mean_f,  device=self.device)
+            step_losses["Val_JF"] = torch.tensor(0.5 * (mean_j + mean_f), device=self.device)
+        # -------------------------------------
 
         self.steps[phase] += 1
 
@@ -968,13 +1028,13 @@ class Trainer:
                     f"\nMissing in val datasets: {set(self.meters_conf[phase].keys()) - set(val_keys)}"
                 )
 
-            if self.loss_conf is not None:
-                loss_keys = set(self.loss_conf.keys()) - set(["all"])
-                assert all([k in loss_keys for k in val_keys]), (
-                    f"Keys in val datasets do not match the keys in losses."
-                    f"\nMissing in losses: {set(val_keys) - loss_keys}"
-                    f"\nMissing in val datasets: {loss_keys - set(val_keys)}"
-                )
+            # if self.loss_conf is not None:
+            #     loss_keys = set(self.loss_conf.keys()) - set(["all"])
+            #     assert all([k in loss_keys for k in val_keys]), (
+            #         f"Keys in val datasets do not match the keys in losses."
+            #         f"\nMissing in losses: {set(val_keys) - loss_keys}"
+            #         f"\nMissing in val datasets: {loss_keys - set(val_keys)}"
+            #     )
 
     def _setup_components(self):
 

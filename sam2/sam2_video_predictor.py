@@ -542,6 +542,75 @@ class SAM2VideoPredictor(SAM2Base):
             for frame_idx in obj_output_dict["cond_frame_outputs"]:
                 obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
 
+    # This is modified to only care about model VOS evaluation.
+    # @torch.inference_mode()
+    # def propagate_in_video(
+    #     self,
+    #     inference_state,
+    #     start_frame_idx=None,
+    #     max_frame_num_to_track=None,
+    #     reverse=False,
+    # ):
+    #     """Propagate the input points across frames to track in the entire video."""
+    #     self.propagate_in_video_preflight(inference_state)
+
+    #     obj_ids = inference_state["obj_ids"]
+    #     num_frames = inference_state["num_frames"]
+    #     batch_size = self._get_obj_num(inference_state)
+    #     print("batch size ", batch_size, "obj_ids ", obj_ids)
+
+    #     # set start index, end index, and processing order
+    #     if start_frame_idx is None:
+    #         # default: start from the earliest frame with input points
+    #         start_frame_idx = min(
+    #             t
+    #             for obj_output_dict in inference_state["output_dict_per_obj"].values()
+    #             for t in obj_output_dict["cond_frame_outputs"]
+    #         )
+            
+    #     end_frame_idx = num_frames - 1
+    #     processing_order = range(start_frame_idx, end_frame_idx + 1)
+
+    #     batched_objs_output_dict = {
+    #         "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+    #         "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+    #     }
+        
+    #     for frame_idx in tqdm(processing_order, desc="propagate in video"):
+    #         #pred_masks_per_obj = [None] * batch_size
+    #         all_pred_masks = []
+            
+    #         # run the tracker in one go on all objects
+    #         cond = False
+    #         mask_inputs = None
+    #         storage_key = "non_cond_frame_outputs"
+    #         if frame_idx == 0:
+    #             cond = True
+    #             storage_key = "cond_frame_outputs"
+    #             mask_inputs = torch.cat([inference_state["mask_inputs_per_obj"][inference_state["obj_id_to_idx"][obj_id]][frame_idx] for obj_id in obj_ids], dim=0) if frame_idx == 0 else None
+                
+    #         batched_out, batched_pred = self._run_single_frame_inference(
+    #             inference_state=inference_state,
+    #             output_dict=batched_objs_output_dict,
+    #             frame_idx=frame_idx,
+    #             batch_size=batch_size,
+    #             is_init_cond_frame=cond,
+    #             point_inputs=None,
+    #             mask_inputs=mask_inputs,
+    #             reverse=False,
+    #             run_mem_encoder=True,
+    #         )
+    #         all_pred_masks.append(batched_pred)
+    #         batched_objs_output_dict[storage_key][frame_idx] = batched_out
+            
+    #         all_pred_masks = torch.cat(all_pred_masks, dim=0)
+
+    #         _, video_res_masks = self._get_orig_video_res_output(
+    #             inference_state, all_pred_masks
+    #         )
+    #         yield frame_idx, obj_ids, video_res_masks
+
+
     @torch.inference_mode()
     def propagate_in_video(
         self,

@@ -1,16 +1,16 @@
 # @package _global_
 
 scratch:
-  resolution: 512
-  train_batch_size: 8
-  num_train_workers: 24
+  resolution: 1024
+  train_batch_size: 4
+  num_train_workers: 23
   num_frames: 8
-  max_num_objects: 5
-  base_lr: 5.0e-6
-  vision_lr: 3.0e-06
-  cross_obj_lr: 1e-4
+  max_num_objects: 3
+  base_lr: 2e-4 #5.0e-6 paper says the used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
+  vision_lr: 1e-11 #3.0e-06. we set this to 0 basically, but it is frozen so should not matter
+  #cross_obj_lr: 5e-4
   phases_per_epoch: 1
-  num_epochs: 80
+  num_epochs: 40
 
 dataset:
   # PATHS to Dataset
@@ -21,6 +21,18 @@ dataset:
 
 # Video transforms
 vos:
+  val_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std:  [0.229, 0.224, 0.225]
+  
   train_transforms:
     - _target_: training.dataset.transforms.ComposeAPI
       transforms:
@@ -57,7 +69,7 @@ vos:
 
 trainer:
   _target_: training.trainer.Trainer
-  mode: train_only
+  mode: train #train_only
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
   accelerator: cuda
   seed_value: 123
@@ -255,7 +267,7 @@ trainer:
     multimask_output_for_tracking: true
     use_multimask_token_for_obj_ptr: true
     multimask_min_pt_num: 0
-    multimask_max_pt_num: 3
+    multimask_max_pt_num: 1
     use_mlp_for_obj_ptr_proj: true
     # Compilation flag
     # compile_image_encoder: False
@@ -307,6 +319,7 @@ trainer:
                 _target_: training.dataset.vos_sampler.RandomUniformSampler
                 num_frames: ${scratch.num_frames}
                 max_num_objects: ${scratch.max_num_objects}
+                reverse_time_prob: 0.0
               multiplier: ${dataset.multiplier}
       shuffle: True
       num_workers: ${scratch.num_train_workers}
@@ -316,6 +329,37 @@ trainer:
         _target_: training.utils.data_utils.collate_fn
         _partial_: true
         dict_key: all
+    val: 
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: ${scratch.phases_per_epoch}
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.utils.RepeatFactorWrapper
+          dataset:
+            _target_: training.dataset.utils.ConcatDataset
+            datasets:
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ./DAVIS/JPEGImages
+                gt_folder: ./DAVIS/Annotations
+                file_list_txt: ./DAVIS/ImageSets/2017/val.txt
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: ${dataset.multiplier}
+      shuffle: False
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: False
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: val
 
   optim:
     amp:
@@ -351,12 +395,12 @@ trainer:
             end_value: ${divide:${scratch.vision_lr},10}
           param_names:
             - 'image_encoder.*'
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: ${scratch.cross_obj_lr}
-            end_value: ${divide:${scratch.cross_obj_lr},10}
-          param_names:
-            - 'memory_attention.cross_obj*'
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: ${scratch.cross_obj_lr}
+        #     end_value: ${divide:${scratch.cross_obj_lr},10}
+        #   param_names:
+        #     - 'memory_attention.cross_obj*'
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
@@ -369,6 +413,18 @@ trainer:
           module_cls_names: ['torch.nn.LayerNorm']
 
   loss:
+    val:
+      _target_: training.loss_fns.MultiStepMultiMasksAndIous
+      weight_dict:
+        loss_mask: 20
+        loss_dice: 1
+        loss_iou: 1
+        loss_class: 1
+      supervise_all_iou: true
+      iou_use_l1_loss: true
+      pred_obj_scores: true
+      focal_gamma_obj_score: 0.0
+      focal_alpha_obj_score: -1.0
     all:
       _target_: training.loss_fns.MultiStepMultiMasksAndIous
       weight_dict:
@@ -393,7 +449,7 @@ trainer:
       flush_secs: 120
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
-    log_freq: 35
+    log_freq: 400
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
