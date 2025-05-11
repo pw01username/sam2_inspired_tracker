@@ -330,7 +330,7 @@ def check_load_state_dict_errors(
 def load_state_dict_into_model(
     state_dict: Dict,
     model: nn.Module,
-    strict: bool = True,
+    strict: bool = False,
     ignore_missing_keys: List[str] = None,
     ignore_unexpected_keys: List[str] = None,
     checkpoint_kernels: List[Callable] = None,

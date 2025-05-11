@@ -55,6 +55,10 @@ class BatchedVideoDatapoint:
         return self.apply(torch.Tensor.pin_memory, device=device)
 
     @property
+    def get_metadata(self) -> BatchedVideoMetaData:
+        return self.metadata
+
+    @property
     def num_frames(self) -> int:
         """
         Returns the number of frames per video.

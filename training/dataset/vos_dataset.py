@@ -21,7 +21,7 @@ from training.dataset.vos_segment_loader import JSONSegmentLoader
 
 from training.utils.data_utils import Frame, Object, VideoDatapoint
 
-MAX_RETRIES = 100
+MAX_RETRIES = 20
 
 
 class VOSDataset(VisionDataset):

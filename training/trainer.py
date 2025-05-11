@@ -8,12 +8,12 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.8"
 
 import gc
 import json
 import logging
 import math
-import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import numpy as np
 
 import torch
+torch.cuda.set_per_process_memory_fraction(0.95)
 import torch.distributed as dist
 import torch.nn as nn
 from hydra.utils import instantiate
@@ -39,6 +40,8 @@ from training.utils.data_utils import BatchedVideoDatapoint
 from training.utils.distributed import all_reduce_max, barrier, get_rank
 
 from training.utils.logger import Logger, setup_logging
+
+from sam2.utils.misc import get_sdpa_settings
 
 from training.utils.train_utils import (
     AverageMeter,
@@ -103,7 +106,8 @@ class DistributedConf:
 @dataclass
 class CudaConf:
     cudnn_deterministic: bool = False
-    cudnn_benchmark: bool = True
+    cudnn_benchmark: bool = False #True
+    cudnn_enabled: bool = False #SAM2 uses mostly transformers, this cudnn for mainly optimizing CNNs seem to take up too much vram without being useful 
     allow_tf32: bool = False
     # if not None, `matmul_allow_tf32` key will override `allow_tf32` for matmul
     matmul_allow_tf32: Optional[bool] = None
@@ -233,6 +237,11 @@ class Trainer:
         self._setup_ddp_distributed_training(distributed, accelerator)
         barrier()
 
+        print("Checking flash attention settings: ", get_sdpa_settings())
+
+        # Preload GT images for the validation phase
+        self.preload_gt_images()
+
     def _setup_timers(self):
         """
         Initializes counters for elapsed time and eta.
@@ -263,11 +272,13 @@ class Trainer:
         if env_variables_conf is not None:
             for variable_name, value in env_variables_conf.items():
                 os.environ[variable_name] = value
+                print("override setting env var", variable_name, "to ", value, ". in setup_env_variables in trainer.py")
 
     def _setup_torch_dist_and_backend(self, cuda_conf, distributed_conf) -> None:
         if torch.cuda.is_available():
             torch.backends.cudnn.deterministic = cuda_conf.cudnn_deterministic
             torch.backends.cudnn.benchmark = cuda_conf.cudnn_benchmark
+            torch.backends.cudnn.enabled = cuda_conf.cudnn_enabled
             torch.backends.cuda.matmul.allow_tf32 = (
                 cuda_conf.matmul_allow_tf32
                 if cuda_conf.matmul_allow_tf32 is not None
@@ -278,6 +289,7 @@ class Trainer:
                 if cuda_conf.cudnn_allow_tf32 is not None
                 else cuda_conf.allow_tf32
             )
+            print("Using cudnn benchmark: ", cuda_conf.cudnn_benchmark, ". cudann enabled: ", cuda_conf.cudnn_enabled)
 
         self.rank = setup_distributed_backend(
             distributed_conf.backend, distributed_conf.timeout_mins
@@ -436,7 +448,7 @@ class Trainer:
         )
 
         self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.loss.load_state_dict(checkpoint["loss"], strict=True)
+        self.loss.load_state_dict(checkpoint["loss"], strict=False)
         self.epoch = checkpoint["epoch"]
         self.steps = checkpoint["steps"]
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed")
@@ -451,6 +463,73 @@ class Trainer:
 
     def is_intermediate_val_epoch(self, epoch):
         return epoch % self.val_epoch_freq == 0 and epoch < self.max_epochs - 1
+
+    def preload_gt_images(self):
+        """Preload all ground truth images into RAM for faster validation"""
+        import cv2
+        import numpy as np
+        
+        print("Preloading all GT images into RAM...")
+        GT_ROOT = "DAVIS/Annotations"
+        
+        # Get all validation video names
+        val_video_names = self.val_dataset.datasets[0].dataset.datasets[0].video_dataset.video_names
+        
+        # Create cache dictionary to store GT images
+        self.gt_cache = {}
+
+        # Create mapping dictionary to store correct ID mappings for each video
+        self.obj_id_mappings = {}
+        
+        # For each video in validation set
+        for video_id in val_video_names:
+            gt_dir = os.path.join(GT_ROOT, video_id)
+            if not os.path.exists(gt_dir):
+                print(f"ERROR!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!: GT directory {gt_dir} does not exist")
+                continue
+                
+            frame_files = sorted(f for f in os.listdir(gt_dir) if f.endswith(".png"))
+
+            # Get first frame to establish ground truth IDs
+            first_frame = frame_files[0]
+            first_frame_path = os.path.join(gt_dir, first_frame)
+            
+            # Load first frame GT image
+            gt_first = cv2.imread(first_frame_path, cv2.IMREAD_UNCHANGED)
+            if gt_first.ndim == 3:
+                gt_first = cv2.cvtColor(gt_first, cv2.COLOR_BGR2GRAY)
+            gt_first = gt_first.astype(np.uint8)
+            
+            # Get GT object IDs in correct order (sorted by occurrence in image)
+            gt_ids_sorted = []
+            for y in range(gt_first.shape[0]):
+                for x in range(gt_first.shape[1]):
+                    pixel_val = gt_first[y, x]
+                    if pixel_val != 0 and pixel_val not in gt_ids_sorted:
+                        gt_ids_sorted.append(pixel_val)
+            
+            # Create mapping from loaded index to correct GT ID
+            self.obj_id_mappings[video_id] = gt_ids_sorted
+            print(f"Video {video_id} GT IDs order: {gt_ids_sorted}")
+
+            # Create video-level cache
+            self.gt_cache[video_id] = {}
+
+            # Load each frame's GT
+            for frame_file in frame_files:
+                frame_id = os.path.splitext(frame_file)[0]  # e.g., "00001"
+                gt_path = os.path.join(gt_dir, frame_file)
+                
+                # Load GT image
+                gt_full = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
+                if gt_full.ndim == 3:
+                    gt_full = cv2.cvtColor(gt_full, cv2.COLOR_BGR2GRAY)
+                gt_full = gt_full.astype(np.uint8)
+                
+                # Store in cache
+                self.gt_cache[video_id][frame_id] = gt_full
+        
+        print(f"GT cache created with {len(self.gt_cache)} videos")
 
     def _step(
         self,
@@ -487,63 +566,105 @@ class Trainer:
             )
 
         # NEW: ---- if this is the VAL phase, also compute J & F per frame/object ---
+        # Store metrics for all videos
+        all_jf_values = []
         if phase == Phase.VAL:
-            import numpy as np, torch
-            from sav_dataset.utils.sav_benchmark import Evaluator
+            # this has shape [B, n, 3] where:
+            # B is batch size as number of frames, n is number of objects, last has values (video_id, obj_id, frame_id)
+            current_batch_video_ids = batch.get_metadata.unique_objects_identifier
+            val_video_names_by_correct_idx = self.val_dataset.datasets[0].dataset.datasets[0].video_dataset.video_names
+
+            import numpy as np
             import torch
+            import torch.nn.functional as F
+            from sav_dataset.utils.sav_benchmark import Evaluator
+            
+            # Get original frame sizes from metadata
+            frame_orig_size = batch.metadata.frame_orig_size[0, 0].tolist()  # [H, W]
+            H0, W0 = frame_orig_size
 
-            # outputs: list of length T; targets: Tensor [T, O, H, W]
-            targets_np = targets.detach().cpu().numpy()
-            all_j, all_f = [], []
+            # 1) Pull GT list and model preds
+            GT_ROOT = "DAVIS/Annotations"
 
-            for frame_idx, outs in enumerate(outputs):
-                # 1) build GT full image label map
-                gt_masks = targets_np[frame_idx]            # shape (O, H, W)
-                H, W = gt_masks.shape[1:]
-                gt_full = np.zeros((H, W), dtype=np.uint8)
-                for obj_idx in range(gt_masks.shape[0]):
-                    gt_full[gt_masks[obj_idx] > 0] = obj_idx + 1
+            # Process the video used in the batch, WE ASSUME here that batch size is 1 for validation, so just any video_id
+            vid_id = current_batch_video_ids[0, 0, 0]
+            video_id = val_video_names_by_correct_idx[vid_id]
+            
+            gt_dir = os.path.join(GT_ROOT, video_id)
+            frame_files = sorted(f for f in os.listdir(gt_dir) if f.endswith(".png"))
+            frame_ids = [os.path.splitext(f)[0] for f in frame_files]
+            preds = outputs                        # list length T
 
-                # 2) pick best pred mask per object
-                if "multistep_pred_multimasks_high_res" in outs:
-                    multi     = outs["multistep_pred_multimasks_high_res"][-1]  # [O, M, H, W]
-                    ious      = outs["multistep_pred_ious"][-1]                 # [O, M]
-                    best_idx  = ious.argmax(dim=1)                             # [O]
-                    obj_inds  = torch.arange(multi.size(0), device=multi.device)
-                    chosen    = multi[obj_inds, best_idx]                      # [O, H, W]
+            # Get the correct object ID order for this video
+            correct_obj_ids = self.obj_id_mappings[video_id]
+
+            # 2) Process each object separately with its own evaluator
+            for obj_idx, obj_id in enumerate(correct_obj_ids):
+                # Create an evaluator for this object
+                ev = Evaluator(name=video_id, obj_id=obj_id)
+                
+                # 3) Loop frames
+                T = targets.shape[0]
+                for t in range(1, T-1):
+                    fid = frame_ids[t] # e.g. "00001"
+
+                    #  load original GT full-size label map 
+                    gt_full = self.gt_cache[video_id][fid]
+                    H0, W0 = gt_full.shape
+
+                    #  record true object IDs from GT (e.g. [38])
+                    gt_ids = np.unique(gt_full)
+                    gt_ids = gt_ids[gt_ids != 0]
+
+                    #  grab the low-res logits model produced 
+                    out = preds[t]
+                    low = out["pred_masks"]  # shape [O,1,h,w] or [O,h,w]
+                    if low.dim() == 3:
+                        low = low.unsqueeze(1)  # [O,1,h,w]
+
+                    #  exactly as _get_orig_video_res_output:
+                    #    bilinear upsample logits  (H0,W0)
+                    video_res = torch.nn.functional.interpolate(
+                        low.to(self.device),
+                        size=(H0, W0),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    #  apply non-overlap masks
+                    video_res = model.module._apply_non_overlapping_constraints(video_res)
+
+                    #  threshold to binary per-object
+                    bin_hr = (video_res[:, 0] > 0).cpu().numpy().astype(np.uint8)  # [O, H0, W0]
+                    
+                    # Create binary prediction mask for just this object
+                    pred_mask = np.zeros((H0, W0), dtype=np.uint8)
+                    if obj_idx < bin_hr.shape[0]:  # Make sure we have a prediction for this object
+                        pred_mask[bin_hr[obj_idx] == 1] = int(obj_id)
+                    
+                    # Create binary GT mask for just this object
+                    gt_mask = np.zeros((H0, W0), dtype=np.uint8)
+                    gt_mask[gt_full == int(obj_id)] = int(obj_id)
+                    
+                    # Feed to evaluator
+                    ev.feed_frame(mask=pred_mask, gt=gt_mask)
+                
+                # 4) finalize exactly like the on-disk script
+                iou_d, f_d = ev.conclude()                  # dicts {obj: J%}, {obj: F%}
+                
+                if len(iou_d) > 0 and len(f_d) > 0:
+                    obj_j = iou_d.get(obj_id, 0)
+                    obj_f = f_d.get(obj_id, 0)
+                    obj_jf = 0.5 * (obj_j + obj_f)
+                    #print(f"Video {video_id}, object {obj_id}: J={obj_j}, F={obj_f}, JF={obj_jf}")
+                    # Collect results for this video
+                    all_jf_values.append(float(obj_jf))
                 else:
-                    pm        = outs["pred_masks"]                             # [O,1,H,W] or [O,H,W]
-                    chosen    = pm[:,0] if pm.dim() == 4 else pm               # [O, H, W]
-
-                # 3) threshold  boolean masks
-                pred_bool = (chosen > 0).cpu().numpy()                      # either (O,1,H,W) or (O,H,W)
-                if pred_bool.ndim == 4:
-                    pred_bool = pred_bool[:, 0]                             # squeeze channel
-
-                # 4) build pred full image label map
-                pred_full = np.zeros((H, W), dtype=np.uint8)
-                for obj_idx in range(pred_bool.shape[0]):
-                    pred_full[pred_bool[obj_idx]] = obj_idx + 1
-
-                # 5) official Evaluator
-                ev = Evaluator(boundary=0.008, name=None, obj_id=None)
-                ev.feed_frame(mask=pred_full, gt=gt_full)
-                iou_d, f_d = ev.conclude()
-                for oid, jv in iou_d.items():
-                    all_j.append(jv)
-                    all_f.append(f_d[oid])
-
-            # 6) average and inject into step_losses
-            mean_j  = float(np.mean(all_j))
-            mean_f  = float(np.mean(all_f))
-            step_losses["Val_J"]  = torch.tensor(mean_j,  device=self.device)
-            step_losses["Val_F"]  = torch.tensor(mean_f,  device=self.device)
-            step_losses["Val_JF"] = torch.tensor(0.5 * (mean_j + mean_f), device=self.device)
+                    print(f"ERROR: No valid evaluation for video {video_id}")
         # -------------------------------------
 
         self.steps[phase] += 1
 
-        ret_tuple = {loss_str: loss}, batch_size, step_losses
+        ret_tuple = {loss_str: loss}, batch_size, step_losses, all_jf_values
 
         if phase in self.meters and key in self.meters[phase]:
             meters_dict = self.meters[phase][key]
@@ -673,7 +794,7 @@ class Trainer:
         )
 
         end = time.time()
-
+        all_jf = []
         for data_iter, batch in enumerate(val_loader):
 
             # measure data loading time
@@ -692,11 +813,14 @@ class Trainer:
                     ),
                 ):
                     for phase, model in zip(curr_phases, curr_models):
-                        loss_dict, batch_size, extra_losses = self._step(
+                        loss_dict, batch_size, extra_losses, jf = self._step(
                             batch,
                             model,
                             phase,
                         )
+
+                        # Extend the flat list with all JF values from this batch
+                        all_jf.extend(jf)
 
                         assert len(loss_dict) == 1
                         loss_key, loss = loss_dict.popitem()
@@ -741,6 +865,11 @@ class Trainer:
                 unwrap_ddp_if_wrapped(model).on_validation_epoch_end()
 
         out_dict = self._log_meters_and_save_best_ckpts(curr_phases)
+
+        # Calculate global scores across all videos
+        global_jf = np.mean(all_jf)
+        out_dict["Val_JF"] = global_jf
+        print(f"Global Results, phase {phase}: JF={global_jf}")
 
         for k, v in loss_mts.items():
             out_dict[k] = v.avg
@@ -922,7 +1051,7 @@ class Trainer:
             enabled=self.optim_conf.amp.enabled,
             dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
         ):
-            loss_dict, batch_size, extra_losses = self._step(
+            loss_dict, batch_size, extra_losses, _ = self._step(
                 batch,
                 self.model,
                 phase,

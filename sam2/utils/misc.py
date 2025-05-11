@@ -36,6 +36,7 @@ def get_sdpa_settings():
                 stacklevel=2,
             )
         math_kernel_on = pytorch_version < (2, 2) or not use_flash_attn
+        print("Using flash attention: ", math_kernel_on == False, "device version is: ", torch.cuda.get_device_properties(0).major, "py version and use_flash atn var: ", pytorch_version, use_flash_attn)
     else:
         old_gpu = True
         use_flash_attn = False
@@ -91,7 +92,7 @@ def mask_to_box(masks: torch.Tensor):
 
 def _load_img_as_tensor(img_path, image_size):
     img_pil = Image.open(img_path)
-    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
+    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size), 2)) # 2 = Resampling.BILINEAR
     if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
         img_np = img_np / 255.0
     else:

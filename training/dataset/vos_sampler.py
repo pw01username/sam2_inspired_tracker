@@ -37,20 +37,20 @@ class RandomUniformSampler(VOSSampler):
     ):
         self.num_frames = num_frames
         self.max_num_objects = max_num_objects
-        self.reverse_time_prob = reverse_time_prob
+        self.reverse_time_prob = 0.0
 
     def sample(self, video, segment_loader, epoch=None):
 
         for retry in range(MAX_RETRIES):
             if len(video.frames) < self.num_frames:
-                raise Exception(
-                    f"Cannot sample {self.num_frames} frames from video {video.video_name} as it only has {len(video.frames)} annotated frames."
-                )
+                #if more than 1 batch size: 
+                raise Exception(f"Cannot sample {self.num_frames} frames from video {video.video_name} as it only has {len(video.frames)} annotated frames")
+                #if batch size is one we can do:
+                #self.num_frames = len(video.frames)
+                #print(f"MANUAL WARNING: Cannot sample {self.num_frames} frames from video {video.video_name} as it only has {len(video.frames)} annotated frames.")
+
             start = random.randrange(0, len(video.frames) - self.num_frames + 1)
             frames = [video.frames[start + step] for step in range(self.num_frames)]
-            if random.uniform(0, 1) < self.reverse_time_prob:
-                # Reverse time
-                frames = frames[::-1]
 
             # Get first frame object ids
             visible_object_ids = []

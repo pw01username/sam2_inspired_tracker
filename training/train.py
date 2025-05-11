@@ -46,7 +46,7 @@ def single_node_runner(cfg, main_port: int):
     assert cfg.launcher.num_nodes == 1
     num_proc = cfg.launcher.gpus_per_node
     torch.multiprocessing.set_start_method(
-        "spawn"
+        "spawn", force=True
     )  # CUDA runtime does not support `fork`
     if num_proc == 1:
         # directly call single_proc so we can easily set breakpoints
@@ -58,7 +58,7 @@ def single_node_runner(cfg, main_port: int):
         # Note: using "fork" below, "spawn" causes time and error regressions. Using
         # spawn changes the default multiprocessing context to spawn, which doesn't
         # interact well with the dataloaders (likely due to the use of OpenCV).
-        mp_runner(single_proc_run, args=args, nprocs=num_proc, start_method="spawn")
+        mp_runner(single_proc_run, args=args, nprocs=num_proc, start_method="fork")
 
 
 def format_exception(e: Exception, limit=20):
@@ -124,7 +124,7 @@ def add_pythonpath_to_sys_path():
 def main(args) -> None:
     #GlobalHydra.instance().clear()
 
-    cfg = compose(config_name=args.config, overrides=["+model=sam2.1_hiera_l.yaml"])
+    cfg = compose(config_name=args.config) # , overrides=["+model=sam2.1_hiera_b+.yaml"]
     if cfg.launcher.experiment_log_dir is None:
         cfg.launcher.experiment_log_dir = os.path.join(
             os.getcwd(), "sam2_logs", args.config

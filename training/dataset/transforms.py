@@ -74,11 +74,6 @@ def resize(datapoint, index, size, max_size=None, square=False, v2=False):
         )
         size = get_size(cur_size, size, max_size)
 
-    old_size = (
-        datapoint.frames[index].data.size()[-2:][::-1]
-        if v2
-        else datapoint.frames[index].data.size
-    )
     if v2:
         datapoint.frames[index].data = Fv2.resize(
             datapoint.frames[index].data, size, antialias=True
@@ -86,11 +81,6 @@ def resize(datapoint, index, size, max_size=None, square=False, v2=False):
     else:
         datapoint.frames[index].data = F.resize(datapoint.frames[index].data, size)
 
-    new_size = (
-        datapoint.frames[index].data.size()[-2:][::-1]
-        if v2
-        else datapoint.frames[index].data.size
-    )
 
     for obj in datapoint.frames[index].objects:
         if obj.segment is not None:

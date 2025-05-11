@@ -889,17 +889,17 @@ class SAM2Base(torch.nn.Module):
 
         # Finally run the memory encoder on the predicted mask to encode
         # it into a new memory feature (that can be used in future frames)
-        self._encode_memory_in_output(
-            current_vision_feats,
-            feat_sizes,
-            point_inputs,
-            run_mem_encoder,
-            high_res_masks,
-            object_score_logits,
-            current_out,
-        )
+        # self._encode_memory_in_output(
+        #     current_vision_feats,
+        #     feat_sizes,
+        #     point_inputs,
+        #     run_mem_encoder,
+        #     high_res_masks,
+        #     object_score_logits,
+        #     current_out,
+        # )
 
-        return current_out
+        # return current_out
         
         # NEW: only encode "good" frames for objects, don't store highly occluded objects which propogate the bad frame for rest of video
         
@@ -937,7 +937,7 @@ class SAM2Base(torch.nn.Module):
             high_res_masks, 
             ious, 
             object_score_logits, 
-            iou_threshold=0.7, 
+            iou_threshold=0.7,
             refine_masks=True
         )
 
@@ -961,6 +961,76 @@ class SAM2Base(torch.nn.Module):
         )
 
         return current_out
+    
+    def select_masks_for_memory_encoding(
+        self,
+        masks, 
+        ious, 
+        object_score_logits, 
+        iou_threshold=0.7, 
+        refine_masks=True
+    ):
+        """
+        Select masks for memory encoding, filtering out heavily occluded masks.
+        
+        Args:
+            masks: Tensor of shape [batch, 1, height, width] containing object masks
+            ious: Tensor of shape [batch, batch] containing pairwise IoUs between masks
+            object_score_logits: Tensor of shape [batch, 1] containing object scores
+            iou_threshold: IoU threshold above which masks are considered overlapping
+            refine_masks: If True, refine all masks by resolving overlaps
+            
+        Returns:
+            selected_mask_indices: Indices of masks selected for memory encoding
+            refined_masks: Optional refined masks with overlaps resolved
+        """
+        batch_size = masks.shape[0]
+        device = masks.device
+        dtype = masks.dtype
+        
+        # Flatten scores for easier comparison
+        scores = object_score_logits.view(-1)
+        
+        # Initialize selection mask (start with all True)
+        selected_for_encoding = torch.ones(batch_size, dtype=torch.bool, device=device)
+        
+        # For each pair of overlapping masks, exclude the lower-scoring one
+        for i in range(batch_size):
+            for j in range(i+1, batch_size):
+                # Check if IoU exceeds threshold
+                if ious[i, j] >= iou_threshold:
+                    # Compare scores and exclude the lower-scoring mask
+                    if scores[i] < scores[j]:
+                        selected_for_encoding[i] = False
+                    else:
+                        selected_for_encoding[j] = False
+        
+        # Get indices of selected masks
+        selected_indices = torch.nonzero(selected_for_encoding).squeeze(-1).tolist()
+        
+        # Optionally refine all masks to resolve overlaps
+        refined_masks = masks.clone()
+        if refine_masks:
+            # Track which pixels have been claimed by higher-scoring objects
+            claimed_pixels = torch.zeros_like(masks[0, 0], dtype=torch.bool, device=device)
+            
+            # Process masks in order of decreasing score
+            sorted_indices = torch.argsort(scores, descending=True)
+            
+            for idx in sorted_indices:
+                # Get binary version of current mask
+                current_mask = masks[idx, 0] > 0
+                
+                # Remove pixels already claimed by higher-scoring masks
+                refined_mask = current_mask & ~claimed_pixels
+                
+                # Update the refined mask
+                refined_masks[idx, 0] = refined_mask.to(dtype)
+                
+                # Mark these pixels as claimed for lower-scoring masks
+                claimed_pixels = claimed_pixels | refined_mask
+        
+        return selected_indices, refined_masks
 
     def _use_multimask(self, is_init_cond_frame, point_inputs):
         """Whether to use multimask output in the SAM head."""
