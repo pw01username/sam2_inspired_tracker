@@ -4,13 +4,47 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from typing import List, Optional, Tuple, Type
 
 import torch
 from torch import nn
 
+from sam2.modeling.position_encoding import PositionEmbeddingSine
 from sam2.modeling.sam2_utils import LayerNorm2d, MLP
 
+
+class MaskRefiner(nn.Module):
+    """
+    Takes raw mask logits for M objects plus a feature map, and predicts
+    a per-mask residual to sharpen boundaries under occlusion.
+    """
+    def __init__(self, mask_channels: int, feat_channels: int, hidden_dim: int = 128):
+        super().__init__()
+        in_ch = mask_channels + feat_channels
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_ch, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        # predict a residual for each mask channel
+        self.conv3 = nn.Conv2d(hidden_dim, mask_channels, kernel_size=1)
+
+    def forward(self, masks: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
+        # masks: raw logits [B, M, H, W]
+        # feats: feature map [B, C, H, W]
+        m_prob = masks.sigmoid()
+        x = torch.cat([m_prob, feats], dim=1)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        delta = self.conv3(x)
+        # apply as a logit-space residual
+        return masks + delta
 
 class MaskDecoder(nn.Module):
     def __init__(
@@ -106,6 +140,40 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_via_stability = dynamic_multimask_via_stability
         self.dynamic_multimask_stability_delta = dynamic_multimask_stability_delta
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
+
+
+
+        # # 1) positional embeddings for (object_idx, token_idx)
+        # self.max_objects = 150  # adjust to your expected max batch size
+        # self.obj_pos_emb   = nn.Embedding(self.max_objects, transformer_dim)
+        # self.token_pos_emb = nn.Embedding(self.num_mask_tokens, transformer_dim)
+
+        # 1) instantiate the SAME sinePE you use for image_pe,
+        #    but now to encode an (object × token) grid:
+        #    we want final PE dim == transformer_dim,
+        #    and PositionEmbeddingSine takes num_pos_feats*2 == transformer_dim
+        self.obj_token_pe = PositionEmbeddingSine(
+            num_pos_feats=transformer_dim,
+            normalize=True,
+            scale=2 * math.pi,
+        )
+
+        # 2) a full TransformerEncoder layer for inter-object communication
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=8,                    # you can tune this
+            dim_feedforward=transformer_dim * 4,
+            activation="gelu",
+            dropout=0.1,
+            batch_first=True            # allow (B*, Seq, Dim)
+        )
+        self.inter_object_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=1,
+            norm=nn.LayerNorm(transformer_dim)
+        )
+        self.norm_inter_obj = nn.LayerNorm(transformer_dim)
+
 
     def forward(
         self,
@@ -223,6 +291,65 @@ class MaskDecoder(nn.Module):
             feat_s0, feat_s1 = high_res_features
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
+
+        
+        
+        # # mask_tokens_out: [B, T, C]
+        # B, T, C = mask_tokens_out.shape
+        # device = mask_tokens_out.device
+
+        # # a) build positional encodings:
+        # obj_ids   = torch.arange(B, device=device).unsqueeze(1).expand(B, T)  # [B, T]
+        # token_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, T)  # [B, T]
+
+        # pos = self.obj_pos_emb(obj_ids) + self.token_pos_emb(token_ids)       # [B, T, C]
+
+        # # b) add & reshape into (batch, seq, dim)
+        # x = mask_tokens_out + pos                                           # [B, T, C]
+        # x = x.flatten(0, 1)                                                 # [B*T, C]
+
+        # # c) apply inter-object TransformerEncoder
+        # #    (handles self-attn, residuals, FFN, layernorm, dropout)
+        # x = self.inter_object_encoder(x)                                    # [B, B*T, C]
+
+        # # d) reshape back and final residual+norm
+        # x = x.view(B, T, C)                                                 # [B, T, C]
+        # mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)         # [B, T, C]
+
+        # --- interobject PE + attention ---
+        #
+        # mask_tokens_out: [B, T, C]
+        B, T, C = mask_tokens_out.shape
+        device = mask_tokens_out.device
+
+        # a) build a dummy tensor of shape [B, 1, B, T] so that
+        #    obj_token_pe.forward() will return a [B, C, B, T] map:
+        dummy = torch.zeros((B, 1, B, T), device=device)
+        pe_map = self.obj_token_pe(dummy)           # [B, C, B, T]
+
+        # b) we only want the diagonal slice along the objectaxis:
+        #    for each batchitem b, pick the PE row at index b.
+        #    First permute to [B, B, T, C]:
+        pe_map = pe_map.permute(0, 2, 3, 1)          # [B, H=B, W=T, C]
+        #    then index the H axis = objectindex:
+        idx = torch.arange(B, device=device)
+        pe_ot = pe_map[idx, idx, :, :]              # [B, T, C]
+
+        # c) add onto your mask tokens
+        x = mask_tokens_out + pe_ot                  # [B, T, C]
+
+        # d) merge into a single sequence of length B*T
+        x = x.view(1, B * T, C)                      # [1, B*T, C]
+
+        # e) run your interobject TransformerEncoder
+        x = self.inter_object_encoder(x)             # [1, B*T, C]
+
+        # f) unmerge back to [B, T, C] and residual+norm
+        x = x.view(B, T, C)
+        mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)
+        # --- end interobject block ---
+
+
 
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):

@@ -133,22 +133,22 @@ class MemoryAttention(nn.Module):
         # self.obj_embedding_scale = nn.Parameter(torch.ones(1) * 0.1)
         # self.obj_embedding_proj = nn.Linear(d_model, d_model)
 
-        # # Additional modules for cross-object mixing
-        # self.cross_obj_attn = nn.MultiheadAttention(
-        #     embed_dim=d_model,
-        #     num_heads=4,
-        #     dropout=0.1,
-        #     batch_first=False,
-        # )
+        # Additional modules for cross-object mixing
+        self.cross_obj_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=False,
+        )
         
-        # # This is the 1.1 mem_ca that got 0.79 val loss on davis. 90.2
-        # max_batch_items = 50 # num objects in a video * num videos (batch size defined in yaml)
-        # # Object embeddings to differentiate objects in the same image
-        # # Shape is (max_objects, d_model) - no need for middle dimension
-        # self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
-        # nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
-        # # Scaling factor for object embeddings
-        # self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.2)
+        # This is the 1.1 mem_ca that got 0.79 val loss on davis. 90.2
+        max_batch_items = 50 # num objects in a video * num videos (batch size defined in yaml)
+        # Object embeddings to differentiate objects in the same image
+        # Shape is (max_objects, d_model) - no need for middle dimension
+        self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
+        nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
+        # Scaling factor for object embeddings
+        self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.2)
 
         # # Simple cross-object mixing with object identity
         # self.obj_embedding = nn.Embedding(100, d_model)  # Support up to 100 objects
@@ -504,10 +504,10 @@ class MemoryAttention(nn.Module):
             )
 
         # Cross-object attention
-        # if img_ids is not None:
-        #     output = self._cross_object_attention(output, img_ids)
-        # else:
-        #     print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
+        if img_ids is not None:
+            output = self._cross_object_attention(output, img_ids)
+        else:
+            print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
 
         normed_output = self.norm(output)
 

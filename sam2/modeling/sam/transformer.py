@@ -187,6 +187,341 @@ class TwoWayAttentionBlock(nn.Module):
         return queries, keys
 
 
+class LatentSpaceAttention(nn.Module):
+    """
+    An attention layer that uses DeepSeek's latent space approach to reduce computation.
+    Projects queries and keys to a lower-dimensional latent space before computing attention.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        latent_dim: int = None,  # Dimension of the latent space
+        downsample_rate: int = 1,
+        dropout: float = 0.0,
+        kv_in_dim: int = None,
+    ) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.kv_in_dim = kv_in_dim if kv_in_dim is not None else embedding_dim
+        self.internal_dim = embedding_dim // downsample_rate
+        self.num_heads = num_heads
+        
+        # Default latent dimension to half of internal_dim if not specified
+        self.latent_dim = latent_dim if latent_dim is not None else self.internal_dim // 2
+        
+        assert self.internal_dim % num_heads == 0, "num_heads must divide embedding_dim."
+        assert self.latent_dim <= self.internal_dim // num_heads, "latent_dim must be smaller than or equal to internal_dim per head."
+
+        # Projections to internal dimension
+        self.q_proj = nn.Linear(embedding_dim, self.internal_dim)
+        self.k_proj = nn.Linear(self.kv_in_dim, self.internal_dim)
+        self.v_proj = nn.Linear(self.kv_in_dim, self.internal_dim)
+        
+        # Additional projections to latent space
+        self.q_latent_proj = nn.Linear(self.internal_dim // num_heads, self.latent_dim)
+        self.k_latent_proj = nn.Linear(self.internal_dim // num_heads, self.latent_dim)
+        
+        self.out_proj = nn.Linear(self.internal_dim, embedding_dim)
+        self.dropout_p = dropout
+
+    def _separate_heads(self, x: Tensor, num_heads: int) -> Tensor:
+        b, n, c = x.shape
+        x = x.reshape(b, n, num_heads, c // num_heads)
+        return x.transpose(1, 2)  # B x N_heads x N_tokens x C_per_head
+
+    def _recombine_heads(self, x: Tensor) -> Tensor:
+        b, n_heads, n_tokens, c_per_head = x.shape
+        x = x.transpose(1, 2)
+        return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
+
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        # Input projections
+        q = self.q_proj(q)
+        k = self.k_proj(k)
+        v = self.v_proj(v)
+
+        # Separate into heads
+        q = self._separate_heads(q, self.num_heads)  # B x N_heads x N_q x C_per_head
+        k = self._separate_heads(k, self.num_heads)  # B x N_heads x N_k x C_per_head
+        v = self._separate_heads(v, self.num_heads)  # B x N_heads x N_k x C_per_head
+
+        # Project to latent space for attention computation
+        q_latent = self.q_latent_proj(q)  # B x N_heads x N_q x latent_dim
+        k_latent = self.k_latent_proj(k)  # B x N_heads x N_k x latent_dim
+
+        # Compute attention weights in latent space
+        # Scale attention scores by sqrt(latent_dim)
+        scale = self.latent_dim ** -0.5
+        attention_weights = torch.matmul(q_latent, k_latent.transpose(-2, -1)) * scale
+        
+        # Apply softmax and dropout
+        dropout_p = self.dropout_p if self.training else 0.0
+        if dropout_p > 0.0:
+            attention_weights = F.dropout(attention_weights, p=dropout_p)
+        attention_weights = F.softmax(attention_weights, dim=-1)
+        
+        # Apply attention weights to values
+        out = torch.matmul(attention_weights, v)  # B x N_heads x N_q x C_per_head
+
+        # Recombine heads
+        out = self._recombine_heads(out)  # B x N_q x C
+        out = self.out_proj(out)
+
+        return out
+
+
+class LatentSpaceRoPEAttention(LatentSpaceAttention):
+    """Latent Space Attention with rotary position encoding."""
+
+    def __init__(
+        self,
+        *args,
+        rope_theta=10000.0,
+        rope_k_repeat=False,
+        feat_sizes=(64, 64),  # [w, h] for stride 16 feats at 1024 resolution
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.compute_cis = partial(
+            compute_axial_cis, dim=self.internal_dim // self.num_heads, theta=rope_theta
+        )
+        freqs_cis = self.compute_cis(end_x=feat_sizes[0], end_y=feat_sizes[1])
+        self.freqs_cis = (
+            freqs_cis.to("cuda") if torch.cuda.is_available() else freqs_cis
+        )
+        self.rope_k_repeat = rope_k_repeat
+
+    def forward(
+        self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0
+    ) -> Tensor:
+        # Input projections
+        q = self.q_proj(q)
+        k = self.k_proj(k)
+        v = self.v_proj(v)
+
+        # Separate into heads
+        q = self._separate_heads(q, self.num_heads)
+        k = self._separate_heads(k, self.num_heads)
+        v = self._separate_heads(v, self.num_heads)
+
+        # Apply rotary position encoding before projecting to latent space
+        w = h = math.sqrt(q.shape[-2])
+        self.freqs_cis = self.freqs_cis.to(q.device)
+        if self.freqs_cis.shape[0] != q.shape[-2]:
+            self.freqs_cis = self.compute_cis(end_x=w, end_y=h).to(q.device)
+        if q.shape[-2] != k.shape[-2]:
+            assert self.rope_k_repeat
+
+        num_k_rope = k.size(-2) - num_k_exclude_rope
+        q, k[:, :, :num_k_rope] = apply_rotary_enc(
+            q,
+            k[:, :, :num_k_rope],
+            freqs_cis=self.freqs_cis,
+            repeat_freqs_k=self.rope_k_repeat,
+        )
+
+        # Project to latent space for attention computation
+        q_latent = self.q_latent_proj(q)  # B x N_heads x N_q x latent_dim
+        k_latent = self.k_latent_proj(k)  # B x N_heads x N_k x latent_dim
+
+        # Compute attention weights in latent space
+        scale = self.latent_dim ** -0.5
+        attention_weights = torch.matmul(q_latent, k_latent.transpose(-2, -1)) * scale
+        
+        # Apply softmax and dropout
+        dropout_p = self.dropout_p if self.training else 0.0
+        if dropout_p > 0.0:
+            attention_weights = F.dropout(attention_weights, p=dropout_p)
+        attention_weights = F.softmax(attention_weights, dim=-1)
+        
+        # Apply attention weights to values
+        out = torch.matmul(attention_weights, v)
+
+        out = self._recombine_heads(out)
+        out = self.out_proj(out)
+
+        return out
+
+
+# class Attention(nn.Module):
+#     """
+#     An attention layer that allows for downscaling the size of the embedding
+#     after projection to queries, keys, and values. Can optionally use latent space
+#     attention when specified.
+#     """
+
+#     def __init__(
+#         self,
+#         embedding_dim: int,
+#         num_heads: int,
+#         downsample_rate: int = 1,
+#         dropout: float = 0.0,
+#         kv_in_dim: int = None,
+#         use_latent_attention: bool = True,  # Toggle for latent space attention
+#         latent_dim: int = 384,  # Dimension for latent space projection
+#     ) -> None:
+#         super().__init__()
+#         self.embedding_dim = embedding_dim
+#         self.kv_in_dim = kv_in_dim if kv_in_dim is not None else embedding_dim
+#         self.internal_dim = embedding_dim // downsample_rate
+#         self.num_heads = num_heads
+#         assert (
+#             self.internal_dim % num_heads == 0
+#         ), "num_heads must divide embedding_dim."
+
+#         # Latent attention parameters
+#         self.use_latent_attention = use_latent_attention
+#         self.latent_dim = latent_dim if latent_dim is not None else self.internal_dim // (2 * num_heads) * num_heads
+
+#         self.q_proj = nn.Linear(embedding_dim, self.internal_dim)
+#         self.k_proj = nn.Linear(self.kv_in_dim, self.internal_dim)
+#         self.v_proj = nn.Linear(self.kv_in_dim, self.internal_dim)
+#         self.out_proj = nn.Linear(self.internal_dim, embedding_dim)
+
+#         # Additional projections for latent space if needed
+#         if self.use_latent_attention:
+#             head_dim = self.internal_dim // num_heads
+#             self.q_latent_proj = nn.Linear(head_dim, self.latent_dim // num_heads)
+#             self.k_latent_proj = nn.Linear(head_dim, self.latent_dim // num_heads)
+
+#         self.dropout_p = dropout
+
+#     def _separate_heads(self, x: Tensor, num_heads: int) -> Tensor:
+#         b, n, c = x.shape
+#         x = x.reshape(b, n, num_heads, c // num_heads)
+#         return x.transpose(1, 2)  # B x N_heads x N_tokens x C_per_head
+
+#     def _recombine_heads(self, x: Tensor) -> Tensor:
+#         b, n_heads, n_tokens, c_per_head = x.shape
+#         x = x.transpose(1, 2)
+#         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
+
+#     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+#         # Input projections
+#         q = self.q_proj(q)
+#         k = self.k_proj(k)
+#         v = self.v_proj(v)
+
+#         # Separate into heads
+#         q = self._separate_heads(q, self.num_heads)
+#         k = self._separate_heads(k, self.num_heads)
+#         v = self._separate_heads(v, self.num_heads)
+
+#         dropout_p = self.dropout_p if self.training else 0.0
+
+#         # Choose between standard attention and latent space attention
+#         if self.use_latent_attention:
+#             # Project to latent space
+#             q_latent = self.q_latent_proj(q)
+#             k_latent = self.k_latent_proj(k)
+            
+#             # Compute attention in latent space
+#             scale = (self.latent_dim // self.num_heads) ** -0.5
+#             attn_weights = torch.matmul(q_latent, k_latent.transpose(-2, -1)) * scale
+            
+#             if dropout_p > 0.0:
+#                 attn_weights = F.dropout(attn_weights, p=dropout_p)
+                
+#             attn_weights = F.softmax(attn_weights, dim=-1)
+#             out = torch.matmul(attn_weights, v)
+#         else:
+#             # Standard scaled dot-product attention
+#             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+#         out = self._recombine_heads(out)
+#         out = self.out_proj(out)
+
+#         return out
+
+
+# # Only modification needed for RoPEAttention class 
+# class RoPEAttention(Attention):
+#     """Attention with rotary position encoding."""
+
+#     def __init__(
+#         self,
+#         *args,
+#         rope_theta=10000.0,
+#         rope_k_repeat=False,
+#         feat_sizes=(64, 64),
+#         use_latent_attention=True,  # Add latent attention toggle
+#         latent_dim=384,            # Add latent dim parameter
+#         **kwargs,
+#     ):
+#         super().__init__(
+#             *args, 
+#             use_latent_attention=use_latent_attention, 
+#             latent_dim=latent_dim, 
+#             **kwargs
+#         )
+
+#         self.compute_cis = partial(
+#             compute_axial_cis, dim=self.internal_dim // self.num_heads, theta=rope_theta
+#         )
+#         freqs_cis = self.compute_cis(end_x=feat_sizes[0], end_y=feat_sizes[1])
+#         self.freqs_cis = (
+#             freqs_cis.to("cuda") if torch.cuda.is_available() else freqs_cis
+#         )
+#         self.rope_k_repeat = rope_k_repeat
+
+#     def forward(
+#         self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0
+#     ) -> Tensor:
+#         # Input projections
+#         q = self.q_proj(q)
+#         k = self.k_proj(k)
+#         v = self.v_proj(v)
+
+#         # Separate into heads
+#         q = self._separate_heads(q, self.num_heads)
+#         k = self._separate_heads(k, self.num_heads)
+#         v = self._separate_heads(v, self.num_heads)
+
+#         # Apply rotary position encoding
+#         w = h = math.sqrt(q.shape[-2])
+#         self.freqs_cis = self.freqs_cis.to(q.device)
+#         if self.freqs_cis.shape[0] != q.shape[-2]:
+#             self.freqs_cis = self.compute_cis(end_x=w, end_y=h).to(q.device)
+#         if q.shape[-2] != k.shape[-2]:
+#             assert self.rope_k_repeat
+
+#         num_k_rope = k.size(-2) - num_k_exclude_rope
+#         q, k[:, :, :num_k_rope] = apply_rotary_enc(
+#             q,
+#             k[:, :, :num_k_rope],
+#             freqs_cis=self.freqs_cis,
+#             repeat_freqs_k=self.rope_k_repeat,
+#         )
+
+#         dropout_p = self.dropout_p if self.training else 0.0
+        
+#         # Choose between standard attention and latent space attention
+#         if self.use_latent_attention:
+#             # Project to latent space
+#             q_latent = self.q_latent_proj(q)
+#             k_latent = self.k_latent_proj(k)
+            
+#             # Compute attention in latent space
+#             scale = (self.latent_dim // self.num_heads) ** -0.5
+#             attn_weights = torch.matmul(q_latent, k_latent.transpose(-2, -1)) * scale
+            
+#             if dropout_p > 0.0:
+#                 attn_weights = F.dropout(attn_weights, p=dropout_p)
+                
+#             attn_weights = F.softmax(attn_weights, dim=-1)
+#             out = torch.matmul(attn_weights, v)
+#         else:
+#             # Standard scaled dot-product attention
+#             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+#         out = self._recombine_heads(out)
+#         out = self.out_proj(out)
+
+#         return out
+
 class Attention(nn.Module):
     """
     An attention layer that allows for downscaling the size of the embedding
