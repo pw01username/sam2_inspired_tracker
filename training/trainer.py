@@ -8,7 +8,7 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.8"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.7"
 
 import gc
 import json
@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import numpy as np
 
 import torch
-torch.cuda.set_per_process_memory_fraction(0.95)
+#this just gives oom error then why use it? torch.cuda.set_per_process_memory_fraction(0.95)
 import torch.distributed as dist
 import torch.nn as nn
 from hydra.utils import instantiate
@@ -239,8 +239,9 @@ class Trainer:
 
         print("Checking flash attention settings: ", get_sdpa_settings())
 
-        # Preload GT images for the validation phase
-        self.preload_gt_images()
+        if self.mode != "train_only":
+            # Preload GT images for the validation phase
+            self.preload_gt_images()
 
     def _setup_timers(self):
         """
@@ -611,6 +612,7 @@ class Trainer:
                     #  load original GT full-size label map 
                     gt_full = self.gt_cache[video_id][fid]
                     H0, W0 = gt_full.shape
+                    
 
                     #  record true object IDs from GT (e.g. [38])
                     gt_ids = np.unique(gt_full)

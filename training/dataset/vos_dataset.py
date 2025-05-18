@@ -63,9 +63,10 @@ class VOSDataset(VisionDataset):
                 break  # Succesfully loaded video
             except Exception as e:
                 if self.training:
-                    logging.warning(
-                        f"Loading failed (id={idx}); Retry {retry} with exception: {e}"
-                    )
+                    # We silence this warning because it spams log a lot and this just selects a new valid range anyway
+                    # logging.warning(
+                    #     f"Loading failed (id={idx}); Retry {retry} with exception: {e}"
+                    # )
                     idx = random.randrange(0, len(self.video_dataset))
                 else:
                     # Shouldn't fail to load a val video

@@ -335,10 +335,10 @@ class RandomAffine:
             if res is not None:
                 return res
 
-        if self.log_warning:
-            logging.warning(
-                f"Skip RandomAffine for zero-area mask in first frame after {self.num_tentatives} tentatives"
-            )
+        # if self.log_warning: # this spams console a lot, silence it
+        #     logging.warning(
+        #         f"Skip RandomAffine for zero-area mask in first frame after {self.num_tentatives} tentatives"
+        #     )
         return datapoint
 
     def transform_datapoint(self, datapoint: VideoDatapoint):

@@ -100,16 +100,15 @@ class SAM2Train(SAM2Base):
         # A random number generator with a fixed initial seed across GPUs
         self.rng = np.random.default_rng(seed=42)
 
-
-        # Freeze all then unfreeze mem atten
+        # Freeze all and unfreeze selected instead
         # for p in self.parameters():
         #     p.requires_grad = False
-
         # for name, p in self.named_parameters():
         #     if "cross_obj" in name:
         #         print(f"Found parameter with inter_obj: {name}, shape: {p.shape}")
         #         p.requires_grad = True
 
+        
         if freeze_image_encoder:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
@@ -120,13 +119,13 @@ class SAM2Train(SAM2Base):
             # Log that we're freezing and setting to eval mode
             logging.info("Image encoder frozen and set to evaluation mode")
 
-        # UNFREEZE Memory attention, mask decoder and memory encoder 
-        # for p in self.memory_attention.parameters():
-        #     p.requires_grad = True
-        # for p in self.sam_mask_decoder.parameters():
-        #     p.requires_grad = True
-        # for p in self.memory_encoder.parameters():
-        #     p.requires_grad = True
+        # UNFREEZE
+        for p in self.memory_attention.parameters():
+            p.requires_grad = True
+        for p in self.memory_attention.parameters():
+            p.requires_grad = True
+        for p in self.memory_encoder.parameters():
+            p.requires_grad = True
         
 
         # Freeze prompt encoder, since we are just fine tuning with inter-object
