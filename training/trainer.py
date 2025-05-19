@@ -8,7 +8,8 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.7"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.8"
+
 
 import gc
 import json
@@ -22,6 +23,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import numpy as np
 
 import torch
+
 #this just gives oom error then why use it? torch.cuda.set_per_process_memory_fraction(0.95)
 import torch.distributed as dist
 import torch.nn as nn
@@ -107,7 +109,7 @@ class DistributedConf:
 class CudaConf:
     cudnn_deterministic: bool = False
     cudnn_benchmark: bool = False #True
-    cudnn_enabled: bool = False #SAM2 uses mostly transformers, this cudnn for mainly optimizing CNNs seem to take up too much vram without being useful 
+    cudnn_enabled: bool = True #SAM2 uses mostly transformers, this cudnn for mainly optimizing CNNs seem to take up too much vram without being useful 
     allow_tf32: bool = False
     # if not None, `matmul_allow_tf32` key will override `allow_tf32` for matmul
     matmul_allow_tf32: Optional[bool] = None
@@ -193,11 +195,11 @@ class Trainer:
         self.where = 0.0
 
         self._infer_distributed_backend_if_none(distributed, accelerator)
-
+        
         self._setup_device(accelerator)
-
+        print("INIT trainer.py")
         self._setup_torch_dist_and_backend(cuda, distributed)
-
+	
         makedir(self.logging_conf.log_dir)
         setup_logging(
             __name__,
@@ -276,7 +278,14 @@ class Trainer:
                 print("override setting env var", variable_name, "to ", value, ". in setup_env_variables in trainer.py")
 
     def _setup_torch_dist_and_backend(self, cuda_conf, distributed_conf) -> None:
+        print("Running setup torch dist and backend, cuda available is:", torch.cuda.is_available(), 
+              ". cuda conf setting/config used is: ", cuda_conf, ". distributed conf is: ", distributed_conf)
         if torch.cuda.is_available():
+            # Enable flash attn explicitly
+            torch.backends.cuda.enable_math_sdp(False)  # Disable slow mathematical vanilla implementation
+            torch.backends.cuda.enable_flash_sdp(True)  # Enable Flash Attention
+
+            
             torch.backends.cudnn.deterministic = cuda_conf.cudnn_deterministic
             torch.backends.cudnn.benchmark = cuda_conf.cudnn_benchmark
             torch.backends.cudnn.enabled = cuda_conf.cudnn_enabled
@@ -1184,7 +1193,7 @@ class Trainer:
         self.logger = Logger(self.logging_conf)
 
         self.model = instantiate(self.model_conf, _convert_="all")
-        print_model_summary(self.model)
+        #print_model_summary(self.model)
 
         self.loss = None
         if self.loss_conf:
@@ -1248,8 +1257,8 @@ def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
     total_parameters = sum(p.numel() for p in model.parameters(**param_kwargs))
     non_trainable_parameters = total_parameters - trainable_parameters
     logging.info("==" * 10)
-    logging.info(f"Summary for model {type(model)}")
-    logging.info(f"Model is {model}")
+    #logging.info(f"Summary for model {type(model)}")
+    #logging.info(f"Model is {model}")
     logging.info(f"\tTotal parameters {get_human_readable_count(total_parameters)}")
     logging.info(
         f"\tTrainable parameters {get_human_readable_count(trainable_parameters)}"

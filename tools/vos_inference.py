@@ -475,6 +475,8 @@ def main():
     print("Disabling flash attention for evaluation, if it was explicitly turned on for training")
     torch.backends.cuda.enable_math_sdp(True)  # Force mathematical implementation
     torch.backends.cuda.enable_flash_sdp(False)  # Disable Flash Attention
+    prev_deterministic = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.deterministic = True
 
     for n_video, video_name in enumerate(video_names):
         print(f"\n{n_video + 1}/{len(video_names)} - running on {video_name}")
@@ -508,7 +510,7 @@ def main():
 
     torch.backends.cuda.enable_math_sdp(False)  # disable mathematical implementation
     torch.backends.cuda.enable_flash_sdp(True)  # Enable Flash Attention
-
+    torch.backends.cudnn.deterministic = prev_deterministic
 
 if __name__ == "__main__":
     main()

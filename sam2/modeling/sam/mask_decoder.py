@@ -152,27 +152,27 @@ class MaskDecoder(nn.Module):
         #    but now to encode an (object × token) grid:
         #    we want final PE dim == transformer_dim,
         #    and PositionEmbeddingSine takes num_pos_feats*2 == transformer_dim
-        self.obj_token_pe = PositionEmbeddingSine(
-            num_pos_feats=transformer_dim,
-            normalize=True,
-            scale=2 * math.pi,
-        )
+        # self.obj_token_pe = PositionEmbeddingSine(
+        #     num_pos_feats=transformer_dim,
+        #     normalize=True,
+        #     scale=2 * math.pi,
+        # )
 
-        # 2) a full TransformerEncoder layer for inter-object communication
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=transformer_dim,
-            nhead=8,                    # you can tune this
-            dim_feedforward=transformer_dim * 4,
-            activation="gelu",
-            dropout=0.1,
-            batch_first=True            # allow (B*, Seq, Dim)
-        )
-        self.inter_object_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=1,
-            norm=nn.LayerNorm(transformer_dim)
-        )
-        self.norm_inter_obj = nn.LayerNorm(transformer_dim)
+        # # 2) a full TransformerEncoder layer for inter-object communication
+        # encoder_layer = nn.TransformerEncoderLayer(
+        #     d_model=transformer_dim,
+        #     nhead=8,                    # you can tune this
+        #     dim_feedforward=transformer_dim * 4,
+        #     activation="gelu",
+        #     dropout=0.1,
+        #     batch_first=True            # allow (B*, Seq, Dim)
+        # )
+        # self.inter_object_encoder = nn.TransformerEncoder(
+        #     encoder_layer,
+        #     num_layers=1,
+        #     norm=nn.LayerNorm(transformer_dim)
+        # )
+        # self.norm_inter_obj = nn.LayerNorm(transformer_dim)
 
 
     def forward(
@@ -317,36 +317,36 @@ class MaskDecoder(nn.Module):
         # mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)         # [B, T, C]
 
         # --- interobject PE + attention ---
-        #
+        
         # mask_tokens_out: [B, T, C]
-        B, T, C = mask_tokens_out.shape
-        device = mask_tokens_out.device
+        # B, T, C = mask_tokens_out.shape
+        # device = mask_tokens_out.device
 
-        # a) build a dummy tensor of shape [B, 1, B, T] so that
-        #    obj_token_pe.forward() will return a [B, C, B, T] map:
-        dummy = torch.zeros((B, 1, B, T), device=device)
-        pe_map = self.obj_token_pe(dummy)           # [B, C, B, T]
+        # # a) build a dummy tensor of shape [B, 1, B, T] so that
+        # #    obj_token_pe.forward() will return a [B, C, B, T] map:
+        # dummy = torch.zeros((B, 1, B, T), device=device)
+        # pe_map = self.obj_token_pe(dummy)           # [B, C, B, T]
 
-        # b) we only want the diagonal slice along the objectaxis:
-        #    for each batchitem b, pick the PE row at index b.
-        #    First permute to [B, B, T, C]:
-        pe_map = pe_map.permute(0, 2, 3, 1)          # [B, H=B, W=T, C]
-        #    then index the H axis = objectindex:
-        idx = torch.arange(B, device=device)
-        pe_ot = pe_map[idx, idx, :, :]              # [B, T, C]
+        # # b) we only want the diagonal slice along the objectaxis:
+        # #    for each batchitem b, pick the PE row at index b.
+        # #    First permute to [B, B, T, C]:
+        # pe_map = pe_map.permute(0, 2, 3, 1)          # [B, H=B, W=T, C]
+        # #    then index the H axis = objectindex:
+        # idx = torch.arange(B, device=device)
+        # pe_ot = pe_map[idx, idx, :, :]              # [B, T, C]
 
-        # c) add onto your mask tokens
-        x = mask_tokens_out + pe_ot                  # [B, T, C]
+        # # c) add onto your mask tokens
+        # x = mask_tokens_out + pe_ot                  # [B, T, C]
 
-        # d) merge into a single sequence of length B*T
-        x = x.view(1, B * T, C)                      # [1, B*T, C]
+        # # d) merge into a single sequence of length B*T
+        # x = x.view(1, B * T, C)                      # [1, B*T, C]
 
-        # e) run your interobject TransformerEncoder
-        x = self.inter_object_encoder(x)             # [1, B*T, C]
+        # # e) run your interobject TransformerEncoder
+        # x = self.inter_object_encoder(x)             # [1, B*T, C]
 
-        # f) unmerge back to [B, T, C] and residual+norm
-        x = x.view(B, T, C)
-        mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)
+        # # f) unmerge back to [B, T, C] and residual+norm
+        # x = x.view(B, T, C)
+        # mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)
         # --- end interobject block ---
 
 

@@ -4,7 +4,7 @@ scratch:
   resolution: 1024
   train_batch_size: 1
   num_train_workers: 14
-  num_frames: 20
+  num_frames: 11
   max_num_objects: 5
   base_lr: 3e-5 #5.0e-6 paper says the used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
   vision_lr: 1e-11 #3.0e-06. we set this to 0 basically, but it is frozen so should not matter
@@ -14,8 +14,8 @@ scratch:
 
 dataset:
   # PATHS to Dataset
-  img_folder: /cluster/home/patricwu/Downloads/train/train/JPEGImages/ # PATH to MOSE JPEGImages folder
-  gt_folder: /cluster/home/patricwu/Downloads/train/train/Annotations/  # PATH to MOSE Annotations folder
+  img_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/JPEGImages/ # PATH to MOSE JPEGImages folder
+  gt_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/Annotations/  # PATH to MOSE Annotations folder
   file_list_txt: null # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 1
 
@@ -70,7 +70,7 @@ vos:
 
 trainer:
   _target_: training.trainer.Trainer
-  mode: train #train_only
+  mode: train_only
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
   accelerator: cuda
   seed_value: 123
