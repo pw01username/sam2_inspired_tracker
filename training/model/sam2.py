@@ -101,8 +101,8 @@ class SAM2Train(SAM2Base):
         self.rng = np.random.default_rng(seed=42)
 
         # Freeze all and unfreeze selected instead
-        # for p in self.parameters():
-        #     p.requires_grad = False
+        for p in self.parameters():
+            p.requires_grad = False
         # for name, p in self.named_parameters():
         #     if "cross_obj" in name:
         #         print(f"Found parameter with inter_obj: {name}, shape: {p.shape}")
@@ -122,7 +122,7 @@ class SAM2Train(SAM2Base):
         # UNFREEZE
         for p in self.memory_attention.parameters():
             p.requires_grad = True
-        for p in self.memory_attention.parameters():
+        for p in self.sam_mask_decoder.parameters():
             p.requires_grad = True
         for p in self.memory_encoder.parameters():
             p.requires_grad = True

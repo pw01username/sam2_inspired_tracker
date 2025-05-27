@@ -134,26 +134,102 @@ class MemoryAttention(nn.Module):
         # self.obj_embedding_proj = nn.Linear(d_model, d_model)
 
         # Additional modules for cross-object mixing
-        self.cross_obj_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=4,
-            dropout=0.1,
-            batch_first=False,
-        )
+        # self.cross_obj_attn = nn.MultiheadAttention(
+        #     embed_dim=d_model,
+        #     num_heads=4,
+        #     dropout=layer.dropout_value,
+        #     batch_first=batch_first,
+        # )
         
-        # This is the 1.1 mem_ca that got 0.79 val loss on davis. 90.2
-        max_batch_items = 50 # num objects in a video * num videos (batch size defined in yaml)
-        # Object embeddings to differentiate objects in the same image
-        # Shape is (max_objects, d_model) - no need for middle dimension
-        self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
-        nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
-        # Scaling factor for object embeddings
-        self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.2)
+        # if batch_first != True:
+        #     raise Exception("batch first not true in mem attention")
+
+        # # This is the 1.1 mem_ca that got 0.79 val loss on davis. 90.2
+        # max_batch_items = 50 # num objects in a video * num videos (batch size defined in yaml)
+        # # Object embeddings to differentiate objects in the same image
+        # # Shape is (max_objects, d_model) - no need for middle dimension
+        # self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
+        # nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
+        # # Scaling factor for object embeddings
+        # self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.1)
 
         # # Simple cross-object mixing with object identity
         # self.obj_embedding = nn.Embedding(100, d_model)  # Support up to 100 objects
         #self.obj_embedding_scale = nn.Parameter(torch.ones(1) * 0.1)
         # self.cross_obj_proj = nn.Linear(d_model, d_model)
+
+    def _cross_object_attention_fully_batched(self, batch_seq: torch.Tensor, img_ids: torch.Tensor) -> torch.Tensor:
+        B, seq, D = batch_seq.shape
+        device = batch_seq.device
+        
+        # Skip cross-object attention if there's no need for it
+        if img_ids is None or B <= 1:
+            return batch_seq
+            
+        # Ensure img_ids is on the correct device
+        img_ids = img_ids.to(device)
+        
+        # 1. Create attention mask based on image IDs
+        same_image_mask = (img_ids.unsqueeze(1) == img_ids.unsqueeze(0)).float()
+        
+        # 2. Count objects per image for each object
+        objects_per_image = same_image_mask.sum(dim=1)
+        
+        # 3. Find objects that have other objects from the same image
+        has_other_objects = (objects_per_image > 1)
+        
+        # If no objects have others from the same image, return the input unchanged
+        if not has_other_objects.any():
+            return batch_seq
+        
+        # 4. Select only objects that have others from the same image
+        active_indices = has_other_objects.nonzero().squeeze(-1)
+        active_batch = batch_seq[active_indices]
+        active_mask = same_image_mask[active_indices][:, active_indices]
+        
+        # 5. Add object embeddings to differentiate objects
+        num_active = len(active_indices)
+        obj_embs = self.obj_embeddings[:num_active].unsqueeze(1).expand(-1, seq, -1)
+        enhanced_active_batch = active_batch + self.obj_emb_scale * obj_embs
+        
+        # 6. Prepare attention mask for the MultiheadAttention module
+        # We need to convert our same_image_mask to an attention mask format
+        # Reshape to match attention requirements: (num_active * seq, num_active * seq)
+        attn_mask = torch.zeros(num_active * seq, num_active * seq, device=device)
+        
+        # Fill in the attention mask - allow attention only between tokens of objects from the same image
+        for i in range(num_active):
+            # For each object, find all other objects from the same image
+            other_objects = active_mask[i].nonzero().squeeze(-1)
+            
+            # Allow attention between this object and all others from same image
+            for j in other_objects:
+                # Set all positions between these two objects to attend
+                attn_mask[i*seq:(i+1)*seq, j*seq:(j+1)*seq] = 1.0
+        
+        # 7. Set mask values to -inf where attention is not allowed
+        attn_mask = attn_mask.masked_fill(attn_mask == 0, float('-inf'))
+        
+        # For batch_first=True
+        flat_active_batch = enhanced_active_batch.reshape(1, num_active * seq, D)
+            
+        # Apply attention in one batched operation
+        attended_active_batch, _ = self.cross_obj_attn(
+            flat_active_batch, flat_active_batch, flat_active_batch,
+            attn_mask=attn_mask
+        )
+        
+        # Reshape back to (num_active, seq, D)
+        attended_active_batch = attended_active_batch.reshape(num_active, seq, D)
+        
+        # 9. Add residual connection
+        attended_active_batch = active_batch + attended_active_batch
+        
+        # 10. Create the output tensor directly - no cloning needed
+        # We can modify batch_seq directly since it's not needed anymore
+        batch_seq[active_indices] = attended_active_batch
+        
+        return batch_seq
 
     def _cross_object_attention(self, batch_seq: torch.Tensor, img_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -174,6 +250,8 @@ class MemoryAttention(nn.Module):
         # Skip cross-object attention if there's no need for it
         if img_ids is None or B <= 1:
             return batch_seq
+
+        img_ids = img_ids.to(device)
         
         # Start with the original sequence as the output
         output = batch_seq.clone()
@@ -187,8 +265,8 @@ class MemoryAttention(nn.Module):
             if num_objs <= 1:
                 continue  # Skip if only one object from this image
                 
-            # Get features for objects with this image ID
-            group_features = batch_seq[indices]  # (num_objs, seq, D)
+            # Get normalized features for objects with this image ID
+            group_features = batch_seq[indices] #self.cross_obj_norm(batch_seq[indices])  # (num_objs, seq, D)
             
             # Add object embeddings to differentiate objects
             obj_indices = torch.arange(num_objs, device=device)
@@ -197,175 +275,21 @@ class MemoryAttention(nn.Module):
             
             enhanced_group = group_features + self.obj_emb_scale * obj_embs
             
-            # Use standard MultiheadAttention correctly
-            # First transpose to (seq, num_objs, D) for non-batch_first format
-            enhanced_group = enhanced_group.transpose(0, 1)
-            
             # Apply self-attention within this group
             attended_group, _ = self.cross_obj_attn(
                 enhanced_group, enhanced_group, enhanced_group,
                 need_weights=False
             )
             
-            # Transpose back to (num_objs, seq, D)
-            attended_group = attended_group.transpose(0, 1)
-            
             # Add residual connection and update the output
             attended_group = group_features + attended_group
             
             # Update the output tensor for these indices
-            for i, idx in enumerate(indices):
-                output[idx] = attended_group[i]
+            output.index_copy_(0, indices.to(output.device), attended_group)
         
         return output
     
-    def _cross_object_attention_batched(self, batch_seq: torch.Tensor, img_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Efficiently implements cross-object attention for all images in parallel
-        using attention masking instead of loops.
-        
-        Args:
-            batch_seq: Tensor of shape (B, seq, D) where B is batch size, seq is sequence length,
-                      and D is embedding dimension.
-            img_ids: Tensor of shape (B) containing image identifiers.
-            
-        Returns:
-            Updated feature tensor of same shape as batch_seq.
-        """
-        B, seq, D = batch_seq.shape
-        device = batch_seq.device
-        
-        # Skip cross-object attention if there's no need for it
-        if img_ids is None or B <= 1:
-            return batch_seq
-        
-        # Add object embeddings to differentiate objects
-        # Get the first B object embeddings and add them to each sequence element
-        obj_embs = self.obj_embeddings[:B].unsqueeze(1)  # (B, 1, D)
-        obj_embs = obj_embs.expand(-1, seq, -1)  # (B, seq, D)
-        
-        # Add object embeddings to input (using input directly, no norm needed)
-        enhanced_seq = batch_seq + self.obj_emb_scale * obj_embs
-        
-        # Reshape to (1, B*seq, D) to process in one pass
-        flat_seq = enhanced_seq.reshape(1, B * seq, D)
-        
-        # Create key padding mask instead of attn_mask
-        # Start with a mask where all positions are invalid
-        key_padding_mask = torch.ones(1, B * seq, device=device, dtype=torch.bool)
-        
-        # For each image ID, create pairwise valid attention between objects with same ID
-        for img_id in img_ids.unique():
-            # Find indices of objects with the same image ID
-            indices = (img_ids == img_id).nonzero(as_tuple=True)[0]
-            num_objs = indices.size(0)
-            
-            if num_objs <= 1:
-                continue  # Skip if only one object from this image
-                
-            # For each token-block belonging to objects with same image_id
-            for obj_idx in indices:
-                # Get token range for this object
-                start_idx = obj_idx * seq
-                end_idx = start_idx + seq
-                
-                # Mark these positions as valid in the key padding mask
-                # This allows these tokens to be attended to
-                key_padding_mask[0, start_idx:end_idx] = False
-        
-        # Perform self-attention with the mask
-        attended_flat, _ = self.cross_obj_attn(
-            flat_seq, flat_seq, flat_seq,
-            key_padding_mask=key_padding_mask
-        )
-        
-        # Reshape back to (B, seq, D)
-        attended_seq = attended_flat.reshape(B, seq, D)
-        
-        # Add residual connection
-        output = batch_seq + attended_seq
-        
-        return output
-
-    def _cross_object_attention_batched_v1(self, batch_seq: torch.Tensor, img_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Efficiently implements cross-object attention for all images in parallel
-        using attention masking instead of loops.
-        
-        Args:
-            batch_seq: Tensor of shape (B, seq, D) where B is batch size, seq is sequence length,
-                      and D is embedding dimension.
-            img_ids: Tensor of shape (B) containing image identifiers.
-            
-        Returns:
-            Updated feature tensor of same shape as batch_seq.
-        """
-        B, seq, D = batch_seq.shape
-        device = batch_seq.device
-        dtype = batch_seq.dtype
-        
-        # Apply layer norm before attention (pre-norm architecture)
-        normed_seq = self.pre_cross_obj_norm(batch_seq)
-        
-        # Create object positional encodings for all objects
-        obj_pos_encodings = self.obj_pos_enc[:B].to(device=device, dtype=dtype)
-        obj_pos_encodings = obj_pos_encodings.expand(-1, seq, -1)  # (B, seq, D)
-        
-        # Add positional encoding to input
-        pos_enhanced_seq = normed_seq + self.pos_scale * obj_pos_encodings
-        
-        # Reshape to (1, B*seq, D) to process in one pass
-        flat_seq = pos_enhanced_seq.reshape(1, B * seq, D)
-        
-        # Create attention mask to enforce within-image attention only
-        # Start with a mask that blocks all attention (filled with -inf)
-        attn_mask = torch.full(
-            (B * seq, B * seq), 
-            float('-inf'),
-            device=device,
-            dtype=torch.float
-        )
-        
-        # Allow attention between tokens from the same image
-        for img_id in img_ids.unique():
-            # Find indices of objects with the same image ID
-            indices = (img_ids == img_id).nonzero(as_tuple=True)[0]
-            num_objs = indices.size(0)
-            if num_objs > 10:
-                print("ERROR IN ASSUMPTION OF MAX NUMBER OF OBJECTS IN MOSE AND DAVIS", img_ids, num_objs)
-                raise Exception("go to memory_attention.py")
-            
-            if num_objs <= 1:
-                continue  # Skip if only one object from this image
-                
-            # For each object in this image
-            for i, obj_idx in enumerate(indices):
-                # Calculate start and end indices in the flattened sequence
-                start_i = obj_idx * seq
-                end_i = start_i + seq
-                
-                # Allow this object to attend to all objects in same image
-                for j, other_idx in enumerate(indices):
-                    start_j = other_idx * seq
-                    end_j = start_j + seq
-                    
-                    # Allow attention between these objects
-                    attn_mask[start_i:end_i, start_j:end_j] = 0.0
-        
-        # Perform self-attention with the mask
-        attended_flat, _ = self.cross_obj_attn(
-            flat_seq, flat_seq, flat_seq,
-            attn_mask=attn_mask
-        )
-        
-        # Reshape back to (B, seq, D)
-        attended_seq = attended_flat.reshape(B, seq, D)
-        
-        # Add residual connection
-        output = batch_seq + attended_seq
-        
-        return output
-
+    
     def _cross_object_mixing(self, batch_seq: torch.Tensor, img_ids: torch.Tensor) -> torch.Tensor:
         """
         Simple cross-object mixing that avoids complex attention mechanisms.
@@ -504,10 +428,10 @@ class MemoryAttention(nn.Module):
             )
 
         # Cross-object attention
-        if img_ids is not None:
-            output = self._cross_object_attention(output, img_ids)
-        else:
-            print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
+        # if img_ids is not None:
+        #     output = self._cross_object_attention(output, img_ids)
+        # else:
+        #     print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
 
         normed_output = self.norm(output)
 

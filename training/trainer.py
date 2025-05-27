@@ -8,8 +8,8 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.8"
-
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.7"
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
 import gc
 import json

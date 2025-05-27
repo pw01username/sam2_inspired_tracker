@@ -272,6 +272,7 @@ class SAM2Base(torch.nn.Module):
         mask_inputs=None,
         high_res_features=None,
         multimask_output=False,
+        img_ids=None
     ):
         """
         Forward SAM prompt encoders and mask heads.
@@ -366,6 +367,7 @@ class SAM2Base(torch.nn.Module):
             multimask_output=multimask_output,
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
+            img_ids=img_ids
         )
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
@@ -423,7 +425,7 @@ class SAM2Base(torch.nn.Module):
             object_score_logits,
         )
 
-    def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
+    def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs, img_ids):
         """
         Directly turn binary `mask_inputs` into a output mask logits without using SAM.
         (same input and output shapes as in _forward_sam_heads above).
@@ -452,6 +454,7 @@ class SAM2Base(torch.nn.Module):
                 backbone_features=backbone_features,
                 mask_inputs=self.mask_downsample(mask_inputs_float),
                 high_res_features=high_res_features,
+                img_ids=img_ids
             )
         # In this method, we are treating mask_input as output, e.g. using it directly to create spatial mem;
         # Below, we follow the same design axiom to use mask_input to decide if obj appears or not instead of relying
@@ -768,7 +771,7 @@ class SAM2Base(torch.nn.Module):
             pix_feat = current_vision_feats[-1].permute(1, 2, 0)
             pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
             sam_outputs = self._use_mask_as_output(
-                pix_feat, high_res_features, mask_inputs
+                pix_feat, high_res_features, mask_inputs, img_ids=img_ids
             )
         else:
             # fused the visual feature with previous memory features in the memory bank
@@ -803,6 +806,7 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
+                img_ids=img_ids
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
@@ -937,7 +941,7 @@ class SAM2Base(torch.nn.Module):
             high_res_masks, 
             ious, 
             object_score_logits, 
-            iou_threshold=0.7,
+            iou_threshold=0.6,
             refine_masks=True
         )
 

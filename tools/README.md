@@ -8,13 +8,8 @@ The `vos_inference.py` script can be used to generate predictions for semi-super
 
 After installing SAM 2 and its dependencies, it can be used as follows ([DAVIS 2017 dataset](https://davischallenge.org/davis2017/code.html) as an example). This script saves the prediction PNG files to the `--output_mask_dir`.
 ```bash
-python ./tools/vos_inference.py \
-  --sam2_cfg configs/sam2.1/sam2.1_hiera_b+.yaml \
-  --sam2_checkpoint ./checkpoints/sam2.1_hiera_base_plus.pt \
-  --base_video_dir /path-to-davis-2017/JPEGImages/480p \
-  --input_mask_dir /path-to-davis-2017/Annotations/480p \
-  --video_list_file /path-to-davis-2017/ImageSets/2017/val.txt \
-  --output_mask_dir ./outputs/davis_2017_pred_pngs
+python ./tools/vos_inference.py --sam2_cfg configs/sam2.1/sam2.1_hiera_b+.yaml --sam2_checkpoint sam2 --base_video_dir /cluster/home/patricwu/Downloads/train/train_mose_davis/JPEGImages/ --input_mask_dir /cluster/home/patricwu/Downloads/train/train_mose_davis/Annotations/  --output_mask_dir ./outputs/mose_train_53step
+--video_list_file DAVIS/ImageSets/2017/val.txt
 ```
 (replace `/path-to-davis-2017` with the path to DAVIS 2017 dataset)
 

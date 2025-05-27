@@ -46,6 +46,87 @@ class MaskRefiner(nn.Module):
         # apply as a logit-space residual
         return masks + delta
 
+class TokenCompetition(nn.Module):
+    """
+    Alternative implementation with learned attention-based suppression
+    """
+    
+    def __init__(self, transformer_dim: int, num_mask_tokens: int = 4, num_heads: int = 4):
+        super().__init__()
+        self.transformer_dim = transformer_dim
+        self.num_mask_tokens = num_mask_tokens
+        
+        # Cross-attention for competition
+        self.competition_attention = nn.ModuleList([
+            nn.MultiheadAttention(
+                transformer_dim, 
+                num_heads, 
+                dropout=0.1,
+                batch_first=True
+            ) for _ in range(num_mask_tokens)
+        ])
+        
+        # Gating network to blend original vs. competed tokens
+        self.gate_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(transformer_dim * 2, transformer_dim),
+                nn.ReLU(),
+                nn.Linear(transformer_dim, 1),
+                nn.Sigmoid()
+            ) for _ in range(num_mask_tokens)
+        ])
+        
+        self.norm = nn.LayerNorm(transformer_dim)
+        
+    def forward(
+        self,
+        mask_tokens_out: torch.Tensor,  # [B, T, D]
+        img_ids: torch.Tensor           # [B]
+    ) -> torch.Tensor:
+        """
+        Competition through attention mechanism
+        """
+        B, T, D = mask_tokens_out.shape
+        updated_tokens = mask_tokens_out.clone()
+        
+        for slot_idx in range(T):
+            for img_id in img_ids.unique():
+                idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
+                G = idx.numel()
+                if G <= 1:
+                    continue
+                
+                # Get tokens for this slot in this image
+                group_tokens = mask_tokens_out[idx, slot_idx, :]  # [G, D]
+                group_tokens_expanded = group_tokens.unsqueeze(0)  # [1, G, D]
+                
+                # Self-attention with competition
+                # Keys and values are all tokens, but we modify attention pattern
+                competed_tokens, attention_weights = self.competition_attention[slot_idx](
+                    query=group_tokens_expanded,
+                    key=group_tokens_expanded,
+                    value=group_tokens_expanded
+                )
+                competed_tokens = competed_tokens.squeeze(0)  # [G, D]
+                
+                # Compute gate values
+                for i in range(G):
+                    # How different is the competed token from original?
+                    gate_input = torch.cat([
+                        group_tokens[i], 
+                        competed_tokens[i]
+                    ], dim=0)
+                    gate = self.gate_nets[slot_idx](gate_input)
+                    
+                    # Blend original and competed tokens
+                    updated_tokens[idx[i], slot_idx] = (
+                        gate * group_tokens[i] + 
+                        (1 - gate) * competed_tokens[i]
+                    )
+        
+        # Final normalization
+        return self.norm(updated_tokens + mask_tokens_out)
+
 class MaskDecoder(nn.Module):
     def __init__(
         self,
@@ -142,37 +223,38 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
 
 
-
-        # # 1) positional embeddings for (object_idx, token_idx)
-        # self.max_objects = 150  # adjust to your expected max batch size
-        # self.obj_pos_emb   = nn.Embedding(self.max_objects, transformer_dim)
-        # self.token_pos_emb = nn.Embedding(self.num_mask_tokens, transformer_dim)
-
         # 1) instantiate the SAME sinePE you use for image_pe,
-        #    but now to encode an (object × token) grid:
-        #    we want final PE dim == transformer_dim,
-        #    and PositionEmbeddingSine takes num_pos_feats*2 == transformer_dim
-        # self.obj_token_pe = PositionEmbeddingSine(
-        #     num_pos_feats=transformer_dim,
-        #     normalize=True,
-        #     scale=2 * math.pi,
-        # )
+        #   but now to encode an (object × token) grid:
+        #   we want final PE dim == transformer_dim,
+        #   and PositionEmbeddingSine takes num_pos_feats*2 == transformer_dim
+        self.obj_token_pe = PositionEmbeddingSine(
+            num_pos_feats=transformer_dim,
+            normalize=True,
+            scale=2 * math.pi,
+        )
 
-        # # 2) a full TransformerEncoder layer for inter-object communication
-        # encoder_layer = nn.TransformerEncoderLayer(
-        #     d_model=transformer_dim,
-        #     nhead=8,                    # you can tune this
-        #     dim_feedforward=transformer_dim * 4,
-        #     activation="gelu",
-        #     dropout=0.1,
-        #     batch_first=True            # allow (B*, Seq, Dim)
-        # )
-        # self.inter_object_encoder = nn.TransformerEncoder(
-        #     encoder_layer,
-        #     num_layers=1,
-        #     norm=nn.LayerNorm(transformer_dim)
-        # )
-        # self.norm_inter_obj = nn.LayerNorm(transformer_dim)
+        # 2) a full TransformerEncoder layer for inter-object communication
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=1,                    # you can tune this
+            dim_feedforward=transformer_dim * 4,
+            activation="gelu",
+            dropout=0.1,
+            batch_first=True            # allow (B*, Seq, Dim)
+        )
+        self.inter_object_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=4,
+            norm=nn.LayerNorm(transformer_dim)
+        )
+        self.norm_inter_obj = nn.LayerNorm(transformer_dim)
+
+
+
+        self.token_competition = TokenCompetition(
+            transformer_dim=transformer_dim,
+            num_mask_tokens=self.num_mask_tokens
+        )
 
 
     def forward(
@@ -184,6 +266,7 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        img_ids = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -208,6 +291,7 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             repeat_image=repeat_image,
             high_res_features=high_res_features,
+            img_ids=img_ids,
         )
 
         # Select the correct mask or masks for output
@@ -241,6 +325,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        img_ids = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -294,28 +379,6 @@ class MaskDecoder(nn.Module):
 
         
         
-        # # mask_tokens_out: [B, T, C]
-        # B, T, C = mask_tokens_out.shape
-        # device = mask_tokens_out.device
-
-        # # a) build positional encodings:
-        # obj_ids   = torch.arange(B, device=device).unsqueeze(1).expand(B, T)  # [B, T]
-        # token_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, T)  # [B, T]
-
-        # pos = self.obj_pos_emb(obj_ids) + self.token_pos_emb(token_ids)       # [B, T, C]
-
-        # # b) add & reshape into (batch, seq, dim)
-        # x = mask_tokens_out + pos                                           # [B, T, C]
-        # x = x.flatten(0, 1)                                                 # [B*T, C]
-
-        # # c) apply inter-object TransformerEncoder
-        # #    (handles self-attn, residuals, FFN, layernorm, dropout)
-        # x = self.inter_object_encoder(x)                                    # [B, B*T, C]
-
-        # # d) reshape back and final residual+norm
-        # x = x.view(B, T, C)                                                 # [B, T, C]
-        # mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)         # [B, T, C]
-
         # --- interobject PE + attention ---
         
         # mask_tokens_out: [B, T, C]
@@ -347,8 +410,16 @@ class MaskDecoder(nn.Module):
         # # f) unmerge back to [B, T, C] and residual+norm
         # x = x.view(B, T, C)
         # mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)
+        
         # --- end interobject block ---
 
+        if img_ids is not None:
+            # mask_tokens_out: [N, T, C]; img_ids: [N] ↦ group tokens by image
+            mask_tokens_out = self._cross_object_attention(mask_tokens_out, img_ids)
+
+            mask_tokens_out = self.token_competition(mask_tokens_out, img_ids)
+        else:
+            print("WARNING: img_ids missing—skipping cross-object attention")
 
 
         hyper_in_list: List[torch.Tensor] = []
@@ -370,6 +441,44 @@ class MaskDecoder(nn.Module):
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
         return masks, iou_pred, mask_tokens_out, object_score_logits
+
+    def _cross_object_attention(
+        self,
+        mask_tokens_out: torch.Tensor,  # [B, T, D]
+        img_ids: torch.Tensor           # [B]
+    ) -> torch.Tensor:
+
+        # 1) Split off the “main” slot:
+        main_tokens = mask_tokens_out[:, 0, :]  # [B, D]
+        updated_main = main_tokens.clone()
+
+        # 2) For each image group, mix only those primary tokens:
+        for img_id in img_ids.unique():
+            idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
+            G = idx.numel()
+            if G <= 1:
+                continue
+
+            group = main_tokens[idx]         # [G, D]
+            x = group.unsqueeze(0)           # → [1, G, D]
+
+            # (optional) you can add a small learned obj-index embedding here,
+            # but since these are unordered “objects” you can also skip PE altogether:
+            #   pe = self.obj_index_embed(torch.arange(G, device=device))[None]
+            #   x = x + pe
+
+            # 3) Run your shared TransformerEncoder:
+            x = self.inter_object_encoder(x)  # [1, G, D]
+            x = x.squeeze(0)                  # [G, D]
+
+            # 4) Write back with a block-level residual + norm:
+            updated_main[idx] = self.norm_inter_obj(group + x)
+
+        # 5) Put the updated main slot back into mask_tokens_out:
+        mask_tokens_out[:, 0, :] = updated_main
+
+        return mask_tokens_out
+
 
     def _get_stability_scores(self, mask_logits):
         """

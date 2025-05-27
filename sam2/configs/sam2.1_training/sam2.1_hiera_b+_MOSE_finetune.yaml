@@ -2,11 +2,11 @@
 
 scratch:
   resolution: 1024
-  train_batch_size: 1
-  num_train_workers: 14
-  num_frames: 11
-  max_num_objects: 5
-  base_lr: 3e-5 #5.0e-6 paper says the used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
+  train_batch_size: 4
+  num_train_workers: 24
+  num_frames: 9
+  max_num_objects: 3
+  base_lr: 1e-5 #3e-5 #5.0e-6 paper says the used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
   vision_lr: 1e-11 #3.0e-06. we set this to 0 basically, but it is frozen so should not matter
   cross_obj_lr: 8e-5
   phases_per_epoch: 1
@@ -17,6 +17,10 @@ dataset:
   img_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/JPEGImages/ # PATH to MOSE JPEGImages folder
   gt_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/Annotations/  # PATH to MOSE Annotations folder
   file_list_txt: null # Optional PATH to filelist containing a subset of videos to be used for training
+
+  img_folder2: /cluster/home/patricwu/Downloads/trainytvos2/JPEGImages/ # PATH to MOSE JPEGImages folder
+  gt_folder2: /cluster/home/patricwu/Downloads/trainytvos2/Annotations/  # PATH to MOSE Annotations folder
+  file_list_txt2: null # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 1
 
 # Video transforms
@@ -156,88 +160,7 @@ trainer:
             use_dwconv: True  # depth-wise convs
           num_layers: 2
 
-    # Large below:
-    # image_encoder:
-    #   _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
-    #   scalp: 1
-    #   trunk:
-    #     _target_: sam2.modeling.backbones.hieradet.Hiera
-    #     embed_dim: 144
-    #     num_heads: 2
-    #     stages: [2, 6, 36, 4]
-    #     global_att_blocks: [23, 33, 43]
-    #     window_pos_embed_bkg_spatial_size: [7, 7]
-    #     window_spec: [8, 4, 16, 8]
-    #   neck:
-    #     _target_: sam2.modeling.backbones.image_encoder.FpnNeck
-    #     position_encoding:
-    #       _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
-    #       num_pos_feats: 256
-    #       normalize: true
-    #       scale: null
-    #       temperature: 10000
-    #     d_model: 256
-    #     backbone_channel_list: [1152, 576, 288, 144]
-    #     fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
-    #     fpn_interp_model: nearest
-
-    # memory_attention:
-    #   _target_: sam2.modeling.memory_attention.MemoryAttention
-    #   d_model: 256
-    #   pos_enc_at_input: true
-    #   layer:
-    #     _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
-    #     activation: relu
-    #     dim_feedforward: 2048
-    #     dropout: 0.1
-    #     pos_enc_at_attn: false
-    #     self_attention:
-    #       _target_: sam2.modeling.sam.transformer.RoPEAttention
-    #       rope_theta: 10000.0
-    #       feat_sizes: [64, 64]
-    #       embedding_dim: 256
-    #       num_heads: 1
-    #       downsample_rate: 1
-    #       dropout: 0.1
-    #     d_model: 256
-    #     pos_enc_at_cross_attn_keys: true
-    #     pos_enc_at_cross_attn_queries: false
-    #     cross_attention:
-    #       _target_: sam2.modeling.sam.transformer.RoPEAttention
-    #       rope_theta: 10000.0
-    #       feat_sizes: [64, 64]
-    #       rope_k_repeat: True
-    #       embedding_dim: 256
-    #       num_heads: 1
-    #       downsample_rate: 1
-    #       dropout: 0.1
-    #       kv_in_dim: 64
-    #   num_layers: 4
-
-    # memory_encoder:
-    #     _target_: sam2.modeling.memory_encoder.MemoryEncoder
-    #     out_dim: 64
-    #     position_encoding:
-    #       _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
-    #       num_pos_feats: 64
-    #       normalize: true
-    #       scale: null
-    #       temperature: 10000
-    #     mask_downsampler:
-    #       _target_: sam2.modeling.memory_encoder.MaskDownSampler
-    #       kernel_size: 3
-    #       stride: 2
-    #       padding: 1
-    #     fuser:
-    #       _target_: sam2.modeling.memory_encoder.Fuser
-    #       layer:
-    #         _target_: sam2.modeling.memory_encoder.CXBlock
-    #         dim: 256
-    #         kernel_size: 7
-    #         padding: 3
-    #         layer_scale_init_value: 1e-6
-    #         use_dwconv: True  # depth-wise convs
-    #       num_layers: 2
+   
 
     num_maskmem: 7
     image_size: ${scratch.resolution}
@@ -290,8 +213,6 @@ trainer:
     num_correction_pt_per_frame: 0
     use_act_ckpt_iterative_pt_sampling: false
     
-
-    
     num_init_cond_frames_for_eval: 1  # only mask on the first frame
     forward_backbone_per_frame_for_eval: True
     
@@ -322,20 +243,20 @@ trainer:
                 reverse_time_prob: 0.0
               multiplier: ${dataset.multiplier}
             # Dataset number 2 below here, which is youtubeVOS2019 that has objects appearing later:
-            # - _target_: training.dataset.vos_dataset.VOSDataset
-            #   transforms: ${vos.train_transforms}
-            #   training: true
-            #   video_dataset:
-            #     _target_: training.dataset.vos_raw_dataset.PNGRawDataset
-            #     img_folder: ${dataset.img_folder}
-            #     gt_folder: ${dataset.gt_folder}
-            #     file_list_txt: ${dataset.file_list_txt}
-            #   sampler:
-            #     _target_: training.dataset.vos_sampler.RandomUniformSampler
-            #     num_frames: ${scratch.num_frames}
-            #     max_num_objects: ${scratch.max_num_objects}
-            #     reverse_time_prob: 0.0
-            #   multiplier: ${dataset.multiplier}
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.train_transforms}
+              training: true
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${dataset.img_folder2}
+                gt_folder: ${dataset.gt_folder2}
+                file_list_txt: ${dataset.file_list_txt2}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+                reverse_time_prob: 0.0
+              multiplier: ${dataset.multiplier}
       shuffle: True
       num_workers: ${scratch.num_train_workers}
       pin_memory: True
@@ -409,12 +330,12 @@ trainer:
             end_value: ${divide:${scratch.vision_lr},10}
           param_names:
             - 'image_encoder.*'
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: ${scratch.cross_obj_lr}
-            end_value: ${divide:${scratch.cross_obj_lr},10}
-          param_names:
-            - 'memory_attention.cross_obj*'
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: ${scratch.cross_obj_lr}
+        #     end_value: ${divide:${scratch.cross_obj_lr},10}
+        #   param_names:
+        #     - 'memory_attention.cross_obj*'
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler

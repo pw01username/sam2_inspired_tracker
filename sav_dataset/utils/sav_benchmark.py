@@ -455,14 +455,14 @@ def benchmark(
         ml = max(*[len(n) for n in object_metrics.keys()], len("Global score"))
         # build header
         out_string = f'{"sequence":<{ml}},{"obj":>3}, {"J&F":>4}, {"J":>4}, {"F":>4}\n'
-        out_string += f'{"Global score":<{ml}},{"":>3}, {global_jf:.1f}, {global_j:.1f}, {global_f:.1f}\n'
+        out_string += f'{"Global score":<{ml}},{"":>3}, {global_jf}, {global_j:.1f}, {global_f:.1f}\n'
         # append one line for each object
         for name, (iou, boundary_f) in object_metrics.items():
             for object_idx in iou.keys():
                 j, f = iou[object_idx], boundary_f[object_idx]
                 jf = (j + f) / 2
                 out_string += (
-                    f"{name:<{ml}},{object_idx:03}, {jf:>4.1f}, {j:>4.1f}, {f:>4.1f}\n"
+                    f"{name:<{ml}},{object_idx:03}, {jf}, {j:>4.1f}, {f:>4.1f}\n"
                 )
 
         # print to console
@@ -470,7 +470,7 @@ def benchmark(
             print(out_string.replace(",", " "), end="")
             print("\nSummary:")
             print(
-                f"Global score: J&F: {global_jf:.1f} J: {global_j:.1f} F: {global_f:.1f}"
+                f"Global score: J&F: {global_jf} J: {global_j:.1f} F: {global_f:.1f}"
             )
             print(f"Time taken: {time_taken:.2f}s")
 

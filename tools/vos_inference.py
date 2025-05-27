@@ -441,6 +441,14 @@ def main():
     )
     args = parser.parse_args()
 
+
+    #torch.backends.cuda.enable_math_sdp(True)  # Force mathematical implementation
+    #torch.backends.cuda.enable_flash_sdp(False)  # Disable Flash Attention
+    #torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+    torch.backends.cudnn.enabled = False
+
+
     # if we use per-object PNG files, they could possibly overlap in inputs and outputs
     hydra_overrides_extra = [
         "++model.non_overlap_masks=" + ("false" if args.per_obj_png_file else "true")
@@ -472,11 +480,6 @@ def main():
         ]
     print(f"running VOS prediction on {len(video_names)} videos:\n{video_names}")
 
-    print("Disabling flash attention for evaluation, if it was explicitly turned on for training")
-    torch.backends.cuda.enable_math_sdp(True)  # Force mathematical implementation
-    torch.backends.cuda.enable_flash_sdp(False)  # Disable Flash Attention
-    prev_deterministic = torch.backends.cudnn.deterministic
-    torch.backends.cudnn.deterministic = True
 
     for n_video, video_name in enumerate(video_names):
         print(f"\n{n_video + 1}/{len(video_names)} - running on {video_name}")
@@ -508,9 +511,6 @@ def main():
         f"output masks saved to {args.output_mask_dir}"
     )
 
-    torch.backends.cuda.enable_math_sdp(False)  # disable mathematical implementation
-    torch.backends.cuda.enable_flash_sdp(True)  # Enable Flash Attention
-    torch.backends.cudnn.deterministic = prev_deterministic
 
 if __name__ == "__main__":
     main()
