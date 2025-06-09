@@ -442,9 +442,9 @@ def main():
     args = parser.parse_args()
 
 
-    #torch.backends.cuda.enable_math_sdp(True)  # Force mathematical implementation
-    #torch.backends.cuda.enable_flash_sdp(False)  # Disable Flash Attention
-    #torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)  # Force mathematical implementation
+    torch.backends.cuda.enable_flash_sdp(False)  # Disable Flash Attention
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
     torch.backends.cudnn.enabled = False
 

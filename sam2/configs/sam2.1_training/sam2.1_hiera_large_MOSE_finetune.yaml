@@ -3,24 +3,24 @@
 scratch:
   resolution: 1024
   train_batch_size: 1
-  num_train_workers: 24
-  num_frames: 18
-  max_num_objects: 5
-  base_lr: 5e-5 #3e-5 #5.0e-6 paper says the used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
+  num_train_workers: 32
+  num_frames: 17
+  max_num_objects: 6
+  base_lr: 3e-5 #3e-5 #5.0e-6 paper says they used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
   vision_lr: 1e-11 #3.0e-06. we set this to 0 basically, but it is frozen so should not matter
-  cross_obj_lr: 8e-5
+  cross_obj_lr: 4e-4
   phases_per_epoch: 1
-  num_epochs: 90
+  num_epochs: 115
 
 dataset:
   # PATHS to Dataset
-  img_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/JPEGImages/ # PATH to MOSE JPEGImages folder
-  gt_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/Annotations/  # PATH to MOSE Annotations folder
-  file_list_txt: null # Optional PATH to filelist containing a subset of videos to be used for training
+  img_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/JPEGImages/
+  gt_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/Annotations/
+  file_list_txt: null
 
-  img_folder2: /cluster/home/patricwu/Downloads/trainytvos2/JPEGImages/ # PATH to MOSE JPEGImages folder
-  gt_folder2: /cluster/home/patricwu/Downloads/trainytvos2/Annotations/  # PATH to MOSE Annotations folder
-  file_list_txt2: null # Optional PATH to filelist containing a subset of videos to be used for training
+  img_folder2: /cluster/home/patricwu/Downloads/trainytvos2/JPEGImages/ # trainytvos2 is filtered so all objects start on same frame
+  gt_folder2: /cluster/home/patricwu/Downloads/trainytvos2/Annotations/
+  file_list_txt2: null
   multiplier: 1
 
 # Video transforms
@@ -44,8 +44,8 @@ vos:
         - _target_: training.dataset.transforms.RandomHorizontalFlip
           consistent_transform: True
         - _target_: training.dataset.transforms.RandomAffine
-          degrees: 25
-          shear: 20
+          degrees: 35 #25
+          shear: 30 #20
           image_interpolation: bilinear
           consistent_transform: True
         - _target_: training.dataset.transforms.RandomResizeAPI
@@ -54,18 +54,18 @@ vos:
           consistent_transform: True
         - _target_: training.dataset.transforms.ColorJitter
           consistent_transform: True
-          brightness: 0.1
-          contrast: 0.03
-          saturation: 0.03
+          brightness: 0.15 #0.1
+          contrast: 0.01 #0.03
+          saturation: 0.02 #0.03
           hue: null
         - _target_: training.dataset.transforms.RandomGrayscale
           p: 0.05
           consistent_transform: True
         - _target_: training.dataset.transforms.ColorJitter
           consistent_transform: False
-          brightness: 0.1
-          contrast: 0.05
-          saturation: 0.05
+          brightness: 0.15 #0.1
+          contrast: 0.025 #0.05
+          saturation: 0.03 #0.05
           hue: null
         - _target_: training.dataset.transforms.ToTensorAPI
         - _target_: training.dataset.transforms.NormalizeAPI
@@ -79,6 +79,7 @@ trainer:
   accelerator: cuda
   seed_value: 123
 
+  # LARGE MODEL:
   model:
     _target_: training.model.sam2.SAM2Train
     image_encoder:
@@ -86,9 +87,12 @@ trainer:
       scalp: 1
       trunk:
         _target_: sam2.modeling.backbones.hieradet.Hiera
-        embed_dim: 112
+        embed_dim: 144
         num_heads: 2
-        drop_path_rate: 0.1
+        stages: [2, 6, 36, 4]
+        global_att_blocks: [23, 33, 43]
+        window_pos_embed_bkg_spatial_size: [7, 7]
+        window_spec: [8, 4, 16, 8]
       neck:
         _target_: sam2.modeling.backbones.image_encoder.FpnNeck
         position_encoding:
@@ -98,7 +102,7 @@ trainer:
           scale: null
           temperature: 10000
         d_model: 256
-        backbone_channel_list: [896, 448, 224, 112]
+        backbone_channel_list: [1152, 576, 288, 144]
         fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
         fpn_interp_model: nearest
 
@@ -108,7 +112,8 @@ trainer:
       pos_enc_at_input: true
       layer:
         _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
-        activation: gelu #relu
+        #activation: relu
+        activation: gelu
         dim_feedforward: 2048
         dropout: 0.1
         pos_enc_at_attn: false
@@ -330,12 +335,16 @@ trainer:
             end_value: ${divide:${scratch.vision_lr},10}
           param_names:
             - 'image_encoder.*'
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: ${scratch.cross_obj_lr}
-        #     end_value: ${divide:${scratch.cross_obj_lr},10}
-        #   param_names:
-        #     - 'memory_attention.cross_obj*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: ${scratch.cross_obj_lr}
+            end_value: ${divide:${scratch.cross_obj_lr},10}
+          param_names:
+            - 'memory_attention.cross_obj*'
+            - 'memory_attention.obj_emb_scale'
+            - 'memory_attention.obj_embeddings'
+            - 'sam_mask_decoder.*inter_obj*'
+            - 'sam_mask_decoder.inter_obj*'
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
@@ -384,7 +393,7 @@ trainer:
       flush_secs: 120
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
-    log_freq: 100
+    log_freq: 250
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
@@ -398,8 +407,9 @@ trainer:
       ignore_missing_keys: null
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
+        checkpoint_path: ./checkpoints/sam2.1_hiera_large.pt
         #checkpoint_path: ./checkpoints/sam2.1_hiera_base_plus.pt
-        checkpoint_path: sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/checkpoints/checkpoint_nooptimz.pt # # PATH to SAM 2.1 checkpoint
+        #checkpoint_path: sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/checkpoints/checkpoint_nooptimz.pt # # PATH to SAM 2.1 checkpoint
         ckpt_state_dict_keys: ['model']
 
 launcher:

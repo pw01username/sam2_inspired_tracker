@@ -8,7 +8,7 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.7"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True, garbage_collection_threshold:0.75" #
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
 import gc
@@ -24,7 +24,7 @@ import numpy as np
 
 import torch
 
-#this just gives oom error then why use it? torch.cuda.set_per_process_memory_fraction(0.95)
+#this just gives oom error then why use it? -> torch.cuda.set_per_process_memory_fraction(0.95)
 import torch.distributed as dist
 import torch.nn as nn
 from hydra.utils import instantiate
@@ -108,9 +108,9 @@ class DistributedConf:
 @dataclass
 class CudaConf:
     cudnn_deterministic: bool = False
-    cudnn_benchmark: bool = False #True
-    cudnn_enabled: bool = True #SAM2 uses mostly transformers, this cudnn for mainly optimizing CNNs seem to take up too much vram without being useful 
-    allow_tf32: bool = False
+    cudnn_benchmark: bool = False #True #SAM2 uses mostly transformers, cudnn benchmark mainly optimizing CNNs take much vram without speedup 
+    cudnn_enabled: bool = True
+    allow_tf32: bool = True #False
     # if not None, `matmul_allow_tf32` key will override `allow_tf32` for matmul
     matmul_allow_tf32: Optional[bool] = None
     # if not None, `cudnn_allow_tf32` key will override `allow_tf32` for cudnn
@@ -284,7 +284,7 @@ class Trainer:
             # Enable flash attn explicitly
             torch.backends.cuda.enable_math_sdp(False)  # Disable slow mathematical vanilla implementation
             torch.backends.cuda.enable_flash_sdp(True)  # Enable Flash Attention
-
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
             
             torch.backends.cudnn.deterministic = cuda_conf.cudnn_deterministic
             torch.backends.cudnn.benchmark = cuda_conf.cudnn_benchmark

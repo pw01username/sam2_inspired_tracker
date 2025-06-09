@@ -125,7 +125,10 @@ class TokenCompetition(nn.Module):
                     )
         
         # Final normalization
-        return self.norm(updated_tokens + mask_tokens_out)
+        #1.3 mdec: return self.norm(updated_tokens + mask_tokens_out)
+        
+        #1.4:
+        return self.norm(updated_tokens)
 
 class MaskDecoder(nn.Module):
     def __init__(
@@ -223,20 +226,20 @@ class MaskDecoder(nn.Module):
         self.dynamic_multimask_stability_thresh = dynamic_multimask_stability_thresh
 
 
-        # 1) instantiate the SAME sinePE you use for image_pe,
+        # instantiate the SAME sinePE you use for image_pe,
         #   but now to encode an (object × token) grid:
         #   we want final PE dim == transformer_dim,
         #   and PositionEmbeddingSine takes num_pos_feats*2 == transformer_dim
         self.obj_token_pe = PositionEmbeddingSine(
-            num_pos_feats=transformer_dim,
+            num_pos_feats=transformer_dim, ## original version of this with 91,1 did not do // 2
             normalize=True,
             scale=2 * math.pi,
         )
 
-        # 2) a full TransformerEncoder layer for inter-object communication
+        # a full TransformerEncoder layer for inter-object communication. 1 head 1 layer 91,1086
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=transformer_dim,
-            nhead=1,                    # you can tune this
+            nhead=4,                   # 1.3 used 1 head, 1.4 uses 4 heads. 1.1 and 1.2 uses 1. ??? Actually num heads will run inference no matter what it was trained with, aka no weights
             dim_feedforward=transformer_dim * 4,
             activation="gelu",
             dropout=0.1,
@@ -244,17 +247,15 @@ class MaskDecoder(nn.Module):
         )
         self.inter_object_encoder = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=4,
+            num_layers=4, #1.1 uses 1, 1.3 and 1.4 uses 4
             norm=nn.LayerNorm(transformer_dim)
         )
         self.norm_inter_obj = nn.LayerNorm(transformer_dim)
 
-
-
-        self.token_competition = TokenCompetition(
-            transformer_dim=transformer_dim,
-            num_mask_tokens=self.num_mask_tokens
-        )
+        # self.token_competition = TokenCompetition(
+        #     transformer_dim=transformer_dim,
+        #     num_mask_tokens=self.num_mask_tokens
+        # )
 
 
     def forward(
@@ -378,10 +379,63 @@ class MaskDecoder(nn.Module):
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
         
+        # --- interobject PE + attention ---
+
+        #mask_tokens_out: [B, T, C]
+        B, T, C = mask_tokens_out.shape
+        device = mask_tokens_out.device
+
+        if img_ids is None:
+            print("ERROR: img_ids is None! This should never happen. Skipping inter-object attention.")
+            raise Exception("img ids should never be none.")
+
+        # Process each image group separately
+        updated_tokens = mask_tokens_out.clone()
+
+        for img_id in img_ids.unique():
+            # Get indices for this image
+            idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
+            G = idx.numel()  # number of objects in this image
+            
+            if G <= 1:
+                continue  # Skip if only one object
+            
+            # Extract tokens for this image group
+            group_tokens = mask_tokens_out[idx]  # [G, T, C]
+            
+            # Create positional encoding for this group
+            # Shape [G, 1, G, T] for the dummy tensor
+            dummy = torch.zeros((G, 1, G, T), device=device)
+            pe_map = self.obj_token_pe(dummy)  # [G, C, G, T]
+            
+            # Extract diagonal PE for each object in group
+            pe_map = pe_map.permute(0, 2, 3, 1)  # [G, G, T, C]
+            group_idx = torch.arange(G, device=device)
+            pe_ot = pe_map[group_idx, group_idx, :, :]  # [G, T, C]
+            
+            # Add PE to tokens
+            x = group_tokens + pe_ot  # [G, T, C]
+            
+            # Merge into single sequence for this group
+            x = x.view(1, G * T, C)  # [1, G*T, C]
+            
+            # Run transformer encoder on this group
+            x = self.inter_object_encoder(x)  # [1, G*T, C]
+            
+            # Unmerge back to [G, T, C]
+            x = x.view(G, T, C)
+            
+            # Write back with residual + norm
+            updated_tokens[idx] = self.norm_inter_obj(group_tokens + x)
+
+        mask_tokens_out = updated_tokens
+
+        # --- end interobject block ---
+
+
+        # # --- interobject PE + attention --- first 91,1 version
         
-        # --- interobject PE + attention ---
-        
-        # mask_tokens_out: [B, T, C]
+        # #mask_tokens_out: [B, T, C]
         # B, T, C = mask_tokens_out.shape
         # device = mask_tokens_out.device
 
@@ -411,15 +465,15 @@ class MaskDecoder(nn.Module):
         # x = x.view(B, T, C)
         # mask_tokens_out = self.norm_inter_obj(mask_tokens_out + x)
         
-        # --- end interobject block ---
+        # # --- end interobject block ---
 
-        if img_ids is not None:
-            # mask_tokens_out: [N, T, C]; img_ids: [N] ↦ group tokens by image
-            mask_tokens_out = self._cross_object_attention(mask_tokens_out, img_ids)
+        # if img_ids is not None:
+        #     # mask_tokens_out: [N, T, C]; img_ids: [N] ↦ group tokens by image
+        #     mask_tokens_out = self._cross_object_attention(mask_tokens_out, img_ids)
 
-            mask_tokens_out = self.token_competition(mask_tokens_out, img_ids)
-        else:
-            print("WARNING: img_ids missing—skipping cross-object attention")
+        #     mask_tokens_out = self.token_competition(mask_tokens_out, img_ids)
+        # else:
+        #     print("WARNING: img_ids missing—skipping cross-object attention")
 
 
         hyper_in_list: List[torch.Tensor] = []

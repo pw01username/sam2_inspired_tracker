@@ -71,7 +71,7 @@ class VOSDataset(VisionDataset):
                 else:
                     # Shouldn't fail to load a val video
                     raise e
-
+        
         datapoint = self.construct(video, sampled_frms_and_objs, segment_loader)
         for transform in self._transforms:
             datapoint = transform(datapoint, epoch=self.curr_epoch)

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Script to copy inter-object encoder weights from a 1-layer checkpoint to a 4-layer checkpoint.
-This handles the case where you trained with num_layers=1 and want to expand to num_layers=4
-by duplicating the single layer's weights across all 4 layers.
+Script to copy memory attention weights (cross_obj_attn, obj_embeddings, obj_emb_scale) 
+from one checkpoint to another.
 """
 
 import torch
@@ -10,13 +9,13 @@ import argparse
 from pathlib import Path
 import sys
 
-def copy_layer_weights(source_checkpoint_path, target_checkpoint_path, output_path):
+def copy_memory_attention_weights(source_checkpoint_path, target_checkpoint_path, output_path):
     """
-    Copy inter-object encoder weights from 1-layer to 4-layer configuration.
+    Copy memory attention weights from source to target checkpoint.
     
     Args:
-        source_checkpoint_path: Path to the checkpoint with 1-layer inter_object_encoder
-        target_checkpoint_path: Path to the checkpoint with 4-layer inter_object_encoder 
+        source_checkpoint_path: Path to the source checkpoint
+        target_checkpoint_path: Path to the target checkpoint 
         output_path: Path where the modified checkpoint will be saved
     """
     
@@ -41,121 +40,180 @@ def copy_layer_weights(source_checkpoint_path, target_checkpoint_path, output_pa
     else:
         target_state = target_ckpt
     
-    # Find inter_object_encoder keys in source (should be for 1 layer)
-    source_inter_obj_keys = [k for k in source_state.keys() if 'inter_object_encoder' in k]
-    target_inter_obj_keys = [k for k in target_state.keys() if 'inter_object_encoder' in k]
+    # Find memory attention keys we're interested in
+    memory_patterns = ['cross_obj_attn', 'obj_embeddings', 'obj_emb_scale']
     
-    print(f"Found {len(source_inter_obj_keys)} inter_object_encoder keys in source")
-    print(f"Found {len(target_inter_obj_keys)} inter_object_encoder keys in target")
+    # Find all keys related to memory attention components
+    source_memory_keys = []
+    for pattern in memory_patterns:
+        keys = [k for k in source_state.keys() if pattern in k]
+        source_memory_keys.extend(keys)
     
-    if not source_inter_obj_keys:
-        print("ERROR: No inter_object_encoder keys found in source checkpoint!")
+    target_memory_keys = []
+    for pattern in memory_patterns:
+        keys = [k for k in target_state.keys() if pattern in k]
+        target_memory_keys.extend(keys)
+    
+    print(f"\nFound {len(source_memory_keys)} memory attention keys in source")
+    print(f"Found {len(target_memory_keys)} memory attention keys in target")
+    
+    if not source_memory_keys:
+        print("ERROR: No memory attention keys (cross_obj_attn, obj_embeddings, obj_emb_scale) found in source checkpoint!")
+        print("These keys should be in the memory attention module.")
+        # Help debug by showing memory-related keys
+        memory_related = [k for k in source_state.keys() if 'memory' in k.lower() or 'mem' in k.lower()]
+        if memory_related:
+            print("\nFound these memory-related keys (first 10):")
+            for key in memory_related[:10]:
+                print(f"  {key}")
         return False
-        
-    if not target_inter_obj_keys:
-        print("ERROR: No inter_object_encoder keys found in target checkpoint!")
+    
+    print(f"\nFound {len(source_memory_keys)} memory attention keys in source")
+    print(f"Found {len(target_memory_keys)} memory attention keys in target")
+    
+    if not source_memory_keys:
+        print("ERROR: No memory attention keys (cross_obj_attn, obj_embeddings, obj_emb_scale) found in source checkpoint!")
+        print("These keys should be in the memory attention module.")
+        # Help debug by showing memory-related keys
+        memory_related = [k for k in source_state.keys() if 'memory' in k.lower() or 'mem' in k.lower()]
+        if memory_related:
+            print("\nFound these memory-related keys (first 10):")
+            for key in memory_related[:10]:
+                print(f"  {key}")
         return False
     
-    # Print some example keys for debugging
-    print("\nSource inter_object_encoder keys (first 5):")
-    for key in source_inter_obj_keys[:5]:
-        print(f"  {key}: {source_state[key].shape}")
+    if not target_memory_keys:
+        print("Note: No matching keys found in target - will add them as new keys.")
     
-    print("\nTarget inter_object_encoder keys (first 10):")
-    for key in target_inter_obj_keys[:10]:
-        print(f"  {key}: {target_state[key].shape}")
+    # Print found keys for debugging
+    if source_memory_keys:
+        print("\nSource memory attention keys:")
+        for key in sorted(source_memory_keys):
+            print(f"  {key}: {source_state[key].shape if hasattr(source_state[key], 'shape') else 'scalar'}")
     
-    # Copy all non-inter_object_encoder weights from source to target
-    print("\nCopying non-inter_object_encoder weights from source to target...")
+    if target_memory_keys:
+        print("\nTarget memory attention keys (will be replaced):")
+        for key in sorted(target_memory_keys):
+            print(f"  {key}: {target_state[key].shape if hasattr(target_state[key], 'shape') else 'scalar'}")
+    
+    # Copy the memory attention weights
     copied_keys = 0
-    for key, value in source_state.items():
-        if 'inter_object_encoder' not in key:
-            if key in target_state:
-                if target_state[key].shape == value.shape:
-                    target_state[key] = value.clone()
+    added_keys = 0
+    skipped_keys = 0
+    
+    print("\nCopying memory attention weights...")
+    for source_key in source_memory_keys:
+        if source_key in target_state:
+            # Key exists in target - check if we can copy
+            source_val = source_state[source_key]
+            target_val = target_state[source_key]
+            
+            # Check if shapes match (for tensors)
+            if hasattr(source_val, 'shape') and hasattr(target_val, 'shape'):
+                if source_val.shape == target_val.shape:
+                    target_state[source_key] = source_val.clone()
+                    print(f"  Copied {source_key} (shape: {source_val.shape})")
                     copied_keys += 1
                 else:
-                    print(f"WARNING: Shape mismatch for {key}: source {value.shape} vs target {target_state[key].shape}")
+                    print(f"  WARNING: Shape mismatch for {source_key}: source {source_val.shape} vs target {target_val.shape}")
+                    skipped_keys += 1
             else:
-                print(f"WARNING: Key {key} not found in target checkpoint")
+                # For scalars or other types
+                target_state[source_key] = source_val
+                print(f"  Copied {source_key} (scalar/other)")
+                copied_keys += 1
+        else:
+            # Key doesn't exist in target - add it!
+            source_val = source_state[source_key]
+            target_state[source_key] = source_val.clone() if hasattr(source_val, 'clone') else source_val
+            shape_info = f" (shape: {source_val.shape})" if hasattr(source_val, 'shape') else " (scalar)"
+            print(f"  ADDED {source_key}{shape_info}")
+            added_keys += 1
     
-    print(f"Copied {copied_keys} non-inter_object_encoder weights")
-    
-    # Now handle the inter_object_encoder layers
-    # Source should have layers.0.* pattern, target should have layers.0.*, layers.1.*, layers.2.*, layers.3.*
-    
-    # Find the pattern for layer 0 in source
-    layer0_keys = [k for k in source_inter_obj_keys if 'layers.0.' in k]
-    print(f"\nFound {len(layer0_keys)} layer 0 keys in source")
-    
-    if not layer0_keys:
-        print("ERROR: No layers.0.* keys found in source inter_object_encoder!")
-        return False
-    
-    # Copy layer 0 weights to all 4 layers in target
-    print("Copying layer 0 weights to all target layers...")
-    for layer_idx in range(4):  # 0, 1, 2, 3
-        for source_key in layer0_keys:
-            # Convert source key to target key for this layer
-            target_key = source_key.replace('layers.0.', f'layers.{layer_idx}.')
-            
-            if target_key in target_state:
-                if target_state[target_key].shape == source_state[source_key].shape:
-                    target_state[target_key] = source_state[source_key].clone()
-                    if layer_idx == 0:  # Only print for first layer to avoid spam
-                        print(f"  Copied {source_key} -> {target_key}")
-                else:
-                    print(f"ERROR: Shape mismatch for {target_key}")
-                    return False
-            else:
-                print(f"ERROR: Target key {target_key} not found!")
-                return False
-    
-    # Copy the norm layer weights (these should be the same)
-    norm_keys = [k for k in source_inter_obj_keys if 'norm.' in k or 'norm_inter_obj' in k]
-    print(f"\nCopying {len(norm_keys)} norm layer weights...")
-    for key in norm_keys:
-        if key in target_state:
-            if target_state[key].shape == source_state[key].shape:
-                target_state[key] = source_state[key].clone()
-                print(f"  Copied {key}")
-            else:
-                print(f"ERROR: Shape mismatch for norm key {key}")
-                return False
+    print(f"\nSummary:")
+    print(f"  Added (new): {added_keys} keys")
+    print(f"  Copied (replaced): {copied_keys} keys")
+    print(f"  Skipped: {skipped_keys} keys")
     
     # Save the modified checkpoint
     print(f"\nSaving modified checkpoint to: {output_path}")
     torch.save(target_ckpt, output_path)
     
-    print("Successfully copied weights!")
+    print("Successfully saved checkpoint!")
     return True
 
+def list_checkpoint_keys(checkpoint_path, pattern=None):
+    """
+    Utility function to list keys in a checkpoint, optionally filtered by pattern.
+    """
+    print(f"Loading checkpoint: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location='cpu')
+    
+    # Extract state dict
+    if 'model' in ckpt:
+        state = ckpt['model']
+    elif 'state_dict' in ckpt:
+        state = ckpt['state_dict']
+    else:
+        state = ckpt
+    
+    keys = list(state.keys())
+    
+    if pattern:
+        keys = [k for k in keys if pattern in k]
+        print(f"\nKeys containing '{pattern}':")
+    else:
+        print(f"\nAll keys:")
+    
+    for key in sorted(keys):
+        if hasattr(state[key], 'shape'):
+            print(f"  {key}: {state[key].shape}")
+        else:
+            print(f"  {key}: scalar/other")
+    
+    print(f"\nTotal: {len(keys)} keys")
+
 def main():
-    parser = argparse.ArgumentParser(description='Copy inter-object encoder weights from 1-layer to 4-layer checkpoint')
-    parser.add_argument('--source', '-s', required=True, help='Path to source checkpoint (1-layer)')
-    parser.add_argument('--target', '-t', required=True, help='Path to target checkpoint (4-layer)')
-    parser.add_argument('--output', '-o', required=True, help='Path for output checkpoint')
+    parser = argparse.ArgumentParser(description='Copy memory attention weights between checkpoints')
+    parser.add_argument('--source', '-s', required=True, help='Path to source checkpoint')
+    parser.add_argument('--target', '-t', help='Path to target checkpoint (required unless using --list-keys)')
+    parser.add_argument('--output', '-o', help='Path for output checkpoint (required unless using --list-keys)')
+    parser.add_argument('--list-keys', action='store_true', help='List keys in checkpoints instead of copying')
+    parser.add_argument('--filter', '-f', help='Filter pattern when listing keys')
     
     args = parser.parse_args()
     
+    # Check required arguments based on mode
+    if not args.list_keys and (not args.target or not args.output):
+        parser.error("--target and --output are required when not using --list-keys")
+    
     # Validate paths
     source_path = Path(args.source)
-    target_path = Path(args.target)
-    output_path = Path(args.output)
+    target_path = Path(args.target) if args.target else None
+    output_path = Path(args.output) if args.output else None
     
     if not source_path.exists():
         print(f"ERROR: Source checkpoint not found: {source_path}")
         sys.exit(1)
         
-    if not target_path.exists():
+    if target_path and not target_path.exists() and not args.list_keys:
         print(f"ERROR: Target checkpoint not found: {target_path}")
         sys.exit(1)
+    
+    # If listing keys, do that instead
+    if args.list_keys:
+        print("=== SOURCE CHECKPOINT ===")
+        list_checkpoint_keys(source_path, args.filter)
+        if target_path and target_path.exists():
+            print("\n=== TARGET CHECKPOINT ===")
+            list_checkpoint_keys(target_path, args.filter)
+        sys.exit(0)
     
     # Create output directory if needed
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Perform the copy
-    success = copy_layer_weights(source_path, target_path, output_path)
+    success = copy_memory_attention_weights(source_path, target_path, output_path)
     
     if success:
         print("\n✅ Checkpoint weights copied successfully!")

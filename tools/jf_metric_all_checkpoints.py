@@ -54,13 +54,15 @@ def process_checkpoint(checkpoint, base_video_dir, input_mask_dir, video_list_fi
 def main():
     # Configuration
     checkpoint_dir = os.path.expanduser(
-        "./sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/checkpoints"
+        #"./sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/checkpoints"
+        "./sam2_logs/configs/sam2.1_training/sam2.1_hiera_large_MOSE_finetune.yaml/checkpoints"
     )
     base_video_dir = os.path.expanduser("./DAVIS/JPEGImages/")
     input_mask_dir = os.path.expanduser("./DAVIS/Annotations/")
     video_list_file = os.path.expanduser("./DAVIS/ImageSets/2017/val.txt")
     output_base_dir = os.path.expanduser("./outputs")
-    sam2_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    #sam2_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    sam2_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
     
     # Number of parallel processes to run
     max_parallel = 4

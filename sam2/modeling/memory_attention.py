@@ -133,25 +133,24 @@ class MemoryAttention(nn.Module):
         # self.obj_embedding_scale = nn.Parameter(torch.ones(1) * 0.1)
         # self.obj_embedding_proj = nn.Linear(d_model, d_model)
 
-        # Additional modules for cross-object mixing
-        # self.cross_obj_attn = nn.MultiheadAttention(
-        #     embed_dim=d_model,
-        #     num_heads=4,
-        #     dropout=layer.dropout_value,
-        #     batch_first=batch_first,
-        # )
         
-        # if batch_first != True:
-        #     raise Exception("batch first not true in mem attention")
-
-        # # This is the 1.1 mem_ca that got 0.79 val loss on davis. 90.2
-        # max_batch_items = 50 # num objects in a video * num videos (batch size defined in yaml)
-        # # Object embeddings to differentiate objects in the same image
-        # # Shape is (max_objects, d_model) - no need for middle dimension
-        # self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
-        # nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
-        # # Scaling factor for object embeddings
-        # self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.1)
+        # This is the 1.1 mem_ca that got 0.79 val loss on davis. 90.2
+        self.cross_obj_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=4,
+            dropout=layer.dropout_value,
+            batch_first=batch_first,
+        )
+        if batch_first != True:
+            raise Exception("batch first not true in mem attention")
+        # 50 was used here originally.
+        max_batch_items = 30 # num objects in a video * num videos (batch size defined in yaml)
+        # Object embeddings to differentiate objects in the same image
+        # Shape is (max_objects, d_model) - no need for middle dimension
+        self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
+        nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
+        # Scaling factor for object embeddings
+        self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.1)
 
         # # Simple cross-object mixing with object identity
         # self.obj_embedding = nn.Embedding(100, d_model)  # Support up to 100 objects
@@ -288,7 +287,6 @@ class MemoryAttention(nn.Module):
             output.index_copy_(0, indices.to(output.device), attended_group)
         
         return output
-    
     
     def _cross_object_mixing(self, batch_seq: torch.Tensor, img_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -427,11 +425,11 @@ class MemoryAttention(nn.Module):
                 **kwds,
             )
 
-        # Cross-object attention
-        # if img_ids is not None:
-        #     output = self._cross_object_attention(output, img_ids)
-        # else:
-        #     print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
+        # # Cross-object attention
+        if img_ids is not None:
+            output = self._cross_object_attention(output, img_ids)
+        else:
+            print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
 
         normed_output = self.norm(output)
 
