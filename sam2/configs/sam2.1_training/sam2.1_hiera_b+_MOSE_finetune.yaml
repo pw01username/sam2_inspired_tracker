@@ -3,25 +3,35 @@
 scratch:
   resolution: 1024
   train_batch_size: 1
-  num_train_workers: 24
+  num_train_workers: 20
   num_frames: 18
   max_num_objects: 5
   base_lr: 5e-5 #3e-5 #5.0e-6 paper says the used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
   vision_lr: 1e-11 #3.0e-06. we set this to 0 basically, but it is frozen so should not matter
   cross_obj_lr: 8e-5
   phases_per_epoch: 1
-  num_epochs: 90
+  num_epochs: 75
 
 dataset:
   # PATHS to Dataset
   img_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/JPEGImages/ # PATH to MOSE JPEGImages folder
   gt_folder: /cluster/home/patricwu/Downloads/train/train_mose_davis/Annotations/  # PATH to MOSE Annotations folder
   file_list_txt: null # Optional PATH to filelist containing a subset of videos to be used for training
+ 
+  
+  img_folder2: /cluster/home/patricwu/Downloads/trainytvos2/JPEGImages/ 
+  gt_folder2: /cluster/home/patricwu/Downloads/trainytvos2/Annotations/
+  file_list_txt2: null
 
-  img_folder2: /cluster/home/patricwu/Downloads/trainytvos2/JPEGImages/ # PATH to MOSE JPEGImages folder
-  gt_folder2: /cluster/home/patricwu/Downloads/trainytvos2/Annotations/  # PATH to MOSE Annotations folder
-  file_list_txt2: null # Optional PATH to filelist containing a subset of videos to be used for training
   multiplier: 1
+
+
+  img_folder3: /cluster/home/patricwu/Downloads/train/train_mose_davis_occlusions/JPEGImages/ 
+  gt_folder3: /cluster/home/patricwu/Downloads/train/train_mose_davis_occlusions/Annotations/
+  file_list_txt3: null
+  occlusion_multiplier: 3
+
+  
 
 # Video transforms
 vos:
@@ -108,7 +118,8 @@ trainer:
       pos_enc_at_input: true
       layer:
         _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
-        activation: gelu #relu
+        #activation: gelu
+        activation: relu
         dim_feedforward: 2048
         dropout: 0.1
         pos_enc_at_attn: false
@@ -118,6 +129,15 @@ trainer:
           feat_sizes: [64, 64]
           embedding_dim: 256
           num_heads: 1
+          downsample_rate: 1
+          dropout: 0.1
+        crs_obj_attention: # new
+          #_target_: sam2.modeling.sam.transformer.RoPEAttention # this was changed along with gelu to relu on epoch 37.
+          #rope_theta: 10000.0
+          #feat_sizes: [64, 64]
+          _target_: sam2.modeling.sam.transformer.Attention
+          embedding_dim: 256
+          num_heads: 2
           downsample_rate: 1
           dropout: 0.1
         d_model: 256
@@ -257,6 +277,21 @@ trainer:
                 max_num_objects: ${scratch.max_num_objects}
                 reverse_time_prob: 0.0
               multiplier: ${dataset.multiplier}
+            # Dataset number 3, occlusion samples from mose and davis, that got low jf.
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.train_transforms}
+              training: true
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${dataset.img_folder3}
+                gt_folder: ${dataset.gt_folder3}
+                file_list_txt: ${dataset.file_list_txt3}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+                reverse_time_prob: 0.0
+              multiplier: ${dataset.occlusion_multiplier}
       shuffle: True
       num_workers: ${scratch.num_train_workers}
       pin_memory: True
@@ -398,8 +433,8 @@ trainer:
       ignore_missing_keys: null
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
-        #checkpoint_path: ./checkpoints/sam2.1_hiera_base_plus.pt
-        checkpoint_path: sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/checkpoints/checkpoint_nooptimz.pt # # PATH to SAM 2.1 checkpoint
+        checkpoint_path: ./checkpoints/sam2.1_hiera_base_plus.pt
+        #checkpoint_path: sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/checkpoints/checkpoint_nooptimz.pt # # PATH to SAM 2.1 checkpoint
         ckpt_state_dict_keys: ['model']
 
 launcher:

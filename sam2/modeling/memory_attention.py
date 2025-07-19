@@ -27,6 +27,7 @@ class MemoryAttentionLayer(nn.Module):
         pos_enc_at_cross_attn_keys: bool,
         pos_enc_at_cross_attn_queries: bool,
         self_attention: nn.Module,
+        crs_obj_attention: nn.Module, # NEW
     ):
         super().__init__()
         self.d_model = d_model
@@ -55,6 +56,138 @@ class MemoryAttentionLayer(nn.Module):
         self.pos_enc_at_attn = pos_enc_at_attn
         self.pos_enc_at_cross_attn_queries = pos_enc_at_cross_attn_queries
         self.pos_enc_at_cross_attn_keys = pos_enc_at_cross_attn_keys
+
+        # Object embeddings for cross-object attention
+        # self.max_objects_per_group = 15
+        # self.object_embed = nn.Embedding(self.max_objects_per_group, d_model)
+        # nn.init.normal_(self.object_embed.weight, mean=0.0, std=0.02)
+        
+        # self.cross_obj_self_attn = crs_obj_attention
+        # self.norm_cross_obj = nn.LayerNorm(d_model)
+        # self.dropout_cross_obj = nn.Dropout(dropout)
+
+    def _forward_cross_obj_sa(self, tgt, query_pos, img_ids):
+        """
+        Cross-object self-attention with both spatial PE (query_pos) and object embeddings.
+        Follows the same pattern as _forward_sa and _forward_ca.
+        """
+        B, S, C = tgt.shape  # B objects, S spatial tokens, C channels
+        device = tgt.device
+        
+        if img_ids is None or B <= 1:
+            return tgt
+        
+        # Process each image group
+        for img_id in img_ids.unique():
+            idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
+            G = idx.numel()
+            
+            if G <= 1:
+                continue
+            
+            # Extract features for this group
+            group_tgt = tgt[idx]  # [G, C]
+            
+            # Normalize the group
+            tgt2 = self.norm_cross_obj(group_tgt)
+            
+            # Get spatial positions for this group
+            group_query_pos = query_pos[idx] if query_pos is not None else None
+            
+            # Create object embeddings
+            obj_positions = torch.arange(G, device=device)
+            obj_pe = self.object_embed(obj_positions)  # [G, C]
+            obj_pe = obj_pe.unsqueeze(1).expand(-1, tgt.shape[1], -1)  # [G, S, C]
+
+            # Combine both position encodings:
+            # - query_pos: spatial position (from RoPE or other spatial encoding)
+            # - obj_pe: object identity within the image
+            combined_pos = obj_pe
+            
+            #if self.pos_enc_at_attn:
+            if group_query_pos is not None:
+                combined_pos = combined_pos + group_query_pos # We always add this when not using ROPE attention here.
+            else:
+                raise Exception("GROUP QUERY POS NONE")
+
+            # Add pos enc to image features
+            tgt2_pos_enc = tgt2 + combined_pos # [G, S, C]
+
+            # Merge into single sequence for cross-object attention
+            tgt2_merged = tgt2_pos_enc.view(1, G * S, C)  # [1, G*S, C]
+            tgt2_v_merged = tgt2.view(1, G * S, C)  # values without position encoding
+
+            # Apply cross-object self-attention
+            tgt2_merged = self.cross_obj_self_attn(
+                q=tgt2_merged,
+                k=tgt2_merged,
+                v=tgt2_v_merged
+            ) # [1, G*S, C]
+            
+            # Unmerge back
+            tgt2 = tgt2_merged.view(G, S, C)  # [G, S, C]
+
+            # Update with residual and dropout
+            tgt[idx] = group_tgt + self.dropout_cross_obj(tgt2)
+        
+        return tgt
+
+    # 91.35 version
+    def _forward_ca_nm_sa(self, tgt, query_pos, img_ids):
+        """
+        Self-attention with both spatial PE (query_pos) and object embeddings.
+        Follows the same pattern as _forward_sa and _forward_ca.
+        """
+        B, S, C = tgt.shape  # B objects, S spatial tokens, C channels
+        device = tgt.device
+        
+        if img_ids is None or B <= 1:
+            return tgt
+        
+        # Process each image group
+        for img_id in img_ids.unique():
+            idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
+            G = idx.numel()
+            
+            if G <= 1:
+                continue
+            
+            # Extract features for this group
+            group_tgt = tgt[idx]  # [G, C]
+            
+            # Normalize the group
+            tgt2 = self.norm_cross_obj(group_tgt)
+            
+            # Get spatial positions for this group
+            group_query_pos = query_pos[idx] if query_pos is not None else None
+            
+            # Create object embeddings
+            obj_positions = torch.arange(G, device=device)
+            obj_pe = self.object_embed(obj_positions)  # [G, C]
+            obj_pe = obj_pe.unsqueeze(1).expand(-1, tgt.shape[1], -1)  # [G, S, C]
+
+            # Combine both position encodings:
+            # - query_pos: spatial position (from RoPE or other spatial encoding)
+            # - obj_pe: object identity within the image
+            combined_pos = obj_pe
+            
+            if self.pos_enc_at_attn:
+                combined_pos = combined_pos + group_query_pos
+
+            # Add pos enc to image features
+            q = k = tgt2 + combined_pos # [G, S, C]
+
+            # Apply cross-object self-attention
+            tgt2_merged = self.cross_obj_self_attn(
+                q=q,
+                k=k,
+                v=tgt2
+            ) # [1, G*S, C]
+
+            # Update with residual and dropout
+            tgt[idx] = group_tgt + self.dropout_cross_obj(tgt2)
+        
+        return tgt
 
     def _forward_sa(self, tgt, query_pos):
         # Self-Attention
@@ -88,11 +221,18 @@ class MemoryAttentionLayer(nn.Module):
         pos: Optional[Tensor] = None,
         query_pos: Optional[Tensor] = None,
         num_k_exclude_rope: int = 0,
+        enable_cross_obj_attn=False, # NEW
+        img_ids: Optional[Tensor] = None,
     ) -> torch.Tensor:
 
         # Self-Attn, Cross-Attn
         tgt = self._forward_sa(tgt, query_pos)
         tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope)
+
+        # Cross-object self-attention (before MLP)
+        # if enable_cross_obj_attn:
+        #     #tgt = self._forward_ca_nm_sa(tgt, query_pos, img_ids)
+        #     tgt = self._forward_cross_obj_sa(tgt, query_pos, img_ids)
 
         # MLP
         tgt2 = self.norm3(tgt)
@@ -135,22 +275,22 @@ class MemoryAttention(nn.Module):
 
         
         # This is the 1.1 mem_ca that got 0.79 val loss on davis. 90.2
-        self.cross_obj_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=4,
-            dropout=layer.dropout_value,
-            batch_first=batch_first,
-        )
-        if batch_first != True:
-            raise Exception("batch first not true in mem attention")
-        # 50 was used here originally.
-        max_batch_items = 30 # num objects in a video * num videos (batch size defined in yaml)
-        # Object embeddings to differentiate objects in the same image
-        # Shape is (max_objects, d_model) - no need for middle dimension
-        self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
-        nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
-        # Scaling factor for object embeddings
-        self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.1)
+        # self.cross_obj_attn = nn.MultiheadAttention(
+        #     embed_dim=d_model,
+        #     num_heads=4,
+        #     dropout=layer.dropout_value,
+        #     batch_first=batch_first,
+        # )
+        # if batch_first != True:
+        #     raise Exception("batch first not true in mem attention")
+        # # 50 was used here originally.
+        # max_batch_items = 30 # num objects in a video * num videos (batch size defined in yaml)
+        # # Object embeddings to differentiate objects in the same image
+        # # Shape is (max_objects, d_model) - no need for middle dimension
+        # self.obj_embeddings = nn.Parameter(torch.zeros(max_batch_items, d_model))
+        # nn.init.normal_(self.obj_embeddings, mean=0.0, std=0.02)
+        # # Scaling factor for object embeddings
+        # self.obj_emb_scale = nn.Parameter(torch.ones(1) * 0.1)
 
         # # Simple cross-object mixing with object identity
         # self.obj_embedding = nn.Embedding(100, d_model)  # Support up to 100 objects
@@ -422,14 +562,16 @@ class MemoryAttention(nn.Module):
                 memory=memory,
                 pos=memory_pos,
                 query_pos=curr_pos,
+                enable_cross_obj_attn=True,
+                img_ids=img_ids,
                 **kwds,
             )
 
-        # # Cross-object attention
-        if img_ids is not None:
-            output = self._cross_object_attention(output, img_ids)
-        else:
-            print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
+        # Cross-object attention
+        # if img_ids is not None:
+        #     output = self._cross_object_attention(output, img_ids)
+        # else:
+        #     print("WARNING ERROR IMG IDS NOT PROVIDED IN MEM ATTENTION FORWARD ----------------")
 
         normed_output = self.norm(output)
 

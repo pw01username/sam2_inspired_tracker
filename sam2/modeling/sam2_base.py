@@ -941,7 +941,7 @@ class SAM2Base(torch.nn.Module):
             high_res_masks, 
             ious, 
             object_score_logits, 
-            iou_threshold=0.6,
+            iou_threshold=0.75,
             refine_masks=True
         )
 

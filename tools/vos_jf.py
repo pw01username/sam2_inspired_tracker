@@ -70,9 +70,10 @@ Or with short options:
     args = parser.parse_args()
     
     # Validate checkpoint exists
-    if not os.path.exists(f'/cluster/home/patricwu/ondemand/w/sam2.1/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/{args.checkpoint}'):
-        print(f"Error: Checkpoint file not found: {args.checkpoint}")
-        sys.exit(1)
+    #if not os.path.exists(f'/cluster/home/patricwu/ondemand/w/sam2.1/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_large_MOSE_finetune.yaml/{args.checkpoint}'):
+    # if not os.path.exists(f'/cluster/home/patricwu/ondemand/w/sam2.1/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/{args.checkpoint}'):
+    #     print(f"Error: Checkpoint file not found: {args.checkpoint}")
+    #     sys.exit(1)
     
     # Create output directory if it doesn't exist
     output_path = Path(f'outputs/{args.output}')
@@ -81,18 +82,50 @@ Or with short options:
     # Define the inference command with hardcoded paths
     inference_cmd = [
         'python', 'tools/vos_inference.py',
-        '--sam2_cfg', 'configs/sam2.1/sam2.1_hiera_b+.yaml',
-        '--sam2_checkpoint', f'/cluster/home/patricwu/ondemand/w/sam2.1/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/{args.checkpoint}',
-        '--base_video_dir', '/cluster/home/patricwu/Downloads/mose_valid/JPEGImages',#'DAVIS/JPEGImages/',
-        '--input_mask_dir', '/cluster/home/patricwu/Downloads/mose_valid/Annotations',#'DAVIS/Annotations/',
+        
+        #'--sam2_cfg', 'configs/sam2.1/sam2.1_hiera_b+.yaml',
+        '--sam2_cfg', 'configs/sam2.1/sam2.1_hiera_l.yaml',
+        
+        #'--sam2_checkpoint', '/cluster/home/patricwu/ondemand/w/sam2.1/sam2/checkpoints/sam2.1_hiera_base_plus.pt', #
+        '--sam2_checkpoint', '/cluster/home/patricwu/ondemand/w/sam2.1/sam2/checkpoints/sam2.1_hiera_large.pt', #        
+        #'--sam2_checkpoint', f'/cluster/home/patricwu/ondemand/w/sam2.1/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_b+_MOSE_finetune.yaml/{args.checkpoint}',
+        #'--sam2_checkpoint', f'/cluster/home/patricwu/ondemand/w/sam2.1/sam2/sam2_logs/configs/sam2.1_training/sam2.1_hiera_large_MOSE_finetune.yaml/{args.checkpoint}',
+        
+        # mose val
+        #'--base_video_dir', '/cluster/home/patricwu/Downloads/mose_valid/JPEGImages',
+        #'--input_mask_dir', '/cluster/home/patricwu/Downloads/mose_valid/Annotations',
+        
+        # davis val
+        #'--base_video_dir', 'DAVIS/JPEGImages/',
+        #'--input_mask_dir', 'DAVIS/Annotations/',
         #'--video_list_file', 'DAVIS/ImageSets/2017/val.txt',
+
+        # davis test
+        #'--base_video_dir', '/cluster/home/patricwu/Downloads/davis_test/JPEGImages/480p/',
+        #'--input_mask_dir', '/cluster/home/patricwu/Downloads/davis_test/Annotations/480p/',
+
+        '--base_video_dir', '/cluster/home/patricwu/Downloads/DAVIS/JPEGImages/Full-Resolution/',
+        '--input_mask_dir', '/cluster/home/patricwu/Downloads/DAVIS/Annotations/Full-Resolution/',
+
+        
+
+        # yt vos train, filtered
+        #'--base_video_dir', '/cluster/home/patricwu/Downloads/trainytvos2/JPEGImages/',
+        #'--input_mask_dir', '/cluster/home/patricwu/Downloads/trainytvos2/Annotations/',
+
+        
         '--output_mask_dir', f'outputs/{args.output}'
     ]
     
     # Define the evaluation command
     eval_cmd = [
         'python', 'sav_dataset/sav_evaluator.py',
+        
+        #'--gt_root', '/cluster/home/patricwu/Downloads/trainytvos2/Annotations',
+        
+        # DAVIS VAL
         '--gt_root', 'DAVIS/Annotations',
+        
         '--pred_root', f'outputs/{args.output}'
     ]
     

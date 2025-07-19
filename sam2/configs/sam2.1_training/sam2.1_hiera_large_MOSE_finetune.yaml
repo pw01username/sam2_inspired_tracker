@@ -2,15 +2,15 @@
 
 scratch:
   resolution: 1024
-  train_batch_size: 1
-  num_train_workers: 32
-  num_frames: 17
-  max_num_objects: 6
+  train_batch_size: 4
+  num_train_workers: 16
+  num_frames: 9
+  max_num_objects: 3
   base_lr: 3e-5 #3e-5 #5.0e-6 paper says they used 3e-4 for training and 4e-4 for pre-training, finetuning script here included 5e-6 default
   vision_lr: 1e-11 #3.0e-06. we set this to 0 basically, but it is frozen so should not matter
   cross_obj_lr: 4e-4
   phases_per_epoch: 1
-  num_epochs: 115
+  num_epochs: 20
 
 dataset:
   # PATHS to Dataset
@@ -112,8 +112,8 @@ trainer:
       pos_enc_at_input: true
       layer:
         _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
-        #activation: relu
-        activation: gelu
+        activation: relu
+        #activation: gelu
         dim_feedforward: 2048
         dropout: 0.1
         pos_enc_at_attn: false
@@ -335,16 +335,16 @@ trainer:
             end_value: ${divide:${scratch.vision_lr},10}
           param_names:
             - 'image_encoder.*'
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: ${scratch.cross_obj_lr}
-            end_value: ${divide:${scratch.cross_obj_lr},10}
-          param_names:
-            - 'memory_attention.cross_obj*'
-            - 'memory_attention.obj_emb_scale'
-            - 'memory_attention.obj_embeddings'
-            - 'sam_mask_decoder.*inter_obj*'
-            - 'sam_mask_decoder.inter_obj*'
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: ${scratch.cross_obj_lr}
+        #     end_value: ${divide:${scratch.cross_obj_lr},10}
+        #   param_names:
+        #     - 'memory_attention.cross_obj*'
+        #     - 'memory_attention.obj_emb_scale'
+        #     - 'memory_attention.obj_embeddings'
+        #     - 'sam_mask_decoder.*inter_obj*'
+        #     - 'sam_mask_decoder.inter_obj*'
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler

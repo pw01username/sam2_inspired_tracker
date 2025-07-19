@@ -230,19 +230,40 @@ class MaskDecoder(nn.Module):
         #   but now to encode an (object × token) grid:
         #   we want final PE dim == transformer_dim,
         #   and PositionEmbeddingSine takes num_pos_feats*2 == transformer_dim
-        self.obj_token_pe = PositionEmbeddingSine(
-            num_pos_feats=transformer_dim, ## original version of this with 91,1 did not do // 2
-            normalize=True,
-            scale=2 * math.pi,
-        )
+
+        
+        # self.obj_token_pe = PositionEmbeddingSine(
+        #     num_pos_feats=transformer_dim, ## original version of this with 91,1 did not do // 2
+        #     normalize=True,
+        #     scale=2 * math.pi,
+        # )
+
+        # # a full TransformerEncoder layer for inter-object communication. 1 head 1 layer 91,1086
+        # encoder_layer = nn.TransformerEncoderLayer(
+        #     d_model=transformer_dim,
+        #     nhead=4,                   # 1.3 used 1 head, 1.4 uses 4 heads. 1.1 and 1.2 uses 1. ??? Actually num heads will run inference no matter what it was trained with, aka no weights
+        #     dim_feedforward=transformer_dim * 4,
+        #     activation="gelu",
+        #     dropout=0.1,
+        #     batch_first=True            # allow (B*, Seq, Dim)
+        # )
+        # self.inter_object_encoder = nn.TransformerEncoder(
+        #     encoder_layer,
+        #     num_layers=4, #1.1 uses 1, 1.3 and 1.4 uses 4
+        #     norm=nn.LayerNorm(transformer_dim)
+        # )
+        
+        self.max_objects_per_group = 15
+        self.object_embed = nn.Embedding(self.max_objects_per_group, transformer_dim)
+        nn.init.normal_(self.object_embed.weight, mean=0.0, std=0.02)
 
         # a full TransformerEncoder layer for inter-object communication. 1 head 1 layer 91,1086
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=transformer_dim,
-            nhead=4,                   # 1.3 used 1 head, 1.4 uses 4 heads. 1.1 and 1.2 uses 1. ??? Actually num heads will run inference no matter what it was trained with, aka no weights
+            nhead=8,                   # 1.3 used 1 head, 1.4 uses 4 heads. 1.1 and 1.2 uses 1. ??? Actually num heads will run inference no matter what it was trained with, aka no weights
             dim_feedforward=transformer_dim * 4,
-            activation="gelu",
-            dropout=0.1,
+            activation="gelu", #all but latest version used
+            dropout=0.05,
             batch_first=True            # allow (B*, Seq, Dim)
         )
         self.inter_object_encoder = nn.TransformerEncoder(
@@ -390,8 +411,6 @@ class MaskDecoder(nn.Module):
             raise Exception("img ids should never be none.")
 
         # Process each image group separately
-        updated_tokens = mask_tokens_out.clone()
-
         for img_id in img_ids.unique():
             # Get indices for this image
             idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
@@ -402,19 +421,14 @@ class MaskDecoder(nn.Module):
             
             # Extract tokens for this image group
             group_tokens = mask_tokens_out[idx]  # [G, T, C]
-            
-            # Create positional encoding for this group
-            # Shape [G, 1, G, T] for the dummy tensor
-            dummy = torch.zeros((G, 1, G, T), device=device)
-            pe_map = self.obj_token_pe(dummy)  # [G, C, G, T]
-            
-            # Extract diagonal PE for each object in group
-            pe_map = pe_map.permute(0, 2, 3, 1)  # [G, G, T, C]
-            group_idx = torch.arange(G, device=device)
-            pe_ot = pe_map[group_idx, group_idx, :, :]  # [G, T, C]
+
+            # Create object position embeddings for this group
+            obj_positions = torch.arange(G, device=device)  # [0, 1, 2, ..., G-1]
+            obj_pe = self.object_embed(obj_positions)  # [G, C]
+            obj_pe = obj_pe.unsqueeze(1).expand(-1, T, -1)  # [G, T, C]
             
             # Add PE to tokens
-            x = group_tokens + pe_ot  # [G, T, C]
+            x = group_tokens + obj_pe  # [G, T, C]
             
             # Merge into single sequence for this group
             x = x.view(1, G * T, C)  # [1, G*T, C]
@@ -426,11 +440,62 @@ class MaskDecoder(nn.Module):
             x = x.view(G, T, C)
             
             # Write back with residual + norm
-            updated_tokens[idx] = self.norm_inter_obj(group_tokens + x)
-
-        mask_tokens_out = updated_tokens
+            mask_tokens_out[idx] = self.norm_inter_obj(group_tokens + x)
 
         # --- end interobject block ---
+
+        # # --- interobject PE + attention ---
+
+        # #mask_tokens_out: [B, T, C]
+        # B, T, C = mask_tokens_out.shape
+        # device = mask_tokens_out.device
+
+        # if img_ids is None:
+        #     print("ERROR: img_ids is None! This should never happen. Skipping inter-object attention.")
+        #     raise Exception("img ids should never be none.")
+
+        # # Process each image group separately
+        # updated_tokens = mask_tokens_out.clone()
+
+        # for img_id in img_ids.unique():
+        #     # Get indices for this image
+        #     idx = (img_ids == img_id).nonzero(as_tuple=True)[0]
+        #     G = idx.numel()  # number of objects in this image
+            
+        #     if G <= 1:
+        #         continue  # Skip if only one object
+            
+        #     # Extract tokens for this image group
+        #     group_tokens = mask_tokens_out[idx]  # [G, T, C]
+            
+        #     # Create positional encoding for this group
+        #     # Shape [G, 1, G, T] for the dummy tensor
+        #     dummy = torch.zeros((G, 1, G, T), device=device)
+        #     pe_map = self.obj_token_pe(dummy)  # [G, C, G, T]
+            
+        #     # Extract diagonal PE for each object in group
+        #     pe_map = pe_map.permute(0, 2, 3, 1)  # [G, G, T, C]
+        #     group_idx = torch.arange(G, device=device)
+        #     pe_ot = pe_map[group_idx, group_idx, :, :]  # [G, T, C]
+            
+        #     # Add PE to tokens
+        #     x = group_tokens + pe_ot  # [G, T, C]
+            
+        #     # Merge into single sequence for this group
+        #     x = x.view(1, G * T, C)  # [1, G*T, C]
+            
+        #     # Run transformer encoder on this group
+        #     x = self.inter_object_encoder(x)  # [1, G*T, C]
+            
+        #     # Unmerge back to [G, T, C]
+        #     x = x.view(G, T, C)
+            
+        #     # Write back with residual + norm
+        #     updated_tokens[idx] = self.norm_inter_obj(group_tokens + x)
+
+        # mask_tokens_out = updated_tokens
+
+        # # --- end interobject block ---
 
 
         # # --- interobject PE + attention --- first 91,1 version
